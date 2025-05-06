@@ -1,3 +1,4 @@
+// 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 #pragma once
 
 #include "flagcx.h"
@@ -11,6 +12,9 @@
 #elif USE_CAMBRICON_ADAPTOR
 #include "framework/core/MLUEvent.h"
 #include "framework/core/MLUStream.h"
+#elif USE_METAX_ADAPTOR
+#include <ATen/cuda/CUDAEvent.h>
+#include <cuda_runtime.h>
 #endif
 
 namespace c10d {
@@ -107,6 +111,34 @@ public:
 
 private:
   torch_mlu::MLUEvent mlu_event;
+};
+#elif USE_METAX_ADAPTOR
+class flagcxMacaEvent : public flagcxEvent {
+public:
+  flagcxMacaEvent() {
+    maca_event = at::cuda::CUDAEvent(cudaEventDisableTiming);
+  }
+
+  void record(const int device_id) override {
+    maca_event.record(at::cuda::getCurrentCUDAStream(device_id));
+  }
+
+  void record(const flagcxStream_t &stream, const int device_id) override {
+    maca_event.record(
+        at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, device_id));
+  }
+
+  void block(const int device_id) override {
+    maca_event.block(at::cuda::getCurrentCUDAStream(device_id));
+  }
+
+  void block(const flagcxStream_t &stream, const int device_id) override {
+    maca_event.block(
+        at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, device_id));
+  }
+
+private:
+  at::cuda::CUDAEvent maca_event;
 };
 #endif
 

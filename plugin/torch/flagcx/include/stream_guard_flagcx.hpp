@@ -1,3 +1,4 @@
+// 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 #pragma once
 
 #include "flagcx.h"
@@ -16,6 +17,11 @@
 #include "framework/core/MLUEvent.h"
 #include "framework/core/MLUStream.h"
 #include "framework/core/stream_guard.h"
+#elif USE_METAX_ADAPTOR
+#include <c10/core/impl/InlineStreamGuard.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/impl/CUDAGuardImpl.h>
+#include <cuda_runtime.h>
 #endif
 
 namespace c10d {
@@ -35,6 +41,9 @@ public:
 #elif USE_CAMBRICON_ADAPTOR
         guard_(
             torch_mlu::getStreamFromExternal(*(cnrtQueue_t *)stream, deviceId))
+#elif USE_METAX_ADAPTOR
+        guard_(
+            at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId))
 #endif
   {
   }
@@ -58,6 +67,9 @@ public:
 #elif USE_CAMBRICON_ADAPTOR
     guard_.reset_stream(
         torch_mlu::getStreamFromExternal(*(cnrtQueue_t *)stream, deviceId_));
+#elif USE_METAX_ADAPTOR
+    guard_.reset_stream(
+        at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId_));
 #endif
     currentStream_ = stream;
   }
@@ -76,6 +88,8 @@ private:
   c10::cuda::CUDAStreamGuard guard_;
 #elif USE_CAMBRICON_ADAPTOR
   torch_mlu::mlu::MLUStreamGuard guard_;
+#elif USE_METAX_ADAPTOR
+  c10::cuda::CUDAStreamGuard guard_;
 #endif
 };
 

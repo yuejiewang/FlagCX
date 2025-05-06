@@ -1,3 +1,5 @@
+//2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 #include "adaptor.h"
 
 #ifdef USE_NVIDIA_ADAPTOR
@@ -27,4 +29,13 @@ struct flagcxCCLAdaptor *cclAdaptors[NCCLADAPTORS] = {&glooAdaptor,
                                                       &cnclAdaptor};
 #endif
 struct flagcxDeviceAdaptor *deviceAdaptor = &mluAdaptor;
+#elif USE_METAX_ADAPTOR
+#ifdef USE_BOOTSTRAP_ADAPTOR
+struct flagcxCCLAdaptor *cclAdaptors[NCCLADAPTORS] = {&bootstrapAdaptor,
+                                                      &mcclAdaptor};
+#elif USE_GLOO_ADAPTOR
+struct flagcxCCLAdaptor *cclAdaptors[NCCLADAPTORS] = {&glooAdaptor,
+                                                      &mcclAdaptor};
+#endif
+struct flagcxDeviceAdaptor *deviceAdaptor = &macaAdaptor;
 #endif

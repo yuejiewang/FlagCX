@@ -1,8 +1,12 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 USE_NVIDIA ?= 0
 USE_ILUVATAR_COREX ?= 0
 USE_CAMBRICON ?= 0
+USE_METAX ?= 0
 ifeq ($(USE_CAMBRICON), 1)
    DEV="MLU"
+else ifeq ($(USE_METAX), 1)
+   DEV="MACA"
 else
    DEV="CUDA"
 endif
