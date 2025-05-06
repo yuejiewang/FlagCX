@@ -51,7 +51,14 @@ flagcxCommOp_t getC2cHomoCommOp(flagcxCommOp_t commOp, int homoType, int mode) {
           }
       }
     case flagcxCommOpAllGather:
-      return flagcxCommOpAllGather;
+      switch (homoType) {
+        case 0:
+          return flagcxCommOpAllGather;
+        case 1:
+          return flagcxCommOpNoOp;
+        case 2:
+          return flagcxCommOpBroadcast;
+      }
     case flagcxCommOpReduceScatter:
       switch (homoType) {
         case 0:
@@ -327,6 +334,22 @@ flagcxResult_t flagcxC2cHomoFunc::run(const void *sendbuff, void *recvbuff,
                               recvOffset_ * getFlagcxDataTypeSize(datatype)),
           count_, datatype, redOp,
           isHomoInterComm_ ? comm->homoInterComm : comm->homo_comm, stream);
+    case flagcxCommOpAllGather:
+      return cclAdaptors[flagcxCCLAdaptorDevice]->allGather(
+          const_cast<const void *>(static_cast<void *>(
+              static_cast<char *>(const_cast<void *>(sendbuff)) +
+              sendOffset_ * getFlagcxDataTypeSize(datatype))),
+          static_cast<void *>(static_cast<char *>(recvbuff) +
+                              recvOffset_ * getFlagcxDataTypeSize(datatype)),
+          count_, datatype, comm->homo_comm, stream);
+    case flagcxCommOpBroadcast:
+      return cclAdaptors[flagcxCCLAdaptorDevice]->broadcast(
+          const_cast<const void *>(static_cast<void *>(
+              static_cast<char *>(const_cast<void *>(sendbuff)) +
+              sendOffset_ * getFlagcxDataTypeSize(datatype))),
+          static_cast<void *>(static_cast<char *>(recvbuff) +
+                              recvOffset_ * getFlagcxDataTypeSize(datatype)),
+          count_, datatype, root, comm->homo_comm, stream);
     default:
       return flagcxSuccess;
   }
@@ -472,13 +495,13 @@ flagcxResult_t flagcxC2cPlanner::searchHeteroSendRecvOps(int searchMethod,
   // cluster j send to cluster z, cluster z recv from cluster j
   for (size_t j = 0; j < clusterInterRankList_.size(); ++j) {
     for (size_t z = j + 1; z < clusterInterRankList_.size(); ++z) {
-      for (size_t r1 = 0; r1 < clusterInterRankList_[j].size(); ++r1) {
+      for (size_t r1 = 0; r1 < clusterInterRankList_[j].size(); ++r1) {         // r1: a cluster j inter rank
         auto &jList = interRankBufferInfoManager_.getBufferInfoList(
             j, clusterInterRankList_[j][r1]);
         for (auto it = jList.begin(); it != jList.end();) {
           int erased = 0;
           if (!it->isScheduled_ && !it->isRecv_) {
-            for (size_t r2 = 0; r2 < clusterInterRankList_[z].size(); ++r2) {
+            for (size_t r2 = 0; r2 < clusterInterRankList_[z].size(); ++r2) {   // r2: a cluster z inter rank
               size_t newR2 = (searchMethod == 1)
                                  ? (r2 + r1) % clusterInterRankList_[z].size()
                                  : r2;
@@ -665,6 +688,13 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
         if (preHomoFuncCommOp == flagcxCommOpReduceScatter) {
           preHomoFuncList_.emplace_back(-1, 0, homoMyRank_ * buffer.count_,
                                         buffer.count_, 0, preHomoFuncCommOp);
+        } else if (preHomoFuncCommOp == flagcxCommOpAllGather) {
+          int offset = 0;
+          for (int i = 0; i < clusterId_; ++i) {
+            offset += comm_->cluster_sizes[i];
+          }
+          preHomoFuncList_.emplace_back(-1, 0, offset, buffer.count_, 0,
+                                        preHomoFuncCommOp);
         }
       }
     } else {
@@ -681,6 +711,14 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                                             (rank_ - homoMyRank_),
                                         buffer.offset_, buffer.offset_,
                                         buffer.count_, 0, preHomoFuncCommOp);
+        } else if (preHomoFuncCommOp == flagcxCommOpAllGather) {
+          int offset = 0;
+          for (int i = 0; i < clusterId_; ++i) {
+            offset += comm_->cluster_sizes[i];
+          }
+          preHomoFuncList_.emplace_back(-1, 0, offset, buffer.count_, 0,
+                                        preHomoFuncCommOp);
+          break;
         }
       }
     }
@@ -755,6 +793,19 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
       } else if (postHomoFuncCommOp == flagcxCommOpReduceScatter) {
         postHomoFuncList_.emplace_back(-1, clusterOffset_ * recvCount_, 0,
                                        recvCount_, 0, postHomoFuncCommOp);
+      } else if (postHomoFuncCommOp == flagcxCommOpBroadcast) {
+        preHomoFuncLoops_ = clusterInterRankList_[clusterId_].size();
+        for (int i = 0; i < preHomoFuncLoops_; ++i) {
+          auto &buffList = interRankBufferInfoManager_.getBufferInfoList(
+              clusterId_, clusterInterRankList_[clusterId_][i]);
+          for (auto it = buffList.begin(); it != buffList.end(); it++) {
+            if (it->isRecv_) {
+              postHomoFuncList_.emplace_back(
+                  clusterInterRankList_[clusterId_][i],
+                  it->offset_, it->offset_, it->count_, 0, homoInterFuncCommOp);
+            }
+          }
+        }
       }
     }
   } else {

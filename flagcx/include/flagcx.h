@@ -43,7 +43,7 @@ typedef enum {
 } flagcxDataType_t;
 
 /* Reduction operation selector */
-typedef enum { flagcxNumRedOps_dummy = 5 } flagcxRedOp_dummy_t;
+typedef enum { flagcxNumRedOps_dummy = 6 } flagcxRedOp_dummy_t;
 typedef enum {
   flagcxSum = 0,
   flagcxProd = 1,
