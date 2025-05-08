@@ -141,6 +141,7 @@ public:
 
 class flagcxC2cHeteroFunc {
 public:
+  friend class flagcxAlgoTimeEstimator;
   flagcxC2cHeteroFunc();
   ~flagcxC2cHeteroFunc();
 
@@ -170,6 +171,7 @@ public:
 
 class flagcxC2cPlanner {
 public:
+  friend class flagcxAlgoTimeEstimator;
   flagcxC2cPlanner(int totalCount, int recvCount, flagcxComm_t comm,
                    flagcxCommOp_t commOp, flagcxRedOp_t redOp);
   ~flagcxC2cPlanner();

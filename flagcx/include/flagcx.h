@@ -86,6 +86,13 @@ typedef enum {
   flagcxMemManaged = 2
 } flagcxMemType_t;
 
+typedef enum {
+  FLAGCX_VENDOR_NVIDIA = 0,
+  FLAGCX_VENDOR_ILUVATAR_COREX = 1,
+  FLAGCX_VENDOR_MLU = 2,
+  FLAGCX_VENDOR_METAX = 3,
+} flagcxVendorType;
+
 #define FLAGCX_UNIQUE_ID_BYTES 256
 typedef struct {
   char internal[FLAGCX_UNIQUE_ID_BYTES];

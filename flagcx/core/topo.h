@@ -327,6 +327,14 @@ flagcxResult_t flagcxTopoGetCompCap(struct flagcxTopoServer *topoServer,
 flagcxResult_t flagcxGetNicDistance(struct flagcxTopoServer *topoServer,
                                     int rank,
                                     struct flagcxNicDistance *distInfo);
+flagcxResult_t flagcxTopoGetLocalNetNode(struct flagcxTopoServer *topoServer,
+                                         int rank,
+                                         struct flagcxTopoNode **netNode);
+
+flagcxResult_t
+flagcxTopoGetServerFromRank(int rank, struct flagcxInterServerTopo *interServer,
+                            struct flagcxTopoServer *currServer,
+                            struct flagcxTopoServer **retServer);
 
 // static flagcxResult_t flagcxTopoIdToIndex(struct flagcxTopoServer*
 // serverTopo, int type, int64_t id, int* index) {
