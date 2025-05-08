@@ -14,6 +14,9 @@
 #include <string.h>
 #include <unordered_map>
 
+#define FLAGCX_CACHE_CAPACITY 16
+static flagcxLRUCache<int, flagcxC2cPlanner> planCache(FLAGCX_CACHE_CAPACITY);
+
 size_t getFlagcxDataTypeSize(flagcxDataType_t dtype) {
   switch (dtype) {
     // case flagcxInt8:
@@ -1169,17 +1172,27 @@ flagcxResult_t flagcxAllReduce(const void *sendbuff, void *recvbuff,
            timers[TIMER_COLL_FREE] / 1e6, timers[TIMER_COLL_MEM_D2H] / 1e6,
            timers[TIMER_COLL_MEM_H2D] / 1e6, timers[TIMER_COLL_COMM] / 1e6);
     } else {
-      // op validation
-      if (op != flagcxSum && op != flagcxMax && op != flagcxMin) {
-        WARN("Unsupported reduction operation %d", op);
-        return flagcxInvalidArgument;
-      }
-
       // Experimental for multi-nic support
       // Construct flagcxC2cPlanner and find corresponding strategy
-      flagcxC2cPlanner planner(count, count, comm, flagcxCommOpAllReduce, op);
-      planner.findStrategy();
-      planner.execute(sendbuff, recvbuff, datatype, -1, stream);
+      flagcxC2cPlanner planner;
+      auto hashValue = getC2cCommPatternHash(count, flagcxCommOpAllReduce, op);
+      if (!planCache.get(hashValue, planner)) {
+        INFO(FLAGCX_COLL,
+             "No available plan is found, create a new one with "
+             "communication pattern "
+             "(count, commOp, redOp) = (%ld, %d, %d), hashValue = %d",
+             count, flagcxCommOpAllReduce, op, hashValue);
+        planner =
+            flagcxC2cPlanner(count, count, comm, flagcxCommOpAllReduce, op);
+        FLAGCXCHECK(planner.findStrategy());
+        planCache.put(hashValue, planner);
+      } else {
+        INFO(FLAGCX_COLL,
+             "Found available planwith communication pattern "
+             "(count, commOp, redOp) = (%ld, %d, %d), hashValue = %d",
+             count, flagcxCommOpAllReduce, op, hashValue);
+      }
+      FLAGCXCHECK(planner.execute(sendbuff, recvbuff, datatype, -1, stream));
     }
   }
   return flagcxSuccess;
