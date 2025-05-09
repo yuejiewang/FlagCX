@@ -55,7 +55,7 @@ flagcxCommOp_t getC2cHomoCommOp(flagcxCommOp_t commOp, int homoType, int mode) {
         case 0:
           return flagcxCommOpAllGather;
         case 1:
-          return flagcxCommOpNoOp;
+          return flagcxCommNoOp;
         case 2:
           return flagcxCommOpBroadcast;
       }
@@ -802,7 +802,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
             if (it->isRecv_) {
               postHomoFuncList_.emplace_back(
                   clusterInterRankList_[clusterId_][i],
-                  it->offset_, it->offset_, it->count_, 0, homoInterFuncCommOp);
+                  it->offset_, it->offset_, it->count_, 0, postHomoFuncCommOp);
             }
           }
         }
@@ -894,7 +894,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
             if (it->isRecv_) {
               postHomoFuncList_.emplace_back(
                   clusterInterRankList_[clusterId_][i],
-                  it->offset_, it->offset_, it->count_, 0, homoInterFuncCommOp);
+                  it->offset_, it->offset_, it->count_, 0, postHomoFuncCommOp);
             }
           }
         }
