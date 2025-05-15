@@ -1,8 +1,10 @@
 # 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+# 2025 - Modified by DU. All Rights Reserved.
 USE_NVIDIA ?= 0
 USE_ILUVATAR_COREX ?= 0
 USE_CAMBRICON ?= 0
 USE_METAX ?= 0
+USE_DU ?= 0
 ifeq ($(USE_CAMBRICON), 1)
    DEV="MLU"
 else ifeq ($(USE_METAX), 1)
@@ -117,6 +119,7 @@ print_var:
 	@echo "USE_NVIDIA: $(USE_NVIDIA)"
 	@echo "USE_ILUVATAR_COREX: $(USE_ILUVATAR_COREX)"
 	@echo "USE_CAMBRICON: $(USE_CAMBRICON)"
+	@echo "USE_DU: $(USE_DU)"
 	@echo "MPI_INCLUDE: $(MPI_INCLUDE)"
 	@echo "MPI_LIB: $(MPI_LIB)"
 	@echo "COMPILER: $(COMPILER)"

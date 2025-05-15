@@ -1,4 +1,7 @@
-// 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+/*************************************************************************
+ * Copyright (c) 2025 by MetaX Integrated Circuits (Shanghai) Co., Ltd. All
+ *Rights Reserved. Copyright (c) 2025 by DU. All Rights Reserved.
+ ************************************************************************/
 #pragma once
 
 #include "flagcx.h"
@@ -13,6 +16,9 @@
 #include "framework/core/MLUEvent.h"
 #include "framework/core/MLUStream.h"
 #elif USE_METAX_ADAPTOR
+#include <ATen/cuda/CUDAEvent.h>
+#include <cuda_runtime.h>
+#elif USE_DU_ADAPTOR
 #include <ATen/cuda/CUDAEvent.h>
 #include <cuda_runtime.h>
 #endif
@@ -139,6 +145,32 @@ public:
 
 private:
   at::cuda::CUDAEvent maca_event;
+};
+#elif USE_DU_ADAPTOR
+class flagcxDuEvent : public flagcxEvent {
+public:
+  flagcxDuEvent() { cudaEvent_ = at::cuda::CUDAEvent(cudaEventDisableTiming); }
+
+  void record(const int deviceId) override {
+    cudaEvent_.record(at::cuda::getCurrentCUDAStream(deviceId));
+  }
+
+  void record(const flagcxStream_t &stream, const int deviceId) override {
+    cudaEvent_.record(
+        at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId));
+  }
+
+  void block(const int deviceId) override {
+    cudaEvent_.block(at::cuda::getCurrentCUDAStream(deviceId));
+  }
+
+  void block(const flagcxStream_t &stream, const int deviceId) override {
+    cudaEvent_.block(
+        at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId));
+  }
+
+private:
+  at::cuda::CUDAEvent cudaEvent_;
 };
 #endif
 

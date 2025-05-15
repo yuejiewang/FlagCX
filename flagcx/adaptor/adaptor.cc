@@ -1,4 +1,7 @@
-//2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+/*************************************************************************
+ * Copyright (c) 2025 by MetaX Integrated Circuits (Shanghai) Co., Ltd. All
+ *Rights Reserved. Copyright (c) 2025 by DU. All Rights Reserved.
+ ************************************************************************/
 
 #include "adaptor.h"
 
@@ -38,4 +41,13 @@ struct flagcxCCLAdaptor *cclAdaptors[NCCLADAPTORS] = {&glooAdaptor,
                                                       &mcclAdaptor};
 #endif
 struct flagcxDeviceAdaptor *deviceAdaptor = &macaAdaptor;
+#elif USE_DU_ADAPTOR
+#ifdef USE_BOOTSTRAP_ADAPTOR
+struct flagcxCCLAdaptor *cclAdaptors[NCCLADAPTORS] = {&bootstrapAdaptor,
+                                                      &duncclAdaptor};
+#elif USE_GLOO_ADAPTOR
+struct flagcxCCLAdaptor *cclAdaptors[NCCLADAPTORS] = {&glooAdaptor,
+                                                      &duncclAdaptor};
+#endif
+struct flagcxDeviceAdaptor *deviceAdaptor = &ducudaAdaptor;
 #endif

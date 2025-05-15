@@ -1,4 +1,5 @@
 # 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+# 2025 - Modified by DU. All Rights Reserved.
 BUILDDIR ?= $(abspath ./build)
 
 # set to 0 if not provided
@@ -8,6 +9,7 @@ USE_CAMBRICON ?= 0
 USE_GLOO ?= 0
 USE_BOOTSTRAP ?= 0
 USE_METAX ?= 0
+USE_DU ?= 0
 
 # set to empty if not provided
 DEVICE_HOME ?=
@@ -23,6 +25,8 @@ ifeq ($(strip $(DEVICE_HOME)),)
 		DEVICE_HOME = $(NEUWARE_HOME)
 	else ifeq ($(USE_METAX), 1)
 		DEVICE_HOME = /opt/maca
+	else ifeq ($(USE_DU), 1)
+		DEVICE_HOME = ${CUDA_PATH}
 	else
 		DEVICE_HOME = /usr/local/cuda
 	endif
@@ -37,6 +41,8 @@ ifeq ($(strip $(CCL_HOME)),)
 		CCL_HOME = $(NEUWARE_HOME)
 	else ifeq ($(USE_METAX), 1)
 		CCL_HOME = /opt/maca
+	else ifeq ($(USE_DU), 1)
+		CCL_HOME = ${CUDA_PATH}
 	else
 		CCL_HOME = /usr/local/nccl/build
 	endif
@@ -92,6 +98,14 @@ else ifeq ($(USE_METAX), 1)
 	CCL_INCLUDE = $(CCL_HOME)/include
 	CCL_LINK = -lmccl
 	ADAPTOR_FLAG = -DUSE_METAX_ADAPTOR
+else ifeq ($(USE_DU), 1)
+	DEVICE_LIB = $(DEVICE_HOME)/lib64
+	DEVICE_INCLUDE = $(DEVICE_HOME)/include
+	DEVICE_LINK = -lcudart -lcuda
+	CCL_LIB = $(CCL_HOME)/lib64
+	CCL_INCLUDE = $(CCL_HOME)/include
+	CCL_LINK = -lnccl
+	ADAPTOR_FLAG = -DUSE_DU_ADAPTOR
 else
 	DEVICE_LIB = $(DEVICE_HOME)/lib64
 	DEVICE_INCLUDE = $(DEVICE_HOME)/include
@@ -147,6 +161,7 @@ print_var:
 	@echo "USE_ILUVATAR_COREX: $(USE_ILUVATAR_COREX)"
 	@echo "USE_CAMBRICON: $(USE_CAMBRICON)"
 	@echo "USE_GLOO: $(USE_GLOO)"
+	@echo "USE_DU: $(USE_DU)"
 	@echo "DEVICE_LIB: $(DEVICE_LIB)"
 	@echo "DEVICE_INCLUDE: $(DEVICE_INCLUDE)"
 	@echo "CCL_LIB: $(CCL_LIB)"

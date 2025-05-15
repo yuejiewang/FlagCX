@@ -1,4 +1,7 @@
-//2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+/*************************************************************************
+ * Copyright (c) 2025 by MetaX Integrated Circuits (Shanghai) Co., Ltd. All
+ *Rights Reserved. Copyright (c) 2025 by DU. All Rights Reserved.
+ ************************************************************************/
 
 #ifndef FLAGCX_ADAPTOR_H_
 #define FLAGCX_ADAPTOR_H_
@@ -22,12 +25,14 @@ extern struct flagcxCCLAdaptor ncclAdaptor;
 extern struct flagcxCCLAdaptor ixncclAdaptor;
 extern struct flagcxCCLAdaptor cnclAdaptor;
 extern struct flagcxCCLAdaptor mcclAdaptor;
+extern struct flagcxCCLAdaptor duncclAdaptor;
 extern struct flagcxCCLAdaptor *cclAdaptors[];
 
 extern struct flagcxDeviceAdaptor cudaAdaptor;
 extern struct flagcxDeviceAdaptor ixcudaAdaptor;
 extern struct flagcxDeviceAdaptor mluAdaptor;
 extern struct flagcxDeviceAdaptor macaAdaptor;
+extern struct flagcxDeviceAdaptor ducudaAdaptor;
 extern struct flagcxDeviceAdaptor *deviceAdaptor;
 
 inline bool flagcxCCLAdaptorNeedSendrecv(size_t value) { return value != 0; }
