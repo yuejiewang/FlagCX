@@ -146,6 +146,12 @@ else
 	HOST_CCL_ADAPTOR_FLAG = -DUSE_BOOTSTRAP_ADAPTOR
 endif
 
+USE_PIPELINE ?= 0
+PIPELINE_FLAG =
+ifeq ($(strip $(USE_PIPELINE)), 1)
+	PIPELINE_FLAG = -DUSE_PIPELINE
+endif
+
 LIBDIR := $(BUILDDIR)/lib
 OBJDIR := $(BUILDDIR)/obj
 
@@ -185,6 +191,7 @@ print_var:
 	@echo "HOST_CCL_INCLUDE: $(HOST_CCL_INCLUDE)"
 	@echo "ADAPTOR_FLAG: $(ADAPTOR_FLAG)"
 	@echo "HOST_CCL_ADAPTOR_FLAG: $(HOST_CCL_ADAPTOR_FLAG)"
+	@echo "PIPELINE_FLAG: $(PIPELINE_FLAG)"
 
 $(LIBDIR)/$(TARGET): $(LIBOBJ)
 	@mkdir -p `dirname $@`
@@ -194,7 +201,7 @@ $(LIBDIR)/$(TARGET): $(LIBOBJ)
 $(OBJDIR)/%.o: %.cc
 	@mkdir -p `dirname $@`
 	@echo "Compiling $@"
-	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
+	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(PIPELINE_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
 
 -include $(LIBOBJ:.o=.d)
 

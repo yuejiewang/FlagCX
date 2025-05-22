@@ -462,7 +462,9 @@ flagcxResult_t flagcxC2cHeteroFunc::run(void *sendbuff, void *recvbuff,
                                         flagcxDataType_t datatype,
                                         flagcxComm_t comm,
                                         flagcxStream_t stream) {
+#ifndef USE_PIPELINE
   flagcxHeteroGroupStart();
+#endif
   for (auto op : p2pOps_) {
     if (op.isRecv_) {
       FLAGCXCHECK(op.run(recvbuff, datatype, comm, stream));
@@ -470,7 +472,9 @@ flagcxResult_t flagcxC2cHeteroFunc::run(void *sendbuff, void *recvbuff,
       FLAGCXCHECK(op.run(sendbuff, datatype, comm, stream));
     }
   }
+#ifndef USE_PIPELINE
   flagcxHeteroGroupEnd();
+#endif
   return flagcxSuccess;
 }
 
@@ -1019,6 +1023,14 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
   } else {
     refreshFunc_ = flagcxC2cRefreshFunc(0, 0, totalCount_, redOp_);
   }
+  
+#ifdef USE_PIPELINE
+  for (int i = 0; i < comm_->nclusters; i++) {
+    heteroFuncPipeline_.emplace_back();
+    homoInterFuncPipeline_.emplace_back();
+    postHomoFuncPipeline_.emplace_back();
+  }
+#endif
 
   // reset multiNic_ based on comm op type
   // since broadcast, alltoall, alltoallv, scatter, gather ops behave
@@ -1167,6 +1179,12 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
 
         // setup heteroFuncs
         flagcxC2cHeteroFunc heteroFunc = flagcxC2cHeteroFunc();
+#ifdef USE_PIPELINE
+        std::vector<flagcxC2cHeteroFunc> heteroFuncStep;
+        for (size_t i = 0; i < comm_->nclusters; ++i) {
+          heteroFuncStep.emplace_back();
+        }
+#endif
         for (size_t j = 0; j < clusterInterRankList_.size(); ++j) {
           for (size_t z = 0; z < clusterInterRankList_[j].size(); ++z) {
             if (rank_ == clusterInterRankList_[j][z]) {
@@ -1176,12 +1194,34 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                 if (it->isScheduled_ && it->loopId_ == i) {
                   heteroFunc.addP2pOp(rank_, it->peerRank_, it->offset_,
                                       it->count_, it->isRecv_);
+#ifdef USE_PIPELINE
+                  int sendClusterId = it->isRecv_
+                                          ? comm_->cluster_ids[it->peerRank_]
+                                          : clusterId_;
+                  int recvClusterId = it->isRecv_
+                                          ? clusterId_
+                                          : comm_->cluster_ids[it->peerRank_];
+                  size_t step =
+                      (sendClusterId + comm_->nclusters - 1 - recvClusterId) %
+                      comm_->nclusters;
+                  heteroFuncStep[step].addP2pOp(rank_, it->peerRank_,
+                                                it->offset_, it->count_,
+                                                it->isRecv_);
+#endif
                 }
               }
             }
           }
         }
         heteroFuncList_.push_back(std::move(heteroFunc));
+#ifdef USE_PIPELINE
+        for (size_t s = 0; s < heteroFuncStep.size(); ++s) {
+          if (heteroFuncPipeline_.size() <= s) {
+            heteroFuncPipeline_.emplace_back();
+          }
+          heteroFuncPipeline_[s].push_back(std::move(heteroFuncStep[s]));
+        }
+#endif
 
         // setup homoInterFuncs
         flagcxCommOp_t homoInterFuncCommOp =
@@ -1236,6 +1276,13 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                 clusterInterRankList_[clusterId_][i] - (rank_ - homoMyRank_),
                 it->offset_, it->offset_, it->count_, 2, postHomoFuncCommOp);
             postHomoFuncLoops_ += 1;
+#ifdef USE_PIPELINE
+            size_t step = (comm_->cluster_ids[it->peerRank_] + comm_->nclusters -
+                          clusterId_) % comm_->nclusters;
+            postHomoFuncPipeline_[step].emplace_back(
+                clusterInterRankList_[clusterId_][i] - (rank_ - homoMyRank_),
+                it->offset_, it->offset_, it->count_, 0, postHomoFuncCommOp);
+#endif
           }
         }
       }
@@ -1321,6 +1368,12 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
       }
       heteroFuncList_.push_back(std::move(heteroFunc));
     } else if (commOp_ == flagcxCommOpAllGather) {
+#ifdef USE_PIPELINE
+      std::vector<flagcxC2cHeteroFunc> heteroFuncStep;
+      for (size_t i = 0; i < comm_->nclusters; ++i) {
+        heteroFuncStep.emplace_back();
+      }
+#endif
       heteroAndHomoInterFuncLoops_ = 1;
       flagcxC2cHeteroFunc heteroFunc = flagcxC2cHeteroFunc();
       int recvOffset = 0;
@@ -1336,10 +1389,28 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
           heteroFunc.addP2pOp(rank_, clusterInterRankList_[i][0],
                               recvOffset * sendCount_,
                               comm_->cluster_sizes[i] * sendCount_, 1);
+#ifdef USE_PIPELINE
+          size_t step =
+              (clusterId_ + comm_->nclusters - 1 - i) % comm_->nclusters;
+          heteroFuncStep[step].addP2pOp(rank_, clusterInterRankList_[i][0],
+                                        clusterOffset_ * sendCount_,
+                                        clusterCount_ * sendCount_, 0);
+          heteroFuncStep[comm_->nclusters - 1 - step].addP2pOp(
+              rank_, clusterInterRankList_[i][0], recvOffset * sendCount_,
+              comm_->cluster_sizes[i] * sendCount_, 1);
+#endif
         }
         recvOffset += comm_->cluster_sizes[i];
       }
       heteroFuncList_.push_back(std::move(heteroFunc));
+#ifdef USE_PIPELINE
+      for (size_t s = 0; s < heteroFuncStep.size(); ++s) {
+        if (heteroFuncPipeline_.size() <= s) {
+          heteroFuncPipeline_.emplace_back();
+        }
+        heteroFuncPipeline_[s].push_back(std::move(heteroFuncStep[s]));
+      }
+#endif
     }
 
     // setup homoInterFuncs
@@ -1373,6 +1444,13 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
             clusterInterRankList_[clusterId_][0] - (rank_ - homoMyRank_),
             clusterOffset * sendCount_, clusterOffset * sendCount_,
             comm_->cluster_sizes[i] * sendCount_, 2, postHomoFuncCommOp);
+#ifdef USE_PIPELINE
+        size_t step = comm_->cluster_ids[i] + comm_->nclusters - clusterId_;
+        postHomoFuncPipeline_[step].emplace_back(
+            clusterInterRankList_[clusterId_][0] - (rank_ - homoMyRank_),
+            clusterOffset * sendCount_, clusterOffset * sendCount_,
+            comm_->cluster_sizes[i] * sendCount_, 0, postHomoFuncCommOp);
+#endif
         postHomoFuncLoops_ += 1;
         clusterOffset += comm_->cluster_sizes[i];
       }
@@ -1448,6 +1526,67 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
   }
   cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
 
+#ifdef USE_PIPELINE
+  int nsteps = comm_->nclusters;
+  refreshFunc_.run(recvTmpBuff, datatype, stream);
+  flagcxHeteroGroupStart();
+  for (int i = 0; i < heteroFuncPipeline_[0].size(); ++i) {
+    heteroFuncPipeline_[0][i].run(sendTmpBuff, recvTmpBuff, datatype, comm_,
+                                  stream);
+  }
+  flagcxHeteroGroupEnd();
+  deviceAdaptor->streamSynchronize(stream);
+  for (int s = 1; s < nsteps - 1; ++s) {
+    cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
+    for (int i = 0; i < homoInterFuncPipeline_[s].size(); ++i) {
+      homoInterFuncPipeline_[s][i].run(recvTmpBuff, recvTmpBuff, datatype,
+                                       redOp_, comm_->globalrank2homorank[root],
+                                       comm_, stream);
+    }
+    cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
+
+    // execute refresh func
+    // todo: support pipeline steps in refresh func
+    refreshFunc_.run(recvTmpBuff, datatype, stream);
+
+    // execute postHomoFunc
+    cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
+    for (int i = 0; i < postHomoFuncPipeline_[s].size(); ++i) {
+      postHomoFuncPipeline_[s][i].run(recvTmpBuff, recvbuff, datatype, redOp_,
+                                      comm_->globalrank2homorank[root], comm_,
+                                      stream);
+    }
+    cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
+
+    flagcxHeteroGroupStart();
+    for (int i = 0; i < heteroFuncPipeline_[s].size(); ++i) {
+      heteroFuncPipeline_[s][i].run(sendTmpBuff, recvTmpBuff, datatype, comm_,
+                                    stream);
+    }
+    flagcxHeteroGroupEnd();
+    deviceAdaptor->streamSynchronize(stream);
+  }
+  cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
+  for (int i = 0; i < homoInterFuncPipeline_[nsteps - 1].size(); ++i) {
+    homoInterFuncPipeline_[nsteps - 1][i].run(
+        recvTmpBuff, recvTmpBuff, datatype, redOp_,
+        comm_->globalrank2homorank[root], comm_, stream);
+  }
+  cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
+
+  // execute refresh func
+  // todo: support pipeline steps in refresh func
+  refreshFunc_.run(recvTmpBuff, datatype, stream);
+
+  // execute postHomoFunc
+  cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
+  for (int i = 0; i < postHomoFuncPipeline_[nsteps - 1].size(); ++i) {
+    postHomoFuncPipeline_[nsteps - 1][i].run(
+        recvTmpBuff, recvbuff, datatype, redOp_,
+        comm_->globalrank2homorank[root], comm_, stream);
+  }
+  cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
+#else
   for (int i = 0; i < heteroAndHomoInterFuncLoops_; ++i) {
     // execute refreshFunc
     refreshFunc_.run(sendTmpBuff, datatype, stream);
@@ -1477,6 +1616,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
                              comm_->globalrank2homorank[root], comm_, stream);
   }
   cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
+#endif
 
   // free scratch buffer if needed
   if (scratchBuffer_ != nullptr) {
