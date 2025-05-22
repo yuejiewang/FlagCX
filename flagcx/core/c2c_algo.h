@@ -235,6 +235,11 @@ private:
   std::vector<flagcxC2cHeteroFunc> heteroFuncList_;
   std::vector<flagcxC2cHomoFunc> homoInterFuncList_;
   std::vector<flagcxC2cHomoFunc> postHomoFuncList_;
+#ifdef USE_PIPELINE
+  std::vector<std::vector<flagcxC2cHeteroFunc>> heteroFuncPipeline_;
+  std::vector<std::vector<flagcxC2cHomoFunc>> homoInterFuncPipeline_;
+  std::vector<std::vector<flagcxC2cHomoFunc>> postHomoFuncPipeline_;
+#endif
   void *scratchBuffer_; // used for intermediate processing
 };
 

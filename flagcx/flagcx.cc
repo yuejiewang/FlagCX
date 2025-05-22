@@ -236,6 +236,13 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
   // Get current gpu vendor
   flagcxVendor vendor;
   deviceAdaptor->getVendor(vendor.internal);
+#ifdef USE_PIPELINE
+  uint64_t nodeId_ = rank / 8;  // todo: use topo detect to determine nodeId
+  char nodeIdStr[16];
+  std::snprintf(nodeIdStr, sizeof(nodeIdStr), "%lu", nodeId_);
+  std::strcat(vendor.internal, nodeIdStr);
+  INFO(FLAGCX_INIT, "Get vendor: rank %d vendor %s", rank, vendor.internal);
+#endif
   FLAGCXCHECK(flagcxCalloc(&vendorData, nranks));
   memcpy(vendorData + rank, &vendor, sizeof(flagcxVendor));
   FLAGCXCHECK(
