@@ -1275,29 +1275,29 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
 
         for (size_t s = 0; s < nsteps_; ++s) {
           heteroFuncPipeline_[s].push_back(std::move(heteroFuncStep[s]));
+        }
 
-          // setup homoInterFuncs
-          flagcxCommOp_t homoInterFuncCommOp =
-              eachNicPerRank_ ? getC2cHomoCommOp(1, 0) : getC2cHomoCommOp(1, 1);
-          if (homoInterFuncCommOp == flagcxCommOpAllReduce) {
-            homoInterFuncPipeline_[s].emplace_back(-1, 0, 0, totalCount_, 1,
-                                                   homoInterFuncCommOp);
-          } else if (homoInterFuncCommOp == flagcxCommOpReduce) {
-            homoInterFuncPipeline_[s].emplace_back(-1, 0, 0, totalCount_,
-                                                   0, // use homo_comm
-                                                   homoInterFuncCommOp);
-          } else if (homoInterFuncCommOp == flagcxCommOpSend) {
-            homoInterFuncPipeline_[s].emplace_back(-1, 0, 0, totalCount_, 1,
-                                                   homoInterFuncCommOp,
-                                                   interRankBufferInfoManager_);
-          } else if (homoInterFuncCommOp == flagcxCommOpRecv) {
-            homoInterFuncPipeline_[s].emplace_back(-1, 0, 0, totalCount_, 1,
-                                                   homoInterFuncCommOp,
-                                                   interRankBufferInfoManager_);
-          } else if (homoInterFuncCommOp == flagcxCommNoOp) {
-            homoInterFuncPipeline_[s].emplace_back(-1, 0, 0, totalCount_, 1,
-                                                   homoInterFuncCommOp);
-          }
+        // setup homoInterFuncs
+        flagcxCommOp_t homoInterFuncCommOp =
+            eachNicPerRank_ ? getC2cHomoCommOp(1, 0) : getC2cHomoCommOp(1, 1);
+        if (homoInterFuncCommOp == flagcxCommOpAllReduce) {
+          homoInterFuncPipeline_[0].emplace_back(-1, 0, 0, totalCount_, 1,
+                                                 homoInterFuncCommOp);
+        } else if (homoInterFuncCommOp == flagcxCommOpReduce) {
+          homoInterFuncPipeline_[0].emplace_back(-1, 0, 0, totalCount_,
+                                                 0, // use homo_comm
+                                                 homoInterFuncCommOp);
+        } else if (homoInterFuncCommOp == flagcxCommOpSend) {
+          homoInterFuncPipeline_[0].emplace_back(-1, 0, 0, totalCount_, 1,
+                                                 homoInterFuncCommOp,
+                                                 interRankBufferInfoManager_);
+        } else if (homoInterFuncCommOp == flagcxCommOpRecv) {
+          homoInterFuncPipeline_[0].emplace_back(-1, 0, 0, totalCount_, 1,
+                                                 homoInterFuncCommOp,
+                                                 interRankBufferInfoManager_);
+        } else if (homoInterFuncCommOp == flagcxCommNoOp) {
+          homoInterFuncPipeline_[0].emplace_back(-1, 0, 0, totalCount_, 1,
+                                                 homoInterFuncCommOp);
         }
 
         if (!scheduleCompleted) {
