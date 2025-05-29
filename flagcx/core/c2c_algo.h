@@ -198,6 +198,7 @@ public:
                          size_t *rDispls = nullptr);
 
 private:
+  int nSteps_;
   int sendCount_;
   int recvCount_;
   int rootRank_; // used for gather, scatter
