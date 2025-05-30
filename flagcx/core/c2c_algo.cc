@@ -1575,8 +1575,6 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
   cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
 
   if (commOp_ == flagcxCommOpAllGather) {
-    int nSteps_ = comm_->nclusters;
-    refreshFunc_.run(recvTmpBuff, datatype, stream);
     flagcxHeteroGroupStart();
     for (int i = 0; i < heteroFuncPipeline_[0].size(); ++i) {
       heteroFuncPipeline_[0][i].run(sendTmpBuff, recvTmpBuff, datatype, comm_,
@@ -1584,21 +1582,14 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
     }
     flagcxHeteroGroupEnd();
     deviceAdaptor->streamSynchronize(stream);
+
+    flagcxStream_t het_stream;
+    deviceAdaptor->streamCreate(&het_stream);
+
     for (int s = 1; s < nSteps_ - 1; ++s) {
       cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
-      for (int i = 0; i < homoInterFuncPipeline_[s].size(); ++i) {
-        homoInterFuncPipeline_[s][i].run(
-            recvTmpBuff, recvTmpBuff, datatype, redOp_,
-            comm_->globalrank2homorank[root], comm_, stream);
-      }
-      cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
-
-      // execute refresh func
-      // todo: support pipeline steps in refresh func
-      refreshFunc_.run(recvTmpBuff, datatype, stream);
-
+      // no need for refresh func in allgather
       // execute postHomoFunc
-      cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
       for (int i = 0; i < postHomoFuncPipeline_[s].size(); ++i) {
         postHomoFuncPipeline_[s][i].run(recvTmpBuff, recvbuff, datatype, redOp_,
                                         comm_->globalrank2homorank[root], comm_,
@@ -1609,31 +1600,24 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
       flagcxHeteroGroupStart();
       for (int i = 0; i < heteroFuncPipeline_[s].size(); ++i) {
         heteroFuncPipeline_[s][i].run(sendTmpBuff, recvTmpBuff, datatype, comm_,
-                                      stream);
+                                      het_stream);
       }
       flagcxHeteroGroupEnd();
       deviceAdaptor->streamSynchronize(stream);
+      deviceAdaptor->streamSynchronize(het_stream);
     }
+
+    // last pipeline
     cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
-    for (int i = 0; i < homoInterFuncPipeline_[nSteps_ - 1].size(); ++i) {
-      homoInterFuncPipeline_[nSteps_ - 1][i].run(
-          recvTmpBuff, recvTmpBuff, datatype, redOp_,
-          comm_->globalrank2homorank[root], comm_, stream);
-    }
-    cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
-
-    // execute refresh func
-    // todo: support pipeline steps in refresh func
-    refreshFunc_.run(recvTmpBuff, datatype, stream);
-
     // execute postHomoFunc
-    cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
     for (int i = 0; i < postHomoFuncPipeline_[nSteps_ - 1].size(); ++i) {
       postHomoFuncPipeline_[nSteps_ - 1][i].run(
           recvTmpBuff, recvbuff, datatype, redOp_,
           comm_->globalrank2homorank[root], comm_, stream);
     }
     cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
+
+    deviceAdaptor->streamDestroy(het_stream);
   } else {
     for (int i = 0; i < heteroAndHomoInterFuncLoops_; ++i) {
       // execute refreshFunc
