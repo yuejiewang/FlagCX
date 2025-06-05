@@ -1266,6 +1266,11 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                     size_t step =
                         (sendClusterId + comm_->nclusters - 1 - recvClusterId) %
                         comm_->nclusters;
+                    if (eachNicPerRank_ && it->isRecv_ &&
+                        clusterInterRankList_[sendClusterId].size() ==
+                            clusterInterRankList_[recvClusterId].size()) {
+                      offset -= comm_->homo_rank * sendCount_;
+                    }
                     heteroFuncStep[step].addP2pOp(rank_, it->peerRank_,
                                                   offset, it->count_,
                                                   it->isRecv_);
@@ -1337,12 +1342,14 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
               size_t step = (comm_->cluster_ids[it->peerRank_] +
                              comm_->nclusters - clusterId_) %
                             comm_->nclusters;
-              if (eachNicPerRank_ && postHomoFuncPipeline_[step].size() == 0 &&
+              if (eachNicPerRank_ &&
                   clusterInterRankList_[clusterId_].size() ==
                       clusterInterRankList_[comm_->cluster_ids[it->peerRank_]].size()) {
-                postHomoFuncPipeline_[step].emplace_back(
-                    -1, it->offset_, it->offset_, it->count_, 2,
-                    flagcxCommOpAllGather);
+                if (postHomoFuncPipeline_[step].size() == 0) {
+                  postHomoFuncPipeline_[step].emplace_back(
+                      -1, it->offset_, it->offset_, it->count_, 2,
+                      flagcxCommOpAllGather);
+                }
               } else {
                 postHomoFuncPipeline_[step].emplace_back(
                     clusterInterRankList_[clusterId_][i] -
@@ -1629,6 +1636,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
       flagcxHeteroGroupEnd();
       deviceAdaptor->streamSynchronize(stream);
       deviceAdaptor->streamSynchronize(het_stream);
+      deviceAdaptor->deviceSynchronize();
     } else {
       flagcxHeteroGroupStart();
       for (int i = 0; i < heteroFuncPipeline_[0].size(); ++i) {
@@ -1657,6 +1665,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
       flagcxHeteroGroupEnd();
       deviceAdaptor->streamSynchronize(stream);
       deviceAdaptor->streamSynchronize(het_stream);
+      deviceAdaptor->deviceSynchronize();
     }
 
     // last pipeline
