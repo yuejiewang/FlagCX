@@ -1337,9 +1337,19 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
               size_t step = (comm_->cluster_ids[it->peerRank_] +
                              comm_->nclusters - clusterId_) %
                             comm_->nclusters;
-              postHomoFuncPipeline_[step].emplace_back(
-                  clusterInterRankList_[clusterId_][i] - (rank_ - homoMyRank_),
-                  it->offset_, it->offset_, it->count_, 2, postHomoFuncCommOp);
+              if (eachNicPerRank_ && postHomoFuncPipeline_[step].size() == 0 &&
+                  clusterInterRankList_[clusterId_].size() ==
+                      clusterInterRankList_[comm_->cluster_ids[it->peerRank_]].size()) {
+                postHomoFuncPipeline_[step].emplace_back(
+                    -1, it->offset_, it->offset_, it->count_, 2,
+                    flagcxCommOpAllGather);
+              } else {
+                postHomoFuncPipeline_[step].emplace_back(
+                    clusterInterRankList_[clusterId_][i] -
+                        (rank_ - homoMyRank_),
+                    it->offset_, it->offset_, it->count_, 2,
+                    postHomoFuncCommOp);
+              }
             } else {
               postHomoFuncPipeline_[0].emplace_back(
                   clusterInterRankList_[clusterId_][i] - (rank_ - homoMyRank_),
