@@ -38,6 +38,8 @@ public:
         deviceId_(deviceId), isBarrierOp_(false) {
 #ifdef USE_NVIDIA_ADAPTOR
     event_ = std::make_unique<flagcxCudaEvent>();
+#elif USE_ASCEND_ADAPTOR
+    event_ = std::make_unique<flagcxCannEvent>();
 #elif USE_ILUVATAR_COREX_ADAPTOR
     event_ = std::make_unique<flagcxIxcudaEvent>();
 #elif USE_CAMBRICON_ADAPTOR
@@ -164,6 +166,8 @@ public:
     std::string devName = "cuda";
 #ifdef USE_NVIDIA_ADAPTOR
     devName = "cuda";
+#elif USE_ASCEND_ADAPTOR
+    devName = "cann";
 #elif USE_ILUVATAR_COREX_ADAPTOR
     devName = "cuda";
 #elif USE_CAMBRICON_ADAPTOR
@@ -201,6 +205,7 @@ protected:
   std::unordered_map<int, flagcxStream_t> flagcxStreams_;
   std::unordered_map<int, std::unique_ptr<flagcxEvent>> flagcxEvents_;
   flagcxHandlerGroup_t handler_ = nullptr;
+  aclrtStream acl_stream;
 
 private:
   // Helper that encapsulates work shared across all collective communication
