@@ -969,12 +969,9 @@ flagcxCommOp_t flagcxC2cPlanner::getC2cHomoCommOp(int homoType, int mode) {
   }
 }
 
-flagcxResult_t flagcxC2cPlanner::importXml(const char *path) {
+flagcxResult_t flagcxC2cPlanner::importXml(const char *prefix) {
   char filename[128];
-  sprintf(
-      filename, "%s/%lu_%d.xml", path,
-      genC2cAlgoHash(sendCount_, recvCount_, rootClusterId_, commOp_, redOp_),
-      rank_);
+  sprintf(filename, "%s_%d.xml", prefix, rank_);
   TRACE_CALL("rank %d algo input set to %s", rank_, filename);
   FILE *file = fopen(filename, "r");
   if (!file)
@@ -1040,12 +1037,9 @@ flagcxResult_t flagcxC2cPlanner::importXml(const char *path) {
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxC2cPlanner::exportXml(const char *path) {
+flagcxResult_t flagcxC2cPlanner::exportXml(const char *prefix) {
   char filename[128];
-  sprintf(
-      filename, "%s/%lu_%d.xml", path,
-      genC2cAlgoHash(sendCount_, recvCount_, rootClusterId_, commOp_, redOp_),
-      rank_);
+  sprintf(filename, "%s_%d.xml", prefix, rank_);
   FILE *file = fopen(filename, "w");
   if (!file)
     return flagcxInternalError;
@@ -1991,8 +1985,15 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
       }
     }
   }
-  if (getenv("FLAGCX_ALGO_EXPORT_PATH")) {
-    exportXml(getenv("FLAGCX_ALGO_EXPORT_PATH"));
+  if (getenv("FLAGCX_ALGO_EXPORT_PREFIX")) {
+    exportXml(getenv("FLAGCX_ALGO_EXPORT_PREFIX"));
+  } else if (getenv("FLAGCX_ALGO_EXPORT_PATH")) {
+    const char *algo_path = getenv("FLAGCX_ALGO_EXPORT_PATH");
+    size_t algo_hash =
+        genC2cAlgoHash(sendCount_, recvCount_, rootClusterId_, commOp_, redOp_);
+    char prefix[128];
+    snprintf(prefix, sizeof(prefix), "%s/%lu", algo_path, algo_hash);
+    exportXml(prefix);
   }
   return flagcxSuccess;
 }
@@ -2055,7 +2056,16 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
   if (getenv("FLAGCX_C2C_ALGO")) {
     if (strcmp(getenv("FLAGCX_C2C_ALGO"), "XML_INPUT") == 0) {
       const char *algo_path = getenv("FLAGCX_ALGO_IMPORT_PATH");
-      res = importXml(algo_path);
+      const char *algo_prefix = getenv("FLAGCX_ALGO_IMPORT_PREFIX");
+      if (algo_prefix) {
+        res = importXml(algo_prefix);
+      } else if (algo_path) {
+        size_t algo_hash = genC2cAlgoHash(sendCount_, recvCount_,
+                                          rootClusterId_, commOp_, redOp_);
+        char prefix[128];
+        snprintf(prefix, sizeof(prefix), "%s/%lu", algo_path, algo_hash);
+        res = importXml(prefix);
+      }
     } else {
       res = flagcxNotSupported;
     }

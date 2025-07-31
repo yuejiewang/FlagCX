@@ -209,9 +209,9 @@ public:
 
   flagcxCommOp_t getC2cHomoCommOp(int homoType, int mode);
   // import a planner from an xml file
-  flagcxResult_t importXml(const char *path);
+  flagcxResult_t importXml(const char *prefix);
   // export a planner to an xml file
-  flagcxResult_t exportXml(const char *path);
+  flagcxResult_t exportXml(const char *prefix);
   flagcxResult_t refresh(
       int isSendRecv); // 0: refresh recv info only; 1: refresh send+recv info
   flagcxResult_t searchHeteroSendRecvOps(int searchMethod,
