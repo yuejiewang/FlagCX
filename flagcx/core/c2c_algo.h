@@ -186,11 +186,11 @@ public:
   flagcxResult_t run(void *recvbuff, void *scratchbuff,
                      flagcxDataType_t datatype, flagcxStream_t stream);
 
+  int bufftype_;
+  size_t start_;
   size_t offset_;
   size_t count_;
   size_t totalCount_;
-  size_t start_;
-  int bufftype_;
   flagcxRedOp_t redOp_;
 };
 
