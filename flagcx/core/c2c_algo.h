@@ -179,14 +179,18 @@ public:
   flagcxC2cRefreshFunc();
   flagcxC2cRefreshFunc(size_t offset, size_t count, size_t totalCount,
                        flagcxRedOp_t redOp);
+  flagcxC2cRefreshFunc(int bufftype, size_t start, size_t offset, size_t count,
+                       size_t totalCount, flagcxRedOp_t redOp);
   ~flagcxC2cRefreshFunc();
 
-  flagcxResult_t run(void *buff, flagcxDataType_t datatype,
-                     flagcxStream_t stream);
+  flagcxResult_t run(void *recvbuff, void *scratchbuff,
+                     flagcxDataType_t datatype, flagcxStream_t stream);
 
   size_t offset_;
   size_t count_;
   size_t totalCount_;
+  size_t start_;
+  int bufftype_;
   flagcxRedOp_t redOp_;
 };
 

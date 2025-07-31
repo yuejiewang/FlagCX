@@ -572,21 +572,34 @@ flagcxC2cRefreshFunc::flagcxC2cRefreshFunc()
 flagcxC2cRefreshFunc::flagcxC2cRefreshFunc(size_t offset, size_t count,
                                            size_t totalCount,
                                            flagcxRedOp_t redOp)
-    : offset_(offset), count_(count), totalCount_(totalCount), redOp_(redOp) {}
+    : offset_(offset), count_(count), totalCount_(totalCount), redOp_(redOp) {
+  bufftype_ = -1;
+  start_ = 0;
+}
+flagcxC2cRefreshFunc::flagcxC2cRefreshFunc(int bufftype, size_t start,
+                                           size_t offset, size_t count,
+                                           size_t totalCount,
+                                           flagcxRedOp_t redOp)
+    : bufftype_(bufftype), start_(start), offset_(offset), count_(count),
+      totalCount_(totalCount), redOp_(redOp) {}
 flagcxC2cRefreshFunc::~flagcxC2cRefreshFunc() {}
 
-flagcxResult_t flagcxC2cRefreshFunc::run(void *buff, flagcxDataType_t datatype,
+flagcxResult_t flagcxC2cRefreshFunc::run(void *recvbuff, void *scratchbuff,
+                                         flagcxDataType_t datatype,
                                          flagcxStream_t stream) {
+  void *refreshbuff = bufftype_ == 1 ? recvbuff : scratchbuff;
+  refreshbuff = static_cast<void *>(static_cast<char *>(refreshbuff) +
+                                    start_ * getFlagcxDataTypeSize(datatype));
   TRACE_CALL(
       "flagcxC2cRefreshFunc run: offset = %lu, count = %lu, totalCount = %lu, "
       "datatype = %d, redOp = %d",
       offset_, count_, totalCount_, datatype, redOp_);
   if (redOp_ == flagcxSum) {
-    deviceAdaptor->deviceMemset(buff, 0,
+    deviceAdaptor->deviceMemset(refreshbuff, 0,
                                 offset_ * getFlagcxDataTypeSize(datatype),
                                 flagcxMemDevice, stream);
     deviceAdaptor->deviceMemset(
-        static_cast<void *>(static_cast<char *>(buff) +
+        static_cast<void *>(static_cast<char *>(refreshbuff) +
                             (offset_ + count_) *
                                 getFlagcxDataTypeSize(datatype)),
         0, (totalCount_ - offset_ - count_) * getFlagcxDataTypeSize(datatype),
@@ -984,6 +997,8 @@ flagcxResult_t flagcxC2cPlanner::importXml(const char *path) {
   nSeqPostSteps_ = readIntTag(line, "nSeqPostSteps");
 
   // load refreshFunc
+  int buffType;
+  size_t startOffset;
   size_t offset;
   size_t count;
   size_t totalCount;
@@ -991,6 +1006,10 @@ flagcxResult_t flagcxC2cPlanner::importXml(const char *path) {
   while (fgets(line, sizeof(line), file)) {
     if (strstr(line, "</RefreshFunc>"))
       break;
+    if (strstr(line, "<buffType>"))
+      buffType = readIntTag(line, "buffType");
+    if (strstr(line, "<start>"))
+      startOffset = readSizeTag(line, "start");
     if (strstr(line, "<offset>"))
       offset = readSizeTag(line, "offset");
     if (strstr(line, "<count>"))
@@ -1004,7 +1023,8 @@ flagcxResult_t flagcxC2cPlanner::importXml(const char *path) {
       "init refreshFunc with: offset = %lu, count = %lu, totalCount = %lu, "
       "redOp = %d",
       offset, count, totalCount, redOp);
-  refreshFunc_ = flagcxC2cRefreshFunc(offset, count, totalCount, redOp);
+  refreshFunc_ = flagcxC2cRefreshFunc(buffType, startOffset, offset, count,
+                                      totalCount, redOp);
 
   // function sequences
   preHomoFuncSteps_ =
@@ -2081,17 +2101,16 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
   deviceAdaptor->streamSynchronize(stream);
 
   // execute pipelined preHomoFunc and heteroFunc steps
-  void *refreshBuff = sendTmpBuff;
-  if ((commOp_ == flagcxCommOpReduceScatter ||
-       commOp_ == flagcxCommOpAllReduce) &&
-      algorithm_ == flagcxAlgoPipeline) {
-    refreshBuff =
-        static_cast<void *>(static_cast<char *>(sendTmpBuff) +
-                            clusterOffset_ * totalCount_ / comm_->nranks *
-                                getFlagcxDataTypeSize(datatype));
-  }
   // execute refreshFunc
-  refreshFunc_.run(refreshBuff, datatype, stream);
+  if (refreshFunc_.bufftype_ == -1) {
+    refreshFunc_.bufftype_ = scratchBuffer_ == nullptr ? 1 : 2;
+    if ((commOp_ == flagcxCommOpReduceScatter ||
+         commOp_ == flagcxCommOpAllReduce) &&
+        algorithm_ == flagcxAlgoPipeline) {
+      refreshFunc_.start_ = clusterOffset_ * totalCount_ / comm_->nranks;
+    }
+  }
+  refreshFunc_.run(recvbuff, scratchBuffer_, datatype, stream);
   deviceAdaptor->streamSynchronize(stream);
   for (int s = 0; s < nPipePreSteps_; ++s) {
     cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
@@ -2104,9 +2123,6 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
     cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
     flagcxHeteroGroupStart();
     for (int i = 0; i < heteroFuncSteps_[s].size(); ++i) {
-      // execute refreshFunc
-      // refreshFunc_.run(refreshBuff, datatype, stream);
-
       // TODO: use stream wait rather than stream sync to avoid cpu blocking
       // deviceAdaptor->streamSynchronize(stream);
 
@@ -2122,7 +2138,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
         homoInterFuncSteps_[s][i].run(
             sendbuff, recvbuff, scratchBuffer_, datatype, redOp_,
             comm_->globalrank2homorank[root], comm_, het_stream);
-        refreshFunc_.run(refreshBuff, datatype, het_stream);
+        refreshFunc_.run(recvbuff, scratchBuffer_, datatype, stream);
       }
     }
     flagcxHeteroGroupEnd();
@@ -2136,7 +2152,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
     for (int i = 0; i < heteroFuncSteps_[nPipePreSteps_ + s].size(); ++i) {
       // execute refreshFunc
       if (algorithm_ == flagcxAlgoSequential) {
-        refreshFunc_.run(refreshBuff, datatype, stream);
+        refreshFunc_.run(recvbuff, scratchBuffer_, datatype, stream);
       }
 
       // TODO: use stream wait rather than stream sync to avoid cpu blocking
@@ -2155,7 +2171,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
             sendbuff, recvbuff, scratchBuffer_, datatype, redOp_,
             comm_->globalrank2homorank[root], comm_, stream);
         if (algorithm_ == flagcxAlgoPipeline) {
-          refreshFunc_.run(refreshBuff, datatype, stream);
+          refreshFunc_.run(recvbuff, scratchBuffer_, datatype, stream);
         }
       }
     }
@@ -2165,7 +2181,6 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
   // execute pipelined heteroFunc and postHomoFunc steps
   for (int s = 0; s < nPipePostSteps_; ++s) {
     cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
-    // todo: add refresh and inter func for combining collectives
     // execute postHomoFunc
     for (int i = 0; i < postHomoFuncSteps_[s].size(); ++i) {
       postHomoFuncSteps_[s][i].run(sendbuff, recvbuff, scratchBuffer_, datatype,
@@ -2178,9 +2193,6 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
     for (int i = 0;
          i < heteroFuncSteps_[nPipePreSteps_ + nSeqInterSteps_ + s].size();
          ++i) {
-      // execute refreshFunc
-      // refreshFunc_.run(refreshBuff, datatype, stream);
-
       // TODO: use stream wait rather than stream sync to avoid cpu blocking
       // deviceAdaptor->streamSynchronize(stream);
 
@@ -2211,7 +2223,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
     for (int i = 0; i < postHomoFuncSteps_[nPipePostSteps_ + s].size(); ++i) {
       // execute refresh func
       if (algorithm_ == flagcxAlgoSequential) {
-        refreshFunc_.run(refreshBuff, datatype, stream);
+        refreshFunc_.run(recvbuff, scratchBuffer_, datatype, stream);
       }
 
       // execute postHomoFunc
