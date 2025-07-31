@@ -179,11 +179,15 @@ public:
   flagcxC2cRefreshFunc();
   flagcxC2cRefreshFunc(size_t offset, size_t count, size_t totalCount,
                        flagcxRedOp_t redOp);
+  flagcxC2cRefreshFunc(int bufftype, size_t start, size_t offset, size_t count,
+                       size_t totalCount, flagcxRedOp_t redOp);
   ~flagcxC2cRefreshFunc();
 
-  flagcxResult_t run(void *buff, flagcxDataType_t datatype,
-                     flagcxStream_t stream);
+  flagcxResult_t run(void *recvbuff, void *scratchbuff,
+                     flagcxDataType_t datatype, flagcxStream_t stream);
 
+  int bufftype_;
+  size_t start_;
   size_t offset_;
   size_t count_;
   size_t totalCount_;
@@ -205,9 +209,9 @@ public:
 
   flagcxCommOp_t getC2cHomoCommOp(int homoType, int mode);
   // import a planner from an xml file
-  flagcxResult_t importXml(const char *path);
+  flagcxResult_t importXml(const char *prefix);
   // export a planner to an xml file
-  flagcxResult_t exportXml(const char *path);
+  flagcxResult_t exportXml(const char *prefix);
   flagcxResult_t refresh(
       int isSendRecv); // 0: refresh recv info only; 1: refresh send+recv info
   flagcxResult_t searchHeteroSendRecvOps(int searchMethod,
