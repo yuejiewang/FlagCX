@@ -17,6 +17,7 @@
 #include "type.h"
 #include <cstdio>
 #include "pthread.h"
+#include <dlfcn.h>
 
 #define LOADAPI(struct,api,ptr) api: (typeof(struct::api)) ptr
 
@@ -648,4 +649,7 @@ void max(void* res, const void* op1, const void* op2, size_t n) {
     c[i] = std::max(a[i], b[i]);
   }
 }
+
+void* flagcxOpenLib(const char* path, int flags, 
+                      void (*error_handler)(const char*, int, const char*));
 #endif

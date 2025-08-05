@@ -1,21 +1,22 @@
 #include "launch_kernel.h"
 #include "group.h"
-#include <dlfcn.h>
 #include <stdio.h>
 
 flagcxLaunchFunc_t deviceKernel = NULL;
 
 flagcxResult_t loadAsyncKernelSymbol(const char *path, flagcxLaunchFunc_t *fn) {
-  void *handle = dlopen(path, RTLD_LAZY);
-  if (!handle) {
-    fprintf(stderr, "dlopen failed: %s\n", dlerror());
-    return flagcxSystemError;
-  }
-  void *sym = dlsym(handle, "launchAsyncKernel");
+  void* handle = flagcxOpenLib(path, RTLD_LAZY, [](const char* p, int err, const char* msg) {
+      fprintf(stderr, "dlopen failed: %s\n", dlerror());
+  });
+    
+  if (!handle) return flagcxSystemError;
+    
+  void* sym = dlsym(handle, "launchAsyncKernel");
   if (!sym) {
-    fprintf(stderr, "dlsym failed: %s\n", dlerror());
-    return flagcxSystemError;
+      fprintf(stderr, "dlsym failed: %s\n", dlerror());
+      return flagcxSystemError;
   }
+    
   *fn = (flagcxLaunchFunc_t)sym;
   return flagcxSuccess;
 }
