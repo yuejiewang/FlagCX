@@ -282,6 +282,58 @@ flagcxResult_t cudaAdaptorGetDeviceByPciBusId(int *dev, const char *pciBusId) {
   return flagcxSuccess;
 }
 
+flagcxResult_t cudaAdaptorDmaSupport(bool *dmaBufferSupport) {
+  if (dmaBufferSupport == NULL)
+    return flagcxInvalidArgument;
+
+#if CUDA_VERSION >= 11070
+  int flag = 0;
+  CUdevice dev;
+  int cudaDriverVersion = 0;
+
+  CUresult cuRes = cuDriverGetVersion(&cudaDriverVersion);
+  if (cuRes != CUDA_SUCCESS || cudaDriverVersion < 11070) {
+    *dmaBufferSupport = false;
+    return flagcxSuccess;
+  }
+
+  int deviceId = 0;
+  if (cudaGetDevice(&deviceId) != cudaSuccess) {
+    *dmaBufferSupport = false;
+    return flagcxSuccess;
+  }
+
+  CUresult devRes = cuDeviceGet(&dev, deviceId);
+  if (devRes != CUDA_SUCCESS) {
+    *dmaBufferSupport = false;
+    return flagcxSuccess;
+  }
+
+  CUresult attrRes =
+      cuDeviceGetAttribute(&flag, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, dev);
+  if (attrRes != CUDA_SUCCESS || flag == 0) {
+    *dmaBufferSupport = false;
+    return flagcxSuccess;
+  }
+
+  *dmaBufferSupport = true;
+  return flagcxSuccess;
+
+#else
+  *dmaBufferSupport = false;
+  return flagcxSuccess;
+#endif
+}
+
+flagcxResult_t
+cudaAdaptorMemGetHandleForAddressRange(void *handleOut, void *buffer,
+                                       size_t size, unsigned long long flags) {
+  CUdeviceptr dptr = (CUdeviceptr)buffer;
+  DEVCHECK(cuMemGetHandleForAddressRange(
+      handleOut, dptr, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, flags));
+  return flagcxSuccess;
+}
+
 struct flagcxDeviceAdaptor cudaAdaptor {
   "CUDA",
       // Basic functions
@@ -310,8 +362,9 @@ struct flagcxDeviceAdaptor cudaAdaptor {
             // share_mem, void *stream, void *memHandle);
       NULL, // flagcxResult_t (*copyArgsInit)(void **args);
       NULL, // flagcxResult_t (*copyArgsFree)(void *args);
-      cudaAdaptorLaunchDeviceFunc, // flagcxResult_t (*launchDeviceFunc)(flagcxStream_t stream, void
-                                   // *args);
+      cudaAdaptorLaunchDeviceFunc, // flagcxResult_t
+                                   // (*launchDeviceFunc)(flagcxStream_t stream,
+                                   // void *args);
       // Others
       cudaAdaptorGetDeviceProperties, // flagcxResult_t
                                       // (*getDeviceProperties)(struct
@@ -321,7 +374,15 @@ struct flagcxDeviceAdaptor cudaAdaptor {
       cudaAdaptorGetDeviceByPciBusId, // flagcxResult_t
                                       // (*getDeviceByPciBusId)(int
                                       // *dev, const char *pciBusId);
-      cudaAdaptorLaunchHostFunc
+      cudaAdaptorLaunchHostFunc,
+      // DMA buffer
+      cudaAdaptorDmaSupport, // flagcxResult_t (*dmaSupport)(bool
+                             // *dmaBufferSupport);
+      cudaAdaptorMemGetHandleForAddressRange, // flagcxResult_t
+                                              // (*memGetHandleForAddressRange)(void
+                                              // *handleOut, void *buffer,
+                                              // size_t size, unsigned long long
+                                              // flags);
 };
 
 #endif // USE_NVIDIA_ADAPTOR

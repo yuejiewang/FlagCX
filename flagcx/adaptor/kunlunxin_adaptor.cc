@@ -325,7 +325,11 @@ struct flagcxDeviceAdaptor kunlunAdaptor {
       kunlunAdaptorGetDeviceByPciBusId, // flagcxResult_t
                                         // (*getDeviceByPciBusId)(int
                                         // *dev, const char *pciBusId);
-      kunlunAdaptorLaunchHostFunc
+      kunlunAdaptorLaunchHostFunc,
+      // DMA buffer
+      NULL, // flagcxResult_t (*dmaSupport)(bool *dmaBufferSupport);
+      NULL, // flagcxResult_t (*memGetHandleForAddressRange)(void *handleOut,
+            // void *buffer, size_t size, unsigned long long flags);
 };
 
 #endif // USE_KUNLUNXIN_ADAPTOR
