@@ -1059,7 +1059,7 @@ flagcxResult_t flagcxC2cPlanner::exportXml(const char *prefix) {
   fprintf(file, "  <nSeqPostSteps>%d</nSeqPostSteps>\n", nSeqPostSteps_);
 
   // Serialize refreshFunc
-  serializRefreshFunc(file, refreshFunc_);
+  serializeRefreshFunc(file, refreshFunc_);
 
   // Serialize function steps
   serializeFunc2DVector(file, preHomoFuncSteps_, "PreHomoFuncSteps");
@@ -1382,6 +1382,17 @@ flagcxResult_t flagcxC2cPlanner::searchHeteroSendRecvOps(int searchMethod,
 flagcxResult_t flagcxC2cPlanner::findStrategy() {
   refresh(1);
   // setup refreshFunc
+  int bufftype = 1;
+  int startoffset = 0;
+  if (commOp_ == flagcxCommOpReduceScatter || commOp_ == flagcxCommOpScatter ||
+      (commOp_ == flagcxCommOpGather && rank_ != rootRank_)) {
+    bufftype = 2;
+    if ((commOp_ == flagcxCommOpReduceScatter ||
+         commOp_ == flagcxCommOpAllReduce) &&
+        algorithm_ == flagcxAlgoPipeline) {
+      startoffset = clusterOffset_ * totalCount_ / comm_->nranks;
+    }
+  }
   if (!interRankBufferInfoManager_.getBufferInfoList(clusterId_, rank_)
            .empty()) {
     auto &bufferList =
@@ -1417,7 +1428,8 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
       count += it->count_;
       counter++;
     }
-    refreshFunc_ = flagcxC2cRefreshFunc(offset, count, totalCount, redOp_);
+    refreshFunc_ = flagcxC2cRefreshFunc(bufftype, startoffset, offset, count,
+                                        totalCount, redOp_);
   } else {
     refreshFunc_ = flagcxC2cRefreshFunc(0, 0, totalCount_, redOp_);
   }
