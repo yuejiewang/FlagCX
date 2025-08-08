@@ -59,8 +59,8 @@ inline size_t readSizeTag(char *line, const char *tag) {
   return strtoull(buf, nullptr, 10);
 }
 
-inline void serializRefreshFunc(FILE *file, const flagcxC2cRefreshFunc &func,
-                                int indent = 2) {
+inline void serializeRefreshFunc(FILE *file, const flagcxC2cRefreshFunc &func,
+                                 int indent = 2) {
   fprintf(file, "%*s<RefreshFunc>\n", indent, "");
   fprintf(file, "%*s<buffType>%d</buffType>\n", indent + 2, "", func.bufftype_);
   fprintf(file, "%*s<start>%zu</start>\n", indent + 2, "", func.start_);
