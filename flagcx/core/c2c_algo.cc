@@ -256,7 +256,7 @@ flagcxC2cHomoFunc::flagcxC2cHomoFunc(
       homoType_(homoType), commOp_(commOp),
       interRankBufferInfoManager_(interRankBufferInfoManager) {}
 
-flagcxC2cHomoFunc::flagcxC2cHomoFunc(FILE *file) {
+flagcxC2cHomoFunc::flagcxC2cHomoFunc(FILE *file, size_t chunksize) {
   char line[LINE_LEN];
 
   while (fgets(line, sizeof(line), file)) {
@@ -269,11 +269,11 @@ flagcxC2cHomoFunc::flagcxC2cHomoFunc(FILE *file) {
     if (strstr(line, "<recvType>"))
       recvType_ = readIntTag(line, "recvType");
     if (strstr(line, "<sendOffset>"))
-      sendOffset_ = readSizeTag(line, "sendOffset");
+      sendOffset_ = readSizeTag(line, "sendOffset") * chunksize;
     if (strstr(line, "<recvOffset>"))
-      recvOffset_ = readSizeTag(line, "recvOffset");
+      recvOffset_ = readSizeTag(line, "recvOffset") * chunksize;
     if (strstr(line, "<count>"))
-      count_ = readSizeTag(line, "count");
+      count_ = readSizeTag(line, "count") * chunksize;
     if (strstr(line, "<homoType>"))
       homoType_ = readIntTag(line, "homoType");
     if (strstr(line, "<commOp>"))
@@ -510,7 +510,7 @@ flagcxResult_t flagcxC2cHomoFunc::run(const void *sendbuff, void *recvbuff,
   }
 }
 
-flagcxC2cHeteroFunc::flagcxC2cHeteroFunc(FILE *file) {
+flagcxC2cHeteroFunc::flagcxC2cHeteroFunc(FILE *file, size_t chunksize) {
   char line[LINE_LEN];
 
   while (fgets(line, sizeof(line), file)) {
@@ -532,9 +532,9 @@ flagcxC2cHeteroFunc::flagcxC2cHeteroFunc(FILE *file) {
         if (strstr(line, "<peerRank>"))
           peerRank = readIntTag(line, "peerRank");
         if (strstr(line, "<offset>"))
-          offset = readSizeTag(line, "offset");
+          offset = readSizeTag(line, "offset") * chunksize;
         if (strstr(line, "<count>"))
-          count = readSizeTag(line, "count");
+          count = readSizeTag(line, "count") * chunksize;
         if (strstr(line, "<isRecv>"))
           isRecv = readIntTag(line, "isRecv");
       }
@@ -609,6 +609,7 @@ flagcxC2cPlanner::flagcxC2cPlanner(size_t sendCount, size_t recvCount,
       homoInterRanks_(comm->homoInterRanks) {
   // set totalCount_
   totalCount_ = (sendCount_ >= recvCount_) ? sendCount_ : recvCount_;
+  nchunks_ = totalCount_;
 
   // set rootClusterId_ and isRootCluster_
   rootClusterId_ = comm_->cluster_ids[rootRank_];
@@ -970,6 +971,13 @@ flagcxResult_t flagcxC2cPlanner::importXml(const char *path) {
   // primitive fields
   char line[LINE_LEN];
   while (fgets(line, sizeof(line), file)) {
+    if (strstr(line, "<nChunks>"))
+      break;
+  }
+  nchunks_ = readSizeTag(line, "nChunks");
+  size_t chunksize = totalCount_ / nchunks_;
+  
+  while (fgets(line, sizeof(line), file)) {
     if (strstr(line, "<nSeqPreSteps>"))
       break;
   }
@@ -1004,17 +1012,18 @@ flagcxResult_t flagcxC2cPlanner::importXml(const char *path) {
       "init refreshFunc with: offset = %lu, count = %lu, totalCount = %lu, "
       "redOp = %d",
       offset, count, totalCount, redOp);
-  refreshFunc_ = flagcxC2cRefreshFunc(offset, count, totalCount, redOp);
+  refreshFunc_ = flagcxC2cRefreshFunc(offset * chunksize, count * chunksize,
+                                      totalCount * chunksize, redOp);
 
   // function sequences
   preHomoFuncSteps_ =
-      readFunc2DVector<flagcxC2cHomoFunc>(file, "PreHomoFuncSteps");
+      readFunc2DVector<flagcxC2cHomoFunc>(file, chunksize, "PreHomoFuncSteps");
   heteroFuncSteps_ =
-      readFunc2DVector<flagcxC2cHeteroFunc>(file, "HeteroFuncSteps");
-  homoInterFuncSteps_ =
-      readFunc2DVector<flagcxC2cHomoFunc>(file, "HomoInterFuncSteps");
+      readFunc2DVector<flagcxC2cHeteroFunc>(file, chunksize, "HeteroFuncSteps");
+  homoInterFuncSteps_ = readFunc2DVector<flagcxC2cHomoFunc>(
+      file, chunksize, "HomoInterFuncSteps");
   postHomoFuncSteps_ =
-      readFunc2DVector<flagcxC2cHomoFunc>(file, "PostHomoFuncSteps");
+      readFunc2DVector<flagcxC2cHomoFunc>(file, chunksize, "PostHomoFuncSteps");
 
   fclose(file);
   return flagcxSuccess;
@@ -1031,6 +1040,8 @@ flagcxResult_t flagcxC2cPlanner::exportXml(const char *path) {
     return flagcxInternalError;
 
   fprintf(file, "<FlagcxC2cPlanner>\n");
+  fprintf(file, "  <nChunks>%d</nChunks>\n", nchunks_);
+  size_t chunksize = totalCount_ / nchunks_;
 
   // Serialize primitive members
   fprintf(file, "  <nSeqPreSteps>%d</nSeqPreSteps>\n", nSeqPreSteps_);
@@ -1040,13 +1051,15 @@ flagcxResult_t flagcxC2cPlanner::exportXml(const char *path) {
   fprintf(file, "  <nSeqPostSteps>%d</nSeqPostSteps>\n", nSeqPostSteps_);
 
   // Serialize refreshFunc
-  serializRefreshFunc(file, refreshFunc_);
+  serializRefreshFunc(file, chunksize, refreshFunc_);
 
   // Serialize function steps
-  serializeFunc2DVector(file, preHomoFuncSteps_, "PreHomoFuncSteps");
-  serializeFunc2DVector(file, heteroFuncSteps_, "HeteroFuncSteps");
-  serializeFunc2DVector(file, homoInterFuncSteps_, "HomoInterFuncSteps");
-  serializeFunc2DVector(file, postHomoFuncSteps_, "PostHomoFuncSteps");
+  serializeFunc2DVector(file, chunksize, preHomoFuncSteps_, "PreHomoFuncSteps");
+  serializeFunc2DVector(file, chunksize, heteroFuncSteps_, "HeteroFuncSteps");
+  serializeFunc2DVector(file, chunksize, homoInterFuncSteps_,
+                        "HomoInterFuncSteps");
+  serializeFunc2DVector(file, chunksize, postHomoFuncSteps_,
+                        "PostHomoFuncSteps");
 
   fprintf(file, "</FlagcxC2cPlanner>\n");
   fclose(file);
@@ -1361,6 +1374,13 @@ flagcxResult_t flagcxC2cPlanner::searchHeteroSendRecvOps(int searchMethod,
 }
 
 flagcxResult_t flagcxC2cPlanner::findStrategy() {
+  if (algorithm_ == flagcxAlgoPipeline) {
+    nchunks_ = 1;
+    for (int i = 0; i < comm_->nclusters; ++i) {
+      nchunks_ = lcm(nchunks_, lcm(comm_->cluster_sizes[i],
+                                   comm_->clusterInterRankList[i].size()));
+    }
+  }
   refresh(1);
   // setup refreshFunc
   if (!interRankBufferInfoManager_.getBufferInfoList(clusterId_, rank_)
