@@ -1,6 +1,6 @@
 from algorithm import *
 
-with FlagcxBlock("test", Collective.AllReduce, [], [], 8):
+with FlagcxWorkflow("test", Collective.AllReduce, [], [], 8):
     # chunk_size = 8388608
 
     # init input and output buffer info
