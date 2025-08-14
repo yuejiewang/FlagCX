@@ -21,165 +21,165 @@ with FlagcxWorkflow("test", Collective.AllReduce, [], [], 8):
     for rank in range(4):
         # pre homo funcs for cluster 0
         add_opr(rank_=rank,
-                  stage_=Stage.PreHomoFunc,
-                  step_=0,
-                  params_={Param.send_buff: BuffRef(rank_data[rank][0], 0, 4),
-                           Param.recv_buff: BuffRef(rank_data[rank][1], rank, 1),
-                           Param.count: 1,
-                           Param.homo_type: 0,
-                           Param.comm_op: Instr.ReduceScatter})
+                stage_=Stage.PreHomoFunc,
+                step_=0,
+                params_={Param.send_buff: BuffRef(rank_data[rank][0], 0, 4),
+                         Param.recv_buff: BuffRef(rank_data[rank][1], rank, 1),
+                         Param.count: 1,
+                         Param.homo_type: 0,
+                         Param.comm_op: Instr.ReduceScatter})
         add_opr(rank_=rank,
-                  stage_=Stage.PreHomoFunc,
-                  step_=0,
-                  params_={Param.send_buff: BuffRef(rank_data[rank][0], 4, 4),
-                           Param.recv_buff: BuffRef(rank_data[rank][1], rank + 4, 1),
-                           Param.count: 1,
-                           Param.homo_type: 0,
-                           Param.comm_op: Instr.ReduceScatter})
+                stage_=Stage.PreHomoFunc,
+                step_=0,
+                params_={Param.send_buff: BuffRef(rank_data[rank][0], 4, 4),
+                         Param.recv_buff: BuffRef(rank_data[rank][1], rank + 4, 1),
+                         Param.count: 1,
+                         Param.homo_type: 0,
+                         Param.comm_op: Instr.ReduceScatter})
         # pre homo funcs for cluster 1
         add_opr(rank_=rank + 4,
-                  stage_=Stage.PreHomoFunc,
-                  step_=0,
-                  params_={Param.send_buff: BuffRef(rank_data[rank + 4][0], 0, 4),
-                           Param.recv_buff: BuffRef(rank_data[rank + 4][1], rank - 4, 1),
-                           Param.count: 1,
-                           Param.homo_type: 0,
-                           Param.comm_op: Instr.ReduceScatter})
+                stage_=Stage.PreHomoFunc,
+                step_=0,
+                params_={Param.send_buff: BuffRef(rank_data[rank + 4][0], 0, 4),
+                         Param.recv_buff: BuffRef(rank_data[rank + 4][1], rank - 4, 1),
+                         Param.count: 1,
+                         Param.homo_type: 0,
+                         Param.comm_op: Instr.ReduceScatter})
         add_opr(rank_=rank + 4,
-                  stage_=Stage.PreHomoFunc,
-                  step_=0,
-                  params_={Param.send_buff: BuffRef(rank_data[rank + 4][0], 4, 4),
-                           Param.recv_buff: BuffRef(rank_data[rank + 4][1], rank, 1),
-                           Param.count: 1,
-                           Param.homo_type: 0,
-                           Param.comm_op: Instr.ReduceScatter})
+                stage_=Stage.PreHomoFunc,
+                step_=0,
+                params_={Param.send_buff: BuffRef(rank_data[rank + 4][0], 4, 4),
+                         Param.recv_buff: BuffRef(rank_data[rank + 4][1], rank, 1),
+                         Param.count: 1,
+                         Param.homo_type: 0,
+                         Param.comm_op: Instr.ReduceScatter})
 
     # hetero funcs
     for rank in range(4):
         # step 0
         add_opr(rank_=rank,
-                  stage_=Stage.HeteroFunc,
-                  step_=0,
-                  params_={Param.peer_or_root_rank: (rank + 1) % 4 + 4,
-                           Param.send_offset: rank + 4,
-                           Param.recv_offset: -1,
-                           Param.count: 1})
+                stage_=Stage.HeteroFunc,
+                step_=0,
+                params_={Param.peer_or_root_rank: (rank + 1) % 4 + 4,
+                         Param.send_offset: rank + 4,
+                         Param.recv_offset: -1,
+                         Param.count: 1})
         add_opr(rank_=rank,
-                  stage_=Stage.HeteroFunc,
-                  step_=0,
-                  params_={Param.peer_or_root_rank: (rank + 3) % 4 + 4,
-                           Param.send_offset: -1,
-                           Param.recv_offset: (rank + 3) % 4,
-                           Param.count: 1})
+                stage_=Stage.HeteroFunc,
+                step_=0,
+                params_={Param.peer_or_root_rank: (rank + 3) % 4 + 4,
+                         Param.send_offset: -1,
+                         Param.recv_offset: (rank + 3) % 4,
+                         Param.count: 1})
         add_opr(rank_=rank + 4,
-                  stage_=Stage.HeteroFunc,
-                  step_=0,
-                  params_={Param.peer_or_root_rank: (rank + 1) % 4,
-                           Param.send_offset: rank - 4,
-                           Param.recv_offset: -1,
-                           Param.count: 1})
+                stage_=Stage.HeteroFunc,
+                step_=0,
+                params_={Param.peer_or_root_rank: (rank + 1) % 4,
+                         Param.send_offset: rank - 4,
+                         Param.recv_offset: -1,
+                         Param.count: 1})
         add_opr(rank_=rank + 4,
-                  stage_=Stage.HeteroFunc,
-                  step_=0,
-                  params_={Param.peer_or_root_rank: (rank + 3) % 4,
-                           Param.send_offset: -1,
-                           Param.recv_offset: (rank + 3) % 4 + 4,
-                           Param.count: 1})
+                stage_=Stage.HeteroFunc,
+                step_=0,
+                params_={Param.peer_or_root_rank: (rank + 3) % 4,
+                         Param.send_offset: -1,
+                         Param.recv_offset: (rank + 3) % 4 + 4,
+                         Param.count: 1})
         # step 1
         add_opr(rank_=rank,
-                  stage_=Stage.HeteroFunc,
-                  step_=1,
-                  params_={Param.peer_or_root_rank: rank + 4,
-                           Param.send_offset: rank,
-                           Param.recv_offset: -1,
-                           Param.count: 1})
+                stage_=Stage.HeteroFunc,
+                step_=1,
+                params_={Param.peer_or_root_rank: rank + 4,
+                         Param.send_offset: rank,
+                         Param.recv_offset: -1,
+                         Param.count: 1})
         add_opr(rank_=rank,
-                  stage_=Stage.HeteroFunc,
-                  step_=1,
-                  params_={Param.peer_or_root_rank: rank + 4,
-                           Param.send_offset: -1,
-                           Param.recv_offset: rank + 4,
-                           Param.count: 1})
+                stage_=Stage.HeteroFunc,
+                step_=1,
+                params_={Param.peer_or_root_rank: rank + 4,
+                         Param.send_offset: -1,
+                         Param.recv_offset: rank + 4,
+                         Param.count: 1})
         add_opr(rank_=rank + 4,
-                  stage_=Stage.HeteroFunc,
-                  step_=1,
-                  params_={Param.peer_or_root_rank: rank,
-                           Param.send_offset: rank + 4,
-                           Param.recv_offset: -1,
-                           Param.count: 1})
+                stage_=Stage.HeteroFunc,
+                step_=1,
+                params_={Param.peer_or_root_rank: rank,
+                         Param.send_offset: rank + 4,
+                         Param.recv_offset: -1,
+                         Param.count: 1})
         add_opr(rank_=rank + 4,
-                  stage_=Stage.HeteroFunc,
-                  step_=1,
-                  params_={Param.peer_or_root_rank: rank,
-                           Param.send_offset: -1,
-                           Param.recv_offset: rank,
-                           Param.count: 1})
+                stage_=Stage.HeteroFunc,
+                step_=1,
+                params_={Param.peer_or_root_rank: rank,
+                         Param.send_offset: -1,
+                         Param.recv_offset: rank,
+                         Param.count: 1})
 
     # homo inter funcs
     for rank in range(4):
         # cluster 0
         add_opr(rank_=rank,
-                  stage_=Stage.HomoInterFunc,
-                  step_=0,
-                  params_={Param.send_buff: BuffRef(rank_data[rank][1], 0, 1),
-                           Param.recv_buff: BuffRef(rank_data[rank][1], 0, 1),
-                           Param.count: 1,
-                           Param.homo_type: 2,
-                           Param.comm_op: Instr.ReduceScatter})
+                stage_=Stage.HomoInterFunc,
+                step_=0,
+                params_={Param.send_buff: BuffRef(rank_data[rank][1], 0, 1),
+                         Param.recv_buff: BuffRef(rank_data[rank][1], 0, 1),
+                         Param.count: 1,
+                         Param.homo_type: 2,
+                         Param.comm_op: Instr.ReduceScatter})
         add_opr(rank_=rank, stage_=Stage.HomoInterFunc, step_=1, params_=None)
         # cluster 1
         add_opr(rank_=rank + 4,
-                  stage_=Stage.HomoInterFunc,
-                  step_=0,
-                  params_={Param.send_buff: BuffRef(rank_data[rank + 4][1], 4, 1),
-                           Param.recv_buff: BuffRef(rank_data[rank + 4][1], 4, 1),
-                           Param.count: 1,
-                           Param.homo_type: 2,
-                           Param.comm_op: Instr.ReduceScatter})
+                stage_=Stage.HomoInterFunc,
+                step_=0,
+                params_={Param.send_buff: BuffRef(rank_data[rank + 4][1], 4, 1),
+                         Param.recv_buff: BuffRef(rank_data[rank + 4][1], 4, 1),
+                         Param.count: 1,
+                         Param.homo_type: 2,
+                         Param.comm_op: Instr.ReduceScatter})
         add_opr(rank_=rank, stage_=Stage.HomoInterFunc, step_=1, params_=None)
 
     # post homo funcs
     for rank in range(4):
         for root in range(4):
             add_opr(rank_=rank,
-                      stage_=Stage.PostHomoFunc,
-                      step_=0,
-                      params_={Param.peer_or_root_rank: root,
-                               Param.send_buff: BuffRef(rank_data[rank][1], root, 1),
-                               Param.recv_buff: BuffRef(rank_data[rank][1], root, 1),
-                               Param.count: 1,
-                               Param.homo_type: 2,
-                               Param.comm_op: Instr.Broadcast})
+                    stage_=Stage.PostHomoFunc,
+                    step_=0,
+                    params_={Param.peer_or_root_rank: root,
+                             Param.send_buff: BuffRef(rank_data[rank][1], root, 1),
+                             Param.recv_buff: BuffRef(rank_data[rank][1], root, 1),
+                             Param.count: 1,
+                             Param.homo_type: 2,
+                             Param.comm_op: Instr.Broadcast})
         for root in range(4):
             add_opr(rank_=rank,
-                      stage_=Stage.PostHomoFunc,
-                      step_=1,
-                      params_={Param.peer_or_root_rank: root,
-                               Param.send_buff: BuffRef(rank_data[rank][1], root + 4, 1),
-                               Param.recv_buff: BuffRef(rank_data[rank][1], root + 4, 1),
-                               Param.count: 1,
-                               Param.homo_type: 2,
-                               Param.comm_op: Instr.Broadcast})
+                    stage_=Stage.PostHomoFunc,
+                    step_=1,
+                    params_={Param.peer_or_root_rank: root,
+                             Param.send_buff: BuffRef(rank_data[rank][1], root + 4, 1),
+                             Param.recv_buff: BuffRef(rank_data[rank][1], root + 4, 1),
+                             Param.count: 1,
+                             Param.homo_type: 2,
+                             Param.comm_op: Instr.Broadcast})
         for root in range(4):
             add_opr(rank_=rank + 4,
-                      stage_=Stage.PostHomoFunc,
-                      step_=0,
-                      params_={Param.peer_or_root_rank: root + 4,
-                               Param.send_buff: BuffRef(rank_data[rank + 4][1], root + 4, 1),
-                               Param.recv_buff: BuffRef(rank_data[rank + 4][1], root + 4, 1),
-                               Param.count: 1,
-                               Param.homo_type: 2,
-                               Param.comm_op: Instr.Broadcast})
+                    stage_=Stage.PostHomoFunc,
+                    step_=0,
+                    params_={Param.peer_or_root_rank: root + 4,
+                             Param.send_buff: BuffRef(rank_data[rank + 4][1], root + 4, 1),
+                             Param.recv_buff: BuffRef(rank_data[rank + 4][1], root + 4, 1),
+                             Param.count: 1,
+                             Param.homo_type: 2,
+                             Param.comm_op: Instr.Broadcast})
         for root in range(4):
             add_opr(rank_=rank + 4,
-                      stage_=Stage.PostHomoFunc,
-                      step_=1,
-                      params_={Param.peer_or_root_rank: root + 4,
-                               Param.send_buff: BuffRef(rank_data[rank + 4][1], root, 1),
-                               Param.recv_buff: BuffRef(rank_data[rank + 4][1], root, 1),
-                               Param.count: 1,
-                               Param.homo_type: 2,
-                               Param.comm_op: Instr.Broadcast})
+                    stage_=Stage.PostHomoFunc,
+                    step_=1,
+                    params_={Param.peer_or_root_rank: root + 4,
+                             Param.send_buff: BuffRef(rank_data[rank + 4][1], root, 1),
+                             Param.recv_buff: BuffRef(rank_data[rank + 4][1], root, 1),
+                             Param.count: 1,
+                             Param.homo_type: 2,
+                             Param.comm_op: Instr.Broadcast})
 
     # export as xml
     for rank in range(8):
