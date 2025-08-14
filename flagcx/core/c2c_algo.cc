@@ -986,7 +986,7 @@ flagcxResult_t flagcxC2cPlanner::importXml(const char *prefix) {
   }
   nchunks_ = readSizeTag(line, "nChunks");
   size_t chunksize = totalCount_ / nchunks_;
-  
+
   while (fgets(line, sizeof(line), file)) {
     if (strstr(line, "<nSeqPreSteps>"))
       break;
@@ -1033,8 +1033,9 @@ flagcxResult_t flagcxC2cPlanner::importXml(const char *prefix) {
       "init refreshFunc with: offset = %lu, count = %lu, totalCount = %lu, "
       "redOp = %d",
       offset, count, totalCount, redOp);
-  refreshFunc_ = flagcxC2cRefreshFunc(buffType, startOffset, offset * chunksize, count * chunksize,
-                                      totalCount * chunksize, redOp);
+  refreshFunc_ =
+      flagcxC2cRefreshFunc(buffType, startOffset, offset * chunksize,
+                           count * chunksize, totalCount * chunksize, redOp);
 
   // function sequences
   preHomoFuncSteps_ =
@@ -1058,7 +1059,7 @@ flagcxResult_t flagcxC2cPlanner::exportXml(const char *prefix) {
     return flagcxInternalError;
 
   fprintf(file, "<FlagcxC2cPlanner>\n");
-  fprintf(file, "  <nChunks>%d</nChunks>\n", nchunks_);
+  fprintf(file, "  <nChunks>%ld</nChunks>\n", nchunks_);
   size_t chunksize = totalCount_ / nchunks_;
 
   // Serialize primitive members
@@ -1393,7 +1394,7 @@ flagcxResult_t flagcxC2cPlanner::searchHeteroSendRecvOps(int searchMethod,
 
 flagcxResult_t flagcxC2cPlanner::findStrategy() {
   if (algorithm_ == flagcxAlgoPipeline) {
-    nchunks_ = 1;
+    nchunks_ = comm_->nranks;
     for (int i = 0; i < comm_->nclusters; ++i) {
       nchunks_ = lcm(nchunks_, lcm(comm_->cluster_sizes[i],
                                    comm_->clusterInterRankList[i].size()));
