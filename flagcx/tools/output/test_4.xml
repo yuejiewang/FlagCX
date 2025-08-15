@@ -81,7 +81,7 @@
         <sendType>1</sendType>
         <recvType>1</recvType>
         <sendOffset>4</sendOffset>
-        <recvOffset>4</recvOffset>
+        <recvOffset>0</recvOffset>
         <count>1</count>
         <homoType>2</homoType>
         <commOp>8</commOp>
