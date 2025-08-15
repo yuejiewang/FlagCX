@@ -16,7 +16,8 @@ with FlagcxWorkflow("test", Collective.AllReduce, [], [], 8):
     # init pipeline schedule
     set_pipeline(1, 0, 1, 1, 1)
     # init refresh func info
-    set_refresh(1, 0, 0, 1, 4, RedOp.sum)
+    for rank in range(8):
+        set_refresh(rank, 1, rank // 4 * 4, rank % 4, 1, 4, RedOp.sum)
 
     for rank in range(4):
         # pre homo funcs for cluster 0
@@ -122,7 +123,7 @@ with FlagcxWorkflow("test", Collective.AllReduce, [], [], 8):
                 stage_=Stage.HomoInterFunc,
                 step_=0,
                 params_={Param.send_buff: BuffRef(rank_data[rank][1], 0, 1),
-                         Param.recv_buff: BuffRef(rank_data[rank][1], 0, 1),
+                         Param.recv_buff: BuffRef(rank_data[rank][1], rank, 1),
                          Param.count: 1,
                          Param.homo_type: 2,
                          Param.comm_op: Instr.ReduceScatter})
@@ -132,7 +133,7 @@ with FlagcxWorkflow("test", Collective.AllReduce, [], [], 8):
                 stage_=Stage.HomoInterFunc,
                 step_=0,
                 params_={Param.send_buff: BuffRef(rank_data[rank + 4][1], 4, 1),
-                         Param.recv_buff: BuffRef(rank_data[rank + 4][1], 4, 1),
+                         Param.recv_buff: BuffRef(rank_data[rank + 4][1], rank, 1),
                          Param.count: 1,
                          Param.homo_type: 2,
                          Param.comm_op: Instr.ReduceScatter})
