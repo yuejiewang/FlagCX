@@ -14,7 +14,8 @@
 
 typedef enum {
   flagcxAlgoSequential = 0,
-  flagcxAlgoPipeline = 1
+  flagcxAlgoPipeline = 1,
+  flagcxAlgoInput = 2
 } flagcxAlgorithm_t;
 
 size_t getC2cCommPatternHash(size_t count, size_t rootClusterId,

@@ -971,6 +971,7 @@ flagcxCommOp_t flagcxC2cPlanner::getC2cHomoCommOp(int homoType, int mode) {
 }
 
 flagcxResult_t flagcxC2cPlanner::importXml(const char *prefix) {
+  algorithm_ = flagcxAlgoInput;
   char filename[128];
   sprintf(filename, "%s_%d.xml", prefix, rank_);
   TRACE_CALL("rank %d algo input set to %s", rank_, filename);
@@ -2203,7 +2204,8 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
   for (int s = 0; s < nSeqInterSteps_; ++s) {
     for (int i = 0; i < heteroFuncSteps_[nPipePreSteps_ + s].size(); ++i) {
       // execute refreshFunc
-      if (algorithm_ == flagcxAlgoSequential) {
+      if (algorithm_ == flagcxAlgoSequential ||
+          (nPipePreSteps_ == 0 && nPipePostSteps_ == 0)) {
         refreshFunc_.run(recvbuff, scratchBuffer_, datatype, stream);
       }
 
@@ -2222,7 +2224,8 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
         homoInterFuncSteps_[nPipePreSteps_ + s][i].run(
             sendbuff, recvbuff, scratchBuffer_, datatype, redOp_,
             comm_->globalrank2homorank[root], comm_, stream);
-        if (algorithm_ == flagcxAlgoPipeline) {
+        if (algorithm_ == flagcxAlgoPipeline &&
+            (nPipePreSteps_ > 0 || nPipePostSteps_ > 0)) {
           refreshFunc_.run(recvbuff, scratchBuffer_, datatype, stream);
         }
       }
@@ -2274,7 +2277,8 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
   for (int s = 0; s < nSeqPostSteps_; ++s) {
     for (int i = 0; i < postHomoFuncSteps_[nPipePostSteps_ + s].size(); ++i) {
       // execute refresh func
-      if (algorithm_ == flagcxAlgoSequential) {
+      if (algorithm_ == flagcxAlgoSequential ||
+          (nPipePreSteps_ == 0 && nPipePostSteps_ == 0)) {
         refreshFunc_.run(recvbuff, scratchBuffer_, datatype, stream);
       }
 
