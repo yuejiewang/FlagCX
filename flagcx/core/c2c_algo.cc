@@ -1408,11 +1408,11 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
   if (commOp_ == flagcxCommOpReduceScatter || commOp_ == flagcxCommOpScatter ||
       (commOp_ == flagcxCommOpGather && rank_ != rootRank_)) {
     bufftype = 2;
-    if ((commOp_ == flagcxCommOpReduceScatter ||
-         commOp_ == flagcxCommOpAllReduce) &&
-        algorithm_ == flagcxAlgoPipeline) {
-      startoffset = clusterOffset_ * totalCount_ / comm_->nranks;
-    }
+  }
+  if ((commOp_ == flagcxCommOpReduceScatter ||
+       commOp_ == flagcxCommOpAllReduce) &&
+      algorithm_ == flagcxAlgoPipeline) {
+    startoffset = clusterOffset_ * totalCount_ / comm_->nranks;
   }
   if (!interRankBufferInfoManager_.getBufferInfoList(clusterId_, rank_)
            .empty()) {

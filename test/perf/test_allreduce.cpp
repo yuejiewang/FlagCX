@@ -112,8 +112,8 @@ int main(int argc, char *argv[]) {
     devHandle->deviceMemset(hello, 0, size, flagcxMemHost, NULL);
     devHandle->deviceMemcpy(hello, recvbuff, size, flagcxMemcpyDeviceToHost,
                             NULL);
-    if (print_buffer) {
-      printf("proc %d recvbuff = ", proc);
+    if (proc == 0 && print_buffer) {
+      printf("recvbuff = ");
       for (size_t i = 0; i < 10; i++) {
         printf("%f ", ((float *)hello)[i]);
       }
