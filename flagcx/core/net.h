@@ -35,6 +35,8 @@ struct sendNetResources {
   struct flagcxSendMem *sendMem;
   struct flagcxRecvMem *recvMem;
 
+  flagcxNet_t *flagcxNet;
+  flagcxCollNet_t *flagcxCollNet;
   int tpRank;
   int tpLocalRank;
   int tpRemoteRank;
@@ -65,6 +67,8 @@ struct recvNetResources {
   struct flagcxSendMem *sendMem;
   struct flagcxRecvMem *recvMem;
 
+  flagcxNet_t *flagcxNet;
+  flagcxCollNet_t *flagcxCollNet;
   int tpRank;
   int tpLocalRank;
   int tpRemoteRank;
