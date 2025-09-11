@@ -505,9 +505,8 @@ static flagcxResult_t proxyProgressAsync(flagcxProxyAsyncOp **opHead,
       struct sendNetResources *resources =
           (struct sendNetResources *)op->connection->transportResources;
       if (!resources->netSendComm) {
-        FLAGCXCHECK(resources->flagcxNet->connect(
-            resources->netDev, (void *)op->reqBuff, &resources->netSendComm,
-            NULL));
+        FLAGCXCHECK(resources->netAdaptor->connect(
+            resources->netDev, (void *)op->reqBuff, &resources->netSendComm));
       } else {
         bool dmaBufferSupport = false;
         if (deviceAdaptor->dmaSupport != NULL) {
@@ -519,17 +518,17 @@ static flagcxResult_t proxyProgressAsync(flagcxProxyAsyncOp **opHead,
           FLAGCXCHECK(deviceAdaptor->getHandleForAddressRange(
               (void *)&dmabuf_fd, resources->buffers[0],
               resources->buffSizes[0], 0));
-          FLAGCXCHECK(resources->flagcxNet->regMrDmaBuf(
+          FLAGCXCHECK(resources->netAdaptor->regMrDmaBuf(
               resources->netSendComm, resources->buffers[0],
               resources->buffSizes[0], 2, 0ULL, dmabuf_fd,
               &resources->mhandles[0]));
         } else {
-          if (resources->flagcxNet == &flagcxNetIb) {
-            FLAGCXCHECK(resources->flagcxNet->regMr(
+          if (resources->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
+            FLAGCXCHECK(resources->netAdaptor->regMr(
                 resources->netSendComm, resources->buffers[0],
                 resources->buffSizes[0], 2, &resources->mhandles[0]));
-          } else if (resources->flagcxNet == &flagcxNetSocket) {
-            FLAGCXCHECK(resources->flagcxNet->regMr(
+          } else if (resources->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
+            FLAGCXCHECK(resources->netAdaptor->regMr(
                 resources->netSendComm, resources->buffers[0],
                 resources->buffSizes[0], 1, &resources->mhandles[0]));
           }
@@ -540,8 +539,8 @@ static flagcxResult_t proxyProgressAsync(flagcxProxyAsyncOp **opHead,
       struct recvNetResources *resources =
           (struct recvNetResources *)op->connection->transportResources;
       if (!resources->netRecvComm) {
-        FLAGCXCHECK(resources->flagcxNet->accept(
-            resources->netListenComm, &resources->netRecvComm, NULL));
+        FLAGCXCHECK(resources->netAdaptor->accept(resources->netListenComm,
+                                                  &resources->netRecvComm));
       } else {
         bool dmaBufferSupport = false;
         if (deviceAdaptor->dmaSupport != NULL) {
@@ -553,17 +552,17 @@ static flagcxResult_t proxyProgressAsync(flagcxProxyAsyncOp **opHead,
           FLAGCXCHECK(deviceAdaptor->getHandleForAddressRange(
               (void *)&dmabuf_fd, resources->buffers[0],
               resources->buffSizes[0], 0));
-          FLAGCXCHECK(resources->flagcxNet->regMrDmaBuf(
+          FLAGCXCHECK(resources->netAdaptor->regMrDmaBuf(
               resources->netRecvComm, resources->buffers[0],
               resources->buffSizes[0], 2, 0ULL, dmabuf_fd,
               &resources->mhandles[0]));
         } else {
-          if (resources->flagcxNet == &flagcxNetIb) {
-            FLAGCXCHECK(resources->flagcxNet->regMr(
+          if (resources->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
+            FLAGCXCHECK(resources->netAdaptor->regMr(
                 resources->netRecvComm, resources->buffers[0],
                 resources->buffSizes[0], 2, &resources->mhandles[0]));
-          } else if (resources->flagcxNet == &flagcxNetSocket) {
-            FLAGCXCHECK(resources->flagcxNet->regMr(
+          } else if (resources->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
+            FLAGCXCHECK(resources->netAdaptor->regMr(
                 resources->netRecvComm, resources->buffers[0],
                 resources->buffSizes[0], 1, &resources->mhandles[0]));
           }

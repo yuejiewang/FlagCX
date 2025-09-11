@@ -26,9 +26,9 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
         conn->proxyConn.connection->send = 0;
         conn->proxyConn.connection->transportResources = (void *)resources;
         resources->netDev = comm->netDev;
-        resources->flagcxNet = comm->flagcxNet;
-        comm->flagcxNet->listen(resources->netDev, (void *)handle,
-                                &resources->netListenComm);
+        resources->netAdaptor = comm->netAdaptor;
+        comm->netAdaptor->listen(resources->netDev, (void *)handle,
+                                 &resources->netListenComm);
         bootstrapSend(comm->bootstrap, peer, 1001 + c, handle,
                       sizeof(flagcxIbHandle));
         deviceAdaptor->streamCreate(&resources->cpStream);
@@ -36,12 +36,12 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
           deviceAdaptor->eventCreate(&resources->cpEvents[s]);
         }
         resources->buffSizes[0] = REGMRBUFFERSIZE;
-        if (comm->flagcxNet == &flagcxNetSocket) {
+        if (comm->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
           resources->buffers[0] = (char *)malloc(resources->buffSizes[0]);
           if (!resources->buffers[0]) {
             return flagcxSystemError;
           }
-        } else if (comm->flagcxNet == &flagcxNetIb) {
+        } else if (comm->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
           deviceAdaptor->gdrMemAlloc((void **)&resources->buffers[0],
                                      resources->buffSizes[0], NULL);
         }
@@ -62,7 +62,7 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
         conn->proxyConn.connection->send = 1;
         conn->proxyConn.connection->transportResources = (void *)resources;
         resources->netDev = comm->netDev;
-        resources->flagcxNet = comm->flagcxNet;
+        resources->netAdaptor = comm->netAdaptor;
         bootstrapRecv(comm->bootstrap, peer, 1001 + c, handle,
                       sizeof(flagcxIbHandle));
         handle->stage.comm = comm;
@@ -71,12 +71,12 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
           deviceAdaptor->eventCreate(&resources->cpEvents[s]);
         }
         resources->buffSizes[0] = REGMRBUFFERSIZE;
-        if (comm->flagcxNet == &flagcxNetSocket) {
+        if (comm->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
           resources->buffers[0] = (char *)malloc(resources->buffSizes[0]);
           if (!resources->buffers[0]) {
             return flagcxSystemError;
           }
-        } else if (comm->flagcxNet == &flagcxNetIb) {
+        } else if (comm->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
           deviceAdaptor->gdrMemAlloc((void **)&resources->buffers[0],
                                      resources->buffSizes[0], NULL);
         }

@@ -12,7 +12,6 @@
 #include "param.h"
 #include "socket.h"
 #include "utils.h"
-
 #include <assert.h>
 #include <poll.h>
 #include <pthread.h>
@@ -432,7 +431,7 @@ int flagcxIbFindMatchingDev(int dev) {
   return flagcxNMergedIbDevs;
 }
 
-flagcxResult_t flagcxIbInit(flagcxDebugLogger_t logFunction) {
+flagcxResult_t flagcxIbInit() {
   flagcxResult_t ret;
   if (flagcxParamIbDisable())
     return flagcxInternalError;
@@ -802,7 +801,7 @@ struct flagcxIbListenComm {
 
 struct flagcxIbSendFifo {
   uint64_t addr;
-  int size;
+  size_t size;
   uint32_t rkeys[FLAGCX_IB_MAX_DEVS_PER_NIC];
   uint32_t nreqs;
   uint32_t tag;
@@ -1056,8 +1055,7 @@ flagcxResult_t flagcxIbListen(int dev, void *opaqueHandle, void **listenComm) {
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxIbConnect(int dev, void *opaqueHandle, void **sendComm,
-                               flagcxNetDeviceHandle_t ** /*sendDevComm*/) {
+flagcxResult_t flagcxIbConnect(int dev, void *opaqueHandle, void **sendComm) {
   struct flagcxIbHandle *handle = (struct flagcxIbHandle *)opaqueHandle;
   struct flagcxIbCommStage *stage = &handle->stage;
   struct flagcxIbSendComm *comm = (struct flagcxIbSendComm *)stage->comm;
@@ -1320,8 +1318,7 @@ ib_send_ready:
 
 FLAGCX_PARAM(IbGdrFlushDisable, "GDR_FLUSH_DISABLE", 0);
 
-flagcxResult_t flagcxIbAccept(void *listenComm, void **recvComm,
-                              flagcxNetDeviceHandle_t ** /*recvDevComm*/) {
+flagcxResult_t flagcxIbAccept(void *listenComm, void **recvComm) {
   struct flagcxIbListenComm *lComm = (struct flagcxIbListenComm *)listenComm;
   struct flagcxIbCommStage *stage = &lComm->stage;
   struct flagcxIbRecvComm *rComm = (struct flagcxIbRecvComm *)stage->comm;
@@ -1878,8 +1875,8 @@ flagcxResult_t flagcxIbMultiSend(struct flagcxIbSendComm *comm, int slot) {
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxIbIsend(void *sendComm, void *data, int size, int tag,
-                             void *mhandle, void **request) {
+flagcxResult_t flagcxIbIsend(void *sendComm, void *data, size_t size, int tag,
+                             void *mhandle, void *phandle, void **request) {
   struct flagcxIbSendComm *comm = (struct flagcxIbSendComm *)sendComm;
   if (comm->base.ready == 0) {
     WARN("NET/IB: flagcxIbIsend() called when comm->base.ready == 0");
@@ -1986,7 +1983,7 @@ flagcxResult_t flagcxIbIsend(void *sendComm, void *data, int size, int tag,
 }
 
 flagcxResult_t flagcxIbPostFifo(struct flagcxIbRecvComm *comm, int n,
-                                void **data, int *sizes, int *tags,
+                                void **data, size_t *sizes, int *tags,
                                 void **mhandles, struct flagcxIbRequest *req) {
   struct ibv_send_wr wr;
   memset(&wr, 0, sizeof(wr));
@@ -2011,9 +2008,8 @@ flagcxResult_t flagcxIbPostFifo(struct flagcxIbRecvComm *comm, int n,
     // Send all applicable rkeys
     for (int j = 0; j < comm->base.ndevs; j++)
       localElem[i].rkeys[j] = mhandleWrapper->mrs[j]->rkey;
-
     localElem[i].nreqs = n;
-    localElem[i].size = sizes[i]; // Sanity/Debugging
+    localElem[i].size = sizes[i];
     localElem[i].tag = tags[i];
     localElem[i].idx = comm->remFifo.fifoTail + 1;
   }
@@ -2073,8 +2069,9 @@ flagcxResult_t flagcxIbPostFifo(struct flagcxIbRecvComm *comm, int n,
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxIbIrecv(void *recvComm, int n, void **data, int *sizes,
-                             int *tags, void **mhandles, void **request) {
+flagcxResult_t flagcxIbIrecv(void *recvComm, int n, void **data, size_t *sizes,
+                             int *tags, void **mhandles, void **phandles,
+                             void **request) {
   struct flagcxIbRecvComm *comm = (struct flagcxIbRecvComm *)recvComm;
   if (comm->base.ready == 0) {
     WARN("NET/IB: flagcxIbIrecv() called when comm->base.ready == 0");
@@ -2351,51 +2348,59 @@ flagcxResult_t flagcxIbGetDevFromName(char *name, int *dev) {
   return flagcxSystemError;
 }
 
-flagcxResult_t flagcxIbGetProperties(int dev, flagcxNetProperties_t *props) {
+flagcxResult_t flagcxIbGetProperties(int dev, void *props) {
   struct flagcxIbMergedDev *mergedDev = flagcxIbMergedDevs + dev;
-  props->name = mergedDev->devName;
-  props->speed = mergedDev->speed;
+  flagcxNetProperties_t *properties = (flagcxNetProperties_t *)props;
+
+  properties->name = mergedDev->devName;
+  properties->speed = mergedDev->speed;
 
   // Take the rest of the properties from an arbitrary sub-device (should be the
   // same)
   struct flagcxIbDev *ibDev = flagcxIbDevs + mergedDev->devs[0];
-  props->pciPath = ibDev->pciPath;
-  props->guid = ibDev->guid;
-  props->ptrSupport = FLAGCX_PTR_HOST;
+  properties->pciPath = ibDev->pciPath;
+  properties->guid = ibDev->guid;
+  properties->ptrSupport = FLAGCX_PTR_HOST;
 
   if (flagcxIbGdrSupport() == flagcxSuccess) {
-    props->ptrSupport |= FLAGCX_PTR_CUDA; // GDR support via nv_peermem
+    properties->ptrSupport |= FLAGCX_PTR_CUDA; // GDR support via nv_peermem
   }
-  props->regIsGlobal = 1;
+  properties->regIsGlobal = 1;
   if (flagcxIbDmaBufSupport(dev) == flagcxSuccess) {
-    props->ptrSupport |= FLAGCX_PTR_DMABUF;
+    properties->ptrSupport |= FLAGCX_PTR_DMABUF;
   }
-  props->latency = 0; // Not set
-  props->port = ibDev->portNum + ibDev->realPort;
-  props->maxComms = ibDev->maxQp;
-  props->maxRecvs = FLAGCX_NET_IB_MAX_RECVS;
-  props->netDeviceType = FLAGCX_NET_DEVICE_HOST;
-  props->netDeviceVersion = FLAGCX_NET_DEVICE_INVALID_VERSION;
+  properties->latency = 0; // Not set
+  properties->port = ibDev->portNum + ibDev->realPort;
+  properties->maxComms = ibDev->maxQp;
+  properties->maxRecvs = FLAGCX_NET_IB_MAX_RECVS;
+  properties->netDeviceType = FLAGCX_NET_DEVICE_HOST;
+  properties->netDeviceVersion = FLAGCX_NET_DEVICE_INVALID_VERSION;
   return flagcxSuccess;
 }
 
-flagcxNet_t flagcxNetIb = {"IB",
-                           flagcxIbInit,
-                           flagcxIbDevices,
-                           flagcxIbGetProperties,
-                           flagcxIbListen,
-                           flagcxIbConnect,
-                           flagcxIbAccept,
-                           flagcxIbRegMr,
-                           flagcxIbRegMrDmaBuf,
-                           flagcxIbDeregMr,
-                           flagcxIbIsend,
-                           flagcxIbIrecv,
-                           flagcxIbIflush,
-                           flagcxIbTest,
-                           flagcxIbCloseSend,
-                           flagcxIbCloseRecv,
-                           flagcxIbCloseListen,
-                           NULL /* getDeviceMr */,
-                           NULL /* irecvConsumed */,
-                           flagcxIbGetDevFromName};
+// Adapter wrapper functions
+
+struct flagcxNetAdaptor flagcxNetIb = {
+    // Basic functions
+    "IB", flagcxIbInit, flagcxIbDevices, flagcxIbGetProperties,
+    NULL, // reduceSupport
+    NULL, // getDeviceMr
+    NULL, // irecvConsumed
+
+    // Setup functions
+    flagcxIbListen, flagcxIbConnect, flagcxIbAccept, flagcxIbCloseSend,
+    flagcxIbCloseRecv, flagcxIbCloseListen,
+
+    // Memory region functions
+    flagcxIbRegMr, flagcxIbRegMrDmaBuf, flagcxIbDeregMr,
+
+    // Two-sided functions
+    flagcxIbIsend, flagcxIbIrecv, flagcxIbIflush, flagcxIbTest,
+
+    // One-sided functions
+    NULL, // write
+    NULL, // read
+    NULL, // signal
+
+    // Device name lookup
+    flagcxIbGetDevFromName};

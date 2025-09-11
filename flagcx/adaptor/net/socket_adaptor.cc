@@ -4,12 +4,12 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#include "adaptor.h"
 #include "comm.h"
 #include "core.h"
 #include "net.h"
 #include "param.h"
 #include "socket.h"
-
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
@@ -34,7 +34,7 @@ static flagcxResult_t flagcxNetSocketGetPciPath(char *devName, char **pciPath) {
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxNetSocketInit(flagcxDebugLogger_t logFunction) {
+flagcxResult_t flagcxNetSocketInit() {
   if (flagcxNetIfs == -1) {
     pthread_mutex_lock(&flagcxNetSocketLock);
     if (flagcxNetIfs == -1) {
@@ -95,20 +95,20 @@ static flagcxResult_t flagcxNetSocketGetSpeed(char *devName, int *speed) {
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxNetSocketGetProperties(int dev,
-                                            flagcxNetProperties_t *props) {
-  props->name = flagcxNetSocketDevs[dev].devName;
-  props->pciPath = flagcxNetSocketDevs[dev].pciPath;
-  props->guid = dev;
-  props->ptrSupport = FLAGCX_PTR_HOST;
-  props->regIsGlobal = 0;
-  FLAGCXCHECK(flagcxNetSocketGetSpeed(props->name, &props->speed));
-  props->latency = 0; // Not set
-  props->port = 0;
-  props->maxComms = 65536;
-  props->maxRecvs = 1;
-  props->netDeviceType = FLAGCX_NET_DEVICE_HOST;
-  props->netDeviceVersion = FLAGCX_NET_DEVICE_INVALID_VERSION;
+flagcxResult_t flagcxNetSocketGetProperties(int dev, void *props) {
+  flagcxNetProperties_t *netProps = (flagcxNetProperties_t *)props;
+  netProps->name = flagcxNetSocketDevs[dev].devName;
+  netProps->pciPath = flagcxNetSocketDevs[dev].pciPath;
+  netProps->guid = dev;
+  netProps->ptrSupport = FLAGCX_PTR_HOST;
+  netProps->regIsGlobal = 0;
+  FLAGCXCHECK(flagcxNetSocketGetSpeed(netProps->name, &netProps->speed));
+  netProps->latency = 0; // Not set
+  netProps->port = 0;
+  netProps->maxComms = 65536;
+  netProps->maxRecvs = 1;
+  netProps->netDeviceType = FLAGCX_NET_DEVICE_HOST;
+  netProps->netDeviceVersion = FLAGCX_NET_DEVICE_INVALID_VERSION;
   return flagcxSuccess;
 }
 
@@ -332,9 +332,8 @@ flagcxResult_t flagcxNetSocketListen(int dev, void *opaqueHandle,
   return flagcxSuccess;
 }
 
-flagcxResult_t
-flagcxNetSocketConnect(int dev, void *opaqueHandle, void **sendComm,
-                       flagcxNetDeviceHandle_t ** /*sendDevComm*/) {
+flagcxResult_t flagcxNetSocketConnect(int dev, void *opaqueHandle,
+                                      void **sendComm) {
   if (dev < 0 ||
       dev >= flagcxNetIfs) { // data transfer socket is based on specified dev
     return flagcxInternalError;
@@ -386,9 +385,7 @@ flagcxNetSocketConnect(int dev, void *opaqueHandle, void **sendComm,
   return flagcxSuccess;
 }
 
-flagcxResult_t
-flagcxNetSocketAccept(void *listenComm, void **recvComm,
-                      flagcxNetDeviceHandle_t ** /*recvDevComm*/) {
+flagcxResult_t flagcxNetSocketAccept(void *listenComm, void **recvComm) {
   struct flagcxNetSocketListenComm *lComm =
       (struct flagcxNetSocketListenComm *)listenComm;
   struct flagcxNetSocketCommStage *stage = &lComm->stage;
@@ -448,7 +445,7 @@ flagcxNetSocketAccept(void *listenComm, void **recvComm,
 }
 
 flagcxResult_t flagcxNetSocketGetRequest(struct flagcxNetSocketComm *comm,
-                                         int op, void *data, int size,
+                                         int op, void *data, size_t size,
                                          struct flagcxNetSocketRequest **req) {
   for (int i = 0; i < MAX_REQUESTS; i++) {
     struct flagcxNetSocketRequest *r = comm->requests + i;
@@ -606,8 +603,9 @@ flagcxResult_t flagcxNetSocketDeregMr(void *comm, void *mhandle) {
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxNetSocketIsend(void *sendComm, void *data, int size,
-                                    int tag, void *mhandle, void **request) {
+flagcxResult_t flagcxNetSocketIsend(void *sendComm, void *data, size_t size,
+                                    int tag, void *mhandle, void *phandle,
+                                    void **request) {
   struct flagcxNetSocketComm *comm = (struct flagcxNetSocketComm *)sendComm;
   FLAGCXCHECK(
       flagcxNetSocketGetRequest(comm, FLAGCX_SOCKET_SEND, data, size,
@@ -616,8 +614,8 @@ flagcxResult_t flagcxNetSocketIsend(void *sendComm, void *data, int size,
 }
 
 flagcxResult_t flagcxNetSocketIrecv(void *recvComm, int n, void **data,
-                                    int *sizes, int *tags, void **mhandles,
-                                    void **request) {
+                                    size_t *sizes, int *tags, void **mhandles,
+                                    void **phandles, void **request) {
   struct flagcxNetSocketComm *comm = (struct flagcxNetSocketComm *)recvComm;
   if (n != 1)
     return flagcxInternalError;
@@ -675,24 +673,34 @@ flagcxResult_t flagcxNetSocketClose(void *opaqueComm) {
   return flagcxSuccess;
 }
 
-flagcxNet_t flagcxNetSocket = {
-    "Socket",
-    flagcxNetSocketInit,
-    flagcxNetSocketDevices,
+flagcxNetAdaptor flagcxNetSocket = {
+    // Basic functions
+    "Socket", flagcxNetSocketInit, flagcxNetSocketDevices,
     flagcxNetSocketGetProperties,
-    flagcxNetSocketListen,
-    flagcxNetSocketConnect,
-    flagcxNetSocketAccept,
-    flagcxNetSocketRegMr,
-    NULL, // No DMA-BUF support
-    flagcxNetSocketDeregMr,
-    flagcxNetSocketIsend,
-    flagcxNetSocketIrecv,
-    flagcxNetSocketIflush,
-    flagcxNetSocketTest,
-    flagcxNetSocketClose,
-    flagcxNetSocketClose,
+    NULL, // reduceSupport - not implemented
+    NULL, // getDeviceMr - not implemented
+    NULL, // irecvConsumed - not implemented
+
+    // Setup functions
+    flagcxNetSocketListen, flagcxNetSocketConnect, flagcxNetSocketAccept,
+    flagcxNetSocketClose, // closeSend
+    flagcxNetSocketClose, // closeRecv (same as closeSend for socket)
     flagcxNetSocketCloseListen,
-    NULL /* getDeviceMr */,
-    NULL /* irecvConsumed */
+
+    // Memory region functions
+    flagcxNetSocketRegMr,
+    NULL, // regMrDmaBuf - No DMA-BUF support
+    flagcxNetSocketDeregMr,
+
+    // Two-sided functions
+    flagcxNetSocketIsend, flagcxNetSocketIrecv, flagcxNetSocketIflush,
+    flagcxNetSocketTest,
+
+    // One-sided functions
+    NULL, // write - not implemented
+    NULL, // read - not implemented
+    NULL, // signal - not implemented
+
+    // Device name lookup
+    NULL, // getDevFromName
 };

@@ -43,6 +43,17 @@ extern struct flagcxDeviceAdaptor kunlunAdaptor;
 extern struct flagcxDeviceAdaptor ducudaAdaptor;
 extern struct flagcxDeviceAdaptor *deviceAdaptor;
 
+extern struct flagcxNetAdaptor *netAdaptor;
+
+// Network type enumeration
+enum NetType {
+  IBRC = 1,    // InfiniBand RC
+  SOCKET = 2   // Socket
+};
+
+// Unified network adaptor function declarations
+struct flagcxNetAdaptor *getUnifiedNetAdaptor(int netType);
+
 inline bool flagcxCCLAdaptorNeedSendrecv(size_t value) { return value != 0; }
 
 struct flagcxCCLAdaptor {
@@ -218,7 +229,8 @@ struct flagcxNetAdaptor {
   flagcxResult_t (*accept)(
       void *listenComm,
       void **recvComm); // TODO: add flagcxNetDeviceHandle_t** recvDevComm
-  flagcxResult_t (*close)(void *comm);
+  flagcxResult_t (*closeSend)(void *sendComm);
+  flagcxResult_t (*closeRecv)(void *recvComm);
   flagcxResult_t (*closeListen)(void *listenComm);
 
   // Memory region functions
@@ -245,6 +257,9 @@ struct flagcxNetAdaptor {
                          void *mhandle, void *phandle, void **request);
   flagcxResult_t (*signal)(void *sendComm, void *data, size_t size, int tag,
                            void *mhandle, void *phandle, void **request);
+
+  // Device name lookup
+  flagcxResult_t (*getDevFromName)(char *name, int *dev);
 
   // TODO: add switch functions such as
   // iallreduce, iallgather, ireducescatter,

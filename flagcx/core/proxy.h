@@ -304,7 +304,7 @@ struct flagcxProxyState {
   int buffSizes[FLAGCX_NUM_PROTOCOLS];
   bool allocP2pNetLLBuffers;
   bool dmaBufSupport;
-  flagcxNet_t *flagcxNet;
+  struct flagcxNetAdaptor *netAdaptor;
   flagcxCollNet_t *flagcxCollNet;
   volatile uint32_t *abortFlag;
   // Service threads
