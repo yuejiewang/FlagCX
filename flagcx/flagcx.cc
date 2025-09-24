@@ -8,6 +8,7 @@
 #include "comm.h"
 #include "cost_model.h"
 #include "flagcx_hetero.h"
+#include "flagcx_tuner.h"
 #include "param.h"
 
 #include "launch_kernel.h"
@@ -179,6 +180,33 @@ const char *flagcxGetLastError(flagcxComm_t comm) {
   return "Not implemented.";
 }
 
+// Function helps init single homo cluster.
+// return homoComm via homoComm paramter.
+static flagcxResult_t flagcxHomoCommInit(flagcxUniqueId_t commId, flagcxUniqueId *uniqueIdData,
+                                        struct bootstrapState *state, flagcxComm_t comm,
+                                        flagcxInnerComm_t *homoComm/*out*/) {
+  int rank = comm->rank;
+  int nranks = comm->nranks;
+  memset((void *)commId, 0, sizeof(*commId));
+  memset((void *)uniqueIdData, 0, nranks * sizeof(flagcxUniqueId));
+  if (comm->homo_rank == 0) {
+    cclAdaptors[flagcxCCLAdaptorDevice]->getUniqueId(&commId);
+  }
+  if (comm->homo_rank == 0) {
+    memcpy((void *)&uniqueIdData[rank], (void *)commId, sizeof(flagcxUniqueId));
+  }
+  FLAGCXCHECK(
+      bootstrapAllGather(state, (void *)uniqueIdData, sizeof(flagcxUniqueId)));
+  FLAGCXCHECK(bootstrapBarrier(state, rank, nranks, 0));
+
+  memcpy((void *)commId, (void *)&uniqueIdData[comm->homo_root_rank],
+        sizeof(flagcxUniqueId));
+  FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->commInitRank(
+      homoComm, comm->homo_ranks, commId, comm->homo_rank,
+      NULL));
+  return flagcxSuccess;
+}
+
 flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
                                   flagcxUniqueId_t commId, int rank) {
   if (nranks < 1 || rank < 0 || rank >= nranks) {
@@ -314,26 +342,43 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
     (*comm)->has_single_rank_homo_comm = 0;
   }
 
-  // Reset commId and homo root rank calls underlying GetUniqueId function for
-  // initialization of homo communicator
-  memset((void *)commId, 0, sizeof(*commId));
-  if ((*comm)->homo_rank == 0) {
-    cclAdaptors[flagcxCCLAdaptorDevice]->getUniqueId(&commId);
-  }
   flagcxUniqueId *uniqueIdData;
   FLAGCXCHECK(flagcxCalloc(&uniqueIdData, nranks));
-  if ((*comm)->homo_rank == 0) {
-    memcpy((void *)&uniqueIdData[rank], (void *)commId, sizeof(flagcxUniqueId));
-  }
-  FLAGCXCHECK(
-      bootstrapAllGather(state, (void *)uniqueIdData, sizeof(flagcxUniqueId)));
-  FLAGCXCHECK(bootstrapBarrier(state, rank, nranks, 0));
 
-  memcpy((void *)commId, (void *)&uniqueIdData[(*comm)->homo_root_rank],
-         sizeof(flagcxUniqueId));
-  FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->commInitRank(
-      &(*comm)->homo_comm, (*comm)->homo_ranks, commId, (*comm)->homo_rank,
-      NULL));
+  // Tuner init
+  bool useTuner = false;
+  const char *useTunerEnv = flagcxGetEnv("FLAGCX_USE_TUNER");
+  if (useTunerEnv) {
+    useTuner = (std::stoi(useTunerEnv) == 1) ? true : false;
+  }
+  INFO(FLAGCX_INIT, "Flagcx USE_TUNER flag set to %d", useTuner);
+  if (useTuner) {
+    (*comm)->tuner = &internalTuner;
+    FLAGCXCHECK((*comm)->tuner->init((*comm)->nranks, 0, flagcxDebugLog, &((*comm)->tunerContext)));
+    uint32_t nConfigs = 0;
+    FLAGCXCHECK((*comm)->tuner->getCandidateNumber((*comm)->tunerContext, &nConfigs));
+    if (nConfigs < 1) {
+      WARN("Tuner returned 0 candidates, at least 1 is required.");
+      return flagcxInternalError;
+    }
+    (*comm)->homoCommMap.clear();
+    // Note: The tuner only support homo comm optimization for now
+    for (uint32_t i = 0; i < nConfigs; ++i) {
+      struct flagcxCommTag tag = {.tag = ""};
+      FLAGCXCHECK((*comm)->tuner->setCandidate((*comm)->tunerContext, i, &tag));
+      INFO(FLAGCX_INIT, "start to prepare communicator tag=%s(%u/%u)", tag.tag, i, nConfigs);
+
+      flagcxInnerComm_t innerComm = NULL;
+      FLAGCXCHECK(flagcxHomoCommInit(commId, uniqueIdData, state, *comm, &innerComm));
+      // Insert item into homoCommMap
+      (*comm)->homoCommMap[tag] = innerComm;
+      // For backward compatible, also assign homo_comm field.
+      (*comm)->homo_comm = innerComm;
+    }
+  } else {
+    (*comm)->tuner = NULL;
+    FLAGCXCHECK(flagcxHomoCommInit(commId, uniqueIdData, state, *comm, &((*comm)->homo_comm)));
+  }
 
   if (!is_homo_comm(*comm)) {
     // Reset commId and hetero root rank calls flagcxHeteroGetUniqueId
@@ -503,10 +548,21 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
           cclAdaptors[flagcxCCLAdaptorHost]->commDestroy(comm->host_comm));
     }
   }
-  // Destroy homo comm
-  FLAGCXCHECK(
-      cclAdaptors[flagcxCCLAdaptorDevice]->commDestroy(comm->homo_comm));
 
+  // Destroy homo comms
+  if (comm->tuner) {
+    for (const auto & item : comm->homoCommMap) {
+      FLAGCXCHECK(
+        cclAdaptors[flagcxCCLAdaptorDevice]->commDestroy(item.second));
+    }
+  } else {
+    cclAdaptors[flagcxCCLAdaptorDevice]->commDestroy(comm->homo_comm);
+  }
+
+  // Destroy tuner
+  if (comm->tuner) {
+    comm->tuner->destroy(comm->tunerContext);
+  }
   return flagcxSuccess;
 }
 
@@ -982,8 +1038,20 @@ flagcxResult_t flagcxAllReduce(const void *sendbuff, void *recvbuff,
                                flagcxStream_t stream) {
   FLAGCXCHECK(flagcxEnsureCommReady(comm));
   if (is_homo_comm(comm)) {
+    if (comm->tuner == NULL) {
+      return cclAdaptors[flagcxCCLAdaptorDevice]->allReduce(
+              sendbuff, recvbuff, count, datatype, op, comm->homo_comm, stream);
+    }
+    struct flagcxCommTag tag = {.tag = ""};
+    FLAGCXCHECK(comm->tuner->getCollInfo(comm->tunerContext, flagcxCommOpAllReduce, count * getFlagcxDataTypeSize(datatype), 0, NULL, 0, &tag));
+    const auto it = comm->homoCommMap.find(tag);
+    if (it == comm->homoCommMap.end()) {
+      WARN("Tuner returned a communicator tag '%s' that was not initialized.", tag.tag);
+      return flagcxInternalError;
+    }
+    flagcxInnerComm_t innerComm = it->second;
     return cclAdaptors[flagcxCCLAdaptorDevice]->allReduce(
-        sendbuff, recvbuff, count, datatype, op, comm->homo_comm, stream);
+        sendbuff, recvbuff, count, datatype, op, innerComm, stream);
   } else {
     if (use_host_comm() || comm->has_single_rank_homo_comm) {
       // c2c validation

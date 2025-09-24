@@ -2,7 +2,6 @@
 #define FLAGCX_ADAPTOR_TUNER_H_
 
 #include "flagcx.h"
-#include "global_comm.h"
 #include "debug.h"
 
 #ifdef __cplusplus
@@ -66,7 +65,7 @@ struct flagcxTuner {
   //   - context: tuner context object
   // Outputs:
   //   - nCandidates: number of candidate communicator
-  flagcxResult_t (*getCandidateNumber)(void* context, int* nCandidates);
+  flagcxResult_t (*getCandidateNumber)(void* context, uint32_t* nCandidates);
 
   // Set appropriate environment variables according to index, and return the communicator tag.
   // Note that all the env settings are set before returning from this function.
@@ -76,7 +75,7 @@ struct flagcxTuner {
   //   - index: index of candidate communicator, range [0, nCandidates)
   // Outputs:
   //   - commTag: communicator tag for this particular candidate
-  flagcxResult_t (*setCandidate)(void* context, int index, struct flagcxCommTag* commTag);
+  flagcxResult_t (*setCandidate)(void* context, uint32_t index, struct flagcxCommTag* commTag);
 
   // Select the best communicator candidate for this collective.
   // All the env of type FLAGCX_ENV_TYPE_COLL and FLAGCX_ENV_TYPE_ONETIME if necessary
@@ -103,6 +102,7 @@ struct flagcxTuner {
   flagcxResult_t (*destroy)(void *context);
 };
 
+typedef struct flagcxTuner flagcxTuner_t;
 #ifdef __cplusplus
 } // end extern "C"
 #endif
