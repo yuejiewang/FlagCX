@@ -47,8 +47,8 @@ extern struct flagcxNetAdaptor *netAdaptor;
 
 // Network type enumeration
 enum NetType {
-  IBRC = 1,    // InfiniBand RC
-  SOCKET = 2   // Socket
+  IBRC = 1,  // InfiniBand RC (or UCX when USE_UCX=1)
+  SOCKET = 2 // Socket
 };
 
 // Unified network adaptor function declarations

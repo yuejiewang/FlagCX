@@ -112,11 +112,20 @@ struct flagcxDeviceAdaptor *deviceAdaptor = &ducudaAdaptor;
 extern struct flagcxNetAdaptor flagcxNetSocket;
 extern struct flagcxNetAdaptor flagcxNetIb;
 
+#ifdef USE_UCX
+extern struct flagcxNetAdaptor flagcxNetUcx;
+#endif
+
 // Unified network adaptor entry point
 struct flagcxNetAdaptor *getUnifiedNetAdaptor(int netType) {
   switch (netType) {
     case IBRC:
+#ifdef USE_UCX
+      // When UCX is enabled, use UCX instead of IBRC
+      return &flagcxNetUcx;
+#else
       return &flagcxNetIb;
+#endif
     case SOCKET:
       return &flagcxNetSocket;
     default:
