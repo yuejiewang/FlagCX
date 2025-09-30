@@ -104,7 +104,8 @@ flagcxResult_t flagcxNetInit(struct flagcxHeteroComm *comm) {
       break;
     }
   } else {
-    // Normal network selection order (IBRC/UCX first, then socket)
+    // Normal network selection order (IBUC first when enabled, then IBRC, then
+    // socket)
     for (int i = 0; i < 3; i++) {
       if (flagcxNetAdaptors[i] == nullptr)
         continue;
