@@ -249,6 +249,8 @@ LIBSRCFILES:= \
 	$(wildcard flagcx/adaptor/ccl/*.cc) \
 	$(wildcard flagcx/adaptor/net/*.cc) \
 	$(wildcard flagcx/adaptor/tuner/*.cc) \
+	$(wildcard flagcx/kernels/flagcx_kernel.cu) \
+	$(wildcard flagcx/kernels/device_collective_demo.cu) \
 	$(wildcard flagcx/service/*.cc)
 
 LIBOBJ     := $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
