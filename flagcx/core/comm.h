@@ -9,6 +9,7 @@
 
 #include "bootstrap.h"
 #include "device.h"
+#include "flagcx_kernel.h"
 #include "flagcx_net.h"
 #include "flagcx_tuner.h"
 #include "info.h"
@@ -334,6 +335,8 @@ struct flagcxHeteroComm {
   int finalizeRankCnt;
   // group job to support multi-thread FT
   struct flagcxGroupJob *groupJob;
+  // kernel p2p state
+  struct flagcxProxyKernelState *proxyKernelState;
 
   // Tuning plugin
   flagcxTuner_t *tuner;

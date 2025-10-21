@@ -7,17 +7,18 @@ __global__ void asyncStore(bool *__restrict__ value) {
 }
 
 __global__ void asyncLoad(const volatile bool *__restrict__ value) {
-  while (!(*value)) { // no-op; }
+  while (!(*value)) { // no-op;
   }
+}
 
-  extern "C" void deviceAsyncStore(flagcxStream_t stream, void *args) {
-    bool *value = static_cast<bool *>(args);
-    asyncStore<<<1, 1, 0, *(cudaStream_t *)stream>>>(value);
-    return;
-  }
+extern "C" void deviceAsyncStore(flagcxStream_t stream, void *args) {
+  bool *value = static_cast<bool *>(args);
+  asyncStore<<<1, 1, 0, *(cudaStream_t *)stream>>>(value);
+  return;
+}
 
-  extern "C" void deviceAsyncLoad(flagcxStream_t stream, void *args) {
-    bool *value = static_cast<bool *>(args);
-    asyncLoad<<<1, 1, 0, *(cudaStream_t *)stream>>>(value);
-    return;
-  }
+extern "C" void deviceAsyncLoad(flagcxStream_t stream, void *args) {
+  bool *value = static_cast<bool *>(args);
+  asyncLoad<<<1, 1, 0, *(cudaStream_t *)stream>>>(value);
+  return;
+}
