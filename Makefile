@@ -253,7 +253,13 @@ LIBSRCFILES:= \
 	$(wildcard flagcx/kernels/device_collective_demo.cu) \
 	$(wildcard flagcx/service/*.cc)
 
-LIBOBJ     := $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
+DEVSRCFILES:= \
+	$(wildcard flagcx/kernels/flagcx_kernel.cu) \
+	$(wildcard flagcx/kernels/device_collective_demo.cu)
+
+LIBOBJ:= \
+	$(LIBSRCFILES:%.cc=$(OBJDIR)/%.o) \
+	$(DEVSRCFILES:%.cu=$(OBJDIR)/%.o)
 
 TARGET = libflagcx.so
 all: $(LIBDIR)/$(TARGET)
@@ -298,6 +304,11 @@ $(OBJDIR)/%.o: %.cc
 	@mkdir -p `dirname $@`
 	@echo "Compiling $@"
 	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
+
+$(OBJDIR)/%.o: %.cu
+	@mkdir -p `dirname $@`
+	@echo "Compiling $@ (CUDA)"
+	@nvcc $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -c -Xcompiler -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
 
 -include $(LIBOBJ:.o=.d)
 
