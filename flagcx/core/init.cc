@@ -11,6 +11,7 @@
 #include "flagcx.h"
 #include "group.h"
 #include "net.h"
+#include "proxy_kernel.h"
 #include "topo.h"
 #include "transport.h"
 #include "type.h"
