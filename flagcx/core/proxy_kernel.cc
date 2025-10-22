@@ -17,16 +17,16 @@ void *flagcxProxyKernelService(void *args) {
     flagcxDeviceTrigger trigger = *ptr;
     switch (trigger.fields.type) {
       case flagcxDevicePrimSend:
-        flagcxSend((const void *)(uintptr_t)(trigger.fields.addr),
-                   trigger.fields.count,
-                   (flagcxDataType_t)(trigger.fields.datatype),
-                   trigger.fields.peerRank, comm, stream);
+        flagcxHeteroSend((const void *)(uintptr_t)(trigger.fields.addr),
+                         trigger.fields.count,
+                         (flagcxDataType_t)(trigger.fields.datatype),
+                         trigger.fields.peerRank, comm, stream);
         break;
       case flagcxDevicePrimRecv:
-        flagcxRecv((void *)(uintptr_t)(trigger.fields.addr),
-                   trigger.fields.count,
-                   (flagcxDataType_t)(trigger.fields.datatype),
-                   trigger.fields.peerRank, comm, stream);
+        flagcxHeteroRecv((void *)(uintptr_t)(trigger.fields.addr),
+                         trigger.fields.count,
+                         (flagcxDataType_t)(trigger.fields.datatype),
+                         trigger.fields.peerRank, comm, stream);
         break;
       case flagcxDevicePrimTerm:
         flagcxHeteroGroupEnd();

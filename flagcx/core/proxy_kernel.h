@@ -2,6 +2,7 @@
 #define PROXY_KERNEL_H_
 
 #include "check.h"
+#include "collectives.h"
 #include "comm.h"
 #include "device.h"
 #include "flagcx.h"
