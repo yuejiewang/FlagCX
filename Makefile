@@ -98,6 +98,7 @@ endif
 DEVICE_LIB =
 DEVICE_INCLUDE =
 DEVICE_LINK =
+DEVICE_COMPILER =
 CCL_LIB =
 CCL_INCLUDE =
 CCL_LINK =
@@ -114,6 +115,7 @@ ifeq ($(USE_NVIDIA), 1)
 	DEVICE_LIB = $(DEVICE_HOME)/lib64
 	DEVICE_INCLUDE = $(DEVICE_HOME)/include
 	DEVICE_LINK = -lcudart -lcuda
+	DEVICE_COMPILER = $(DEVICE_HOME)/bin/nvcc
 	CCL_LIB = $(CCL_HOME)/lib
 	CCL_INCLUDE = $(CCL_HOME)/include
 	CCL_LINK = -lnccl
@@ -257,9 +259,8 @@ DEVSRCFILES:= \
 	$(wildcard flagcx/kernels/flagcx_kernel.cu) \
 	$(wildcard flagcx/kernels/device_collective_demo.cu)
 
-LIBOBJ:= \
-	$(LIBSRCFILES:%.cc=$(OBJDIR)/%.o) \
-	$(DEVSRCFILES:%.cu=$(OBJDIR)/%.o)
+LIBOBJ:= $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
+DEVOBJ:= $(DEVSRCFILES:%.cu=$(OBJDIR)/%.o)
 
 TARGET = libflagcx.so
 all: $(LIBDIR)/$(TARGET)
@@ -295,7 +296,7 @@ print_var:
 	@echo "USE_IBUC: $(USE_IBUC)"
 	@echo "NET_ADAPTOR_FLAG: $(NET_ADAPTOR_FLAG)"
 
-$(LIBDIR)/$(TARGET): $(LIBOBJ)
+$(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJ) $(OBJDIR)/cuda_dlink.o
 	@mkdir -p `dirname $@`
 	@echo "Linking   $@"
 	@g++ $(LIBOBJ) -o $@ -L$(CCL_LIB) -L$(DEVICE_LIB) -L$(HOST_CCL_LIB) -L$(UCX_LIB) -shared -fvisibility=default -Wl,--no-as-needed -Wl,-rpath,$(LIBDIR) -Wl,-rpath,$(CCL_LIB) -Wl,-rpath,$(HOST_CCL_LIB) -Wl,-rpath,$(UCX_LIB) -lpthread -lrt -ldl $(CCL_LINK) $(DEVICE_LINK) $(HOST_CCL_LINK) $(UCX_LINK) -g
@@ -305,12 +306,15 @@ $(OBJDIR)/%.o: %.cc
 	@echo "Compiling $@"
 	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
 
+$(OBJDIR)/cuda_dlink.o: $(DEVOBJ)
+	@$(DEVICE_COMPILER) -dlink -o $@ $^ $(DEVICE_LINK)
+
 $(OBJDIR)/%.o: %.cu
 	@mkdir -p `dirname $@`
 	@echo "Compiling $@ (CUDA)"
-	@nvcc $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -c -Xcompiler -fPIC -MMD -MP -g
+	@$(DEVICE_COMPILER) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -c -Xcompiler -fPIC -MMD -MP -rdc=true -g
 
--include $(LIBOBJ:.o=.d)
+-include $(LIBOBJ:.o=.d) $(DEVOBJ:.o=.d)
 
 clean:
 	@rm -rf $(LIBDIR)/$(TARGET) $(OBJDIR)

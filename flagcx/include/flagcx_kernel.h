@@ -30,7 +30,7 @@ typedef union alignas(16) {
   struct {
     uint64_t fst;
     uint64_t snd;
-  };
+  } value;
   // The summation of number of bits must be 128 or less.
   struct {
     // First 64 bits: value[0]
@@ -103,6 +103,8 @@ public:
   __device__ flagcxResult_t dequeue(flagcxReduceTrigger_t trigger);
 };
 typedef struct flagcxFifo *flagcxFifo_t;
+
+__device__ size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype);
 
 __device__ flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
