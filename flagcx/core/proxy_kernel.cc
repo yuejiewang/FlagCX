@@ -8,26 +8,28 @@ void *flagcxProxyKernelService(void *args) {
   int groupCount = 0;
   while (true) {
     if (groupCount == 0) {
-      flagcxGroupStart(comm);
+      flagcxHeteroGroupStart();
       groupCount++;
     }
     flagcxDeviceTrigger_t ptr;
-    flagcxMemAlloc(ptr, sizeof(flagcxDeviceTrigger), comm);
-    comm->fifo->dequeue(ptr);
+    flagcxCalloc(&ptr, sizeof(flagcxDeviceTrigger));
+    fifo->dequeue(ptr);
     flagcxDeviceTrigger trigger = *ptr;
     switch (trigger.fields.type) {
       case flagcxDevicePrimSend:
-        flagcxSend(const_cast<const void *>(trigger.fields.addr),
-                   trigger.fields.count, trigger.fields.datatype,
+        flagcxSend((const void *)(uintptr_t)(trigger.fields.addr),
+                   trigger.fields.count,
+                   (flagcxDataType_t)(trigger.fields.datatype),
                    trigger.fields.peerRank, comm, stream);
         break;
       case flagcxDevicePrimRecv:
-        flagcxRecv(const_cast<void *>(trigger.fields.addr),
-                   trigger.fields.count, trigger.fields.datatype,
+        flagcxRecv((void *)(uintptr_t)(trigger.fields.addr),
+                   trigger.fields.count,
+                   (flagcxDataType_t)(trigger.fields.datatype),
                    trigger.fields.peerRank, comm, stream);
         break;
       case flagcxDevicePrimTerm:
-        flagcxGroupEnd(comm);
+        flagcxHeteroGroupEnd();
         groupCount--;
         break;
       default:
@@ -45,7 +47,7 @@ flagcxResult_t flagcxProxyKernelInit(struct flagcxHeteroComm *comm) {
 
 flagcxResult_t flagcxProxyKernelDestroy(struct flagcxHeteroComm *comm) {
   pthread_join(comm->proxyKernelState->thread, nullptr);
-  free(*(comm->proxyKernelState->fifo));
+  comm->proxyKernelState->fifo->~flagcxFifo();
   free(comm->proxyKernelState->fifo);
   return flagcxSuccess;
 }

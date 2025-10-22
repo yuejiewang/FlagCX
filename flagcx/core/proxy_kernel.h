@@ -6,6 +6,8 @@
 #include "device.h"
 #include "flagcx.h"
 #include "flagcx_kernel.h"
+#include "group.h"
+#include <stdint.h>
 #include <unistd.h>
 
 struct flagcxProxyKernelState {
@@ -14,7 +16,7 @@ struct flagcxProxyKernelState {
 };
 
 struct flagcxProxyKernelServiceArgs {
-  flagcxComm_t comm;
+  flagcxHeteroComm_t comm;
   flagcxStream_t stream;
 };
 typedef struct flagcxProxyKernelServiceArgs *flagcxProxyKernelServiceArgs_t;

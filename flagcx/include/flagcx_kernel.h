@@ -106,12 +106,12 @@ typedef struct flagcxFifo *flagcxFifo_t;
 
 __device__ flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
-                                           flagcxComm_t comm);
+                                           struct flagcxHeteroComm *comm);
 __device__ flagcxResult_t flagcxDeviceRecv(void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
-                                           flagcxComm_t comm);
-__device__ flagcxResult_t flagcxDeviceWait(flagcxComm_t comm);
-__device__ flagcxResult_t flagcxDeviceTerm(flagcxComm_t comm);
+                                           struct flagcxHeteroComm *comm);
+__device__ flagcxResult_t flagcxDeviceWait(struct flagcxHeteroComm *comm);
+__device__ flagcxResult_t flagcxDeviceTerm(struct flagcxHeteroComm *comm);
 
 __global__ void flagcxCollectiveKernel(flagcxFifo_t q); // TBD
 #endif

@@ -13,29 +13,29 @@ __device__ __forceinline__ void spin_backoff(int iter) {
 
 __device__ flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
-                                           flagcxComm_t comm) {
+                                           flagcxHeteroComm_t comm) {
   flagcxDeviceTrigger trigger;
   trigger.fields.addr = const_cast<void *>sendbuff;
   trigger.fields.count = count;
   trigger.fields.peerRank = peer;
   trigger.fields.datatype = datatype;
   trigger.fields.type = flagcxDevicePrimSend;
-  comm->fifo->enqueue(trigger);
+  comm->proxyKernelState->fifo->enqueue(trigger);
   return flagcxSuccess;
 }
 __device__ flagcxResult_t flagcxDeviceRecv(void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
-                                           flagcxComm_t comm) {
+                                           flagcxHeteroComm_t comm) {
   flagcxDeviceTrigger trigger;
   trigger.fields.addr = const_cast<void *> recvbuff;
   trigger.fields.count = count;
   trigger.fields.peerRank = peer;
   trigger.fields.datatype = datatype;
   trigger.fields.type = flagcxDevicePrimRecv;
-  comm->fifo->enqueue(trigger);
+  comm->proxyKernelState->fifo->enqueue(trigger);
   return flagcxSuccess;
 }
-__device__ flagcxResult_t flagcxDeviceWait(flagcxComm_t comm) {
+__device__ flagcxResult_t flagcxDeviceWait(flagcxHeteroComm_t comm) {
   int curr_p = __ldg(comm->fifo->produced[0]);
   int curr_c = __ldg(comm->fifo->consumed[0]);
   int iter = 0;
@@ -48,14 +48,14 @@ __device__ flagcxResult_t flagcxDeviceWait(flagcxComm_t comm) {
   }
   return flagcxSuccess;
 }
-__device__ flagcxResult_t flagcxDeviceTerm(flagcxComm_t comm) {
+__device__ flagcxResult_t flagcxDeviceTerm(flagcxHeteroComm_t comm) {
   flagcxDeviceTrigger trigger;
   trigger.fields.addr = 0;
   trigger.fields.count = 0;
   trigger.fields.peerRank = 0;
   trigger.fields.datatype = 0;
   trigger.fields.type = flagcxDevicePrimTerm;
-  comm->fifo->enqueue(trigger);
+  comm->proxyKernelState->fifo->enqueue(trigger);
   return flagcxSuccess;
 }
 
