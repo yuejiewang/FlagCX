@@ -1,5 +1,16 @@
 #include "flagcx_kernel.h"
 
+__device__ __forceinline__ void spin_backoff(int iter) {
+  int delay = 1 << (iter < 15 ? iter : 15);
+#if __CUDA_ARCH__ >= 700
+  __nanosleep(delay);
+#else
+  uint64_t start = clock64();
+  while (clock64() - start < (uint64_t)delay) { /* spin */
+  }
+#endif
+}
+
 __device__ flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
                                            flagcxComm_t comm) {

@@ -1,3 +1,6 @@
+#ifndef FLAGCX_KERNEL_H_
+#define FLAGCX_KERNEL_H_
+
 #include "flagcx.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -45,7 +48,7 @@ typedef union alignas(16) {
     uint64_t reserved : flagcxDeviceTriggerBitsFifoReserved;
   } fields;
 } flagcxDeviceTrigger;
-typedef union flagcxDeviceTrigger *flagcxDeviceTrigger_t;
+typedef flagcxDeviceTrigger *flagcxDeviceTrigger_t;
 
 typedef union alignas(16) {
   uint64_t value[4];
@@ -68,7 +71,7 @@ typedef union alignas(16) {
     uint64_t reserved : flagcxReduceTriggerBitsFifoReserved;
   } fields;
 } flagcxReduceTrigger;
-typedef union flagcxReduceTrigger *flagcxReduceTrigger_t;
+typedef flagcxReduceTrigger *flagcxReduceTrigger_t;
 
 struct flagcxFifo {
   int32_t capacity;
@@ -111,14 +114,4 @@ __device__ flagcxResult_t flagcxDeviceWait(flagcxComm_t comm);
 __device__ flagcxResult_t flagcxDeviceTerm(flagcxComm_t comm);
 
 __global__ void flagcxCollectiveKernel(flagcxFifo_t q); // TBD
-
-__device__ __forceinline__ void spin_backoff(int iter) {
-  int delay = 1 << min(15, iter);
-#if __CUDA_ARCH__ >= 700
-  __nanosleep(delay);
-#else
-  uint64_t start = clock64();
-  while (clock64() - start < (uint64_t)delay) { /* spin */
-  }
 #endif
-}
