@@ -1,4 +1,6 @@
+#include "comm.h"
 #include "flagcx_kernel.h"
+#include "proxy_kernel.h"
 
 __device__ __forceinline__ void spin_backoff(int iter) {
   int delay = 1 << (iter < 15 ? iter : 15);
@@ -13,9 +15,9 @@ __device__ __forceinline__ void spin_backoff(int iter) {
 
 __device__ flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
-                                           flagcxHeteroComm_t comm) {
+                                           struct flagcxHeteroComm *comm) {
   flagcxDeviceTrigger trigger;
-  trigger.fields.addr = const_cast<void *>sendbuff;
+  trigger.fields.addr = (uint64_t)(sendbuff);
   trigger.fields.count = count;
   trigger.fields.peerRank = peer;
   trigger.fields.datatype = datatype;
@@ -23,11 +25,11 @@ __device__ flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
   comm->proxyKernelState->fifo->enqueue(trigger);
   return flagcxSuccess;
 }
-__device__ flagcxResult_t flagcxDeviceRecv(void *sendbuff, size_t count,
+__device__ flagcxResult_t flagcxDeviceRecv(void *recvbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
-                                           flagcxHeteroComm_t comm) {
+                                           struct flagcxHeteroComm *comm) {
   flagcxDeviceTrigger trigger;
-  trigger.fields.addr = const_cast<void *> recvbuff;
+  trigger.fields.addr = (uint64_t)(recvbuff);
   trigger.fields.count = count;
   trigger.fields.peerRank = peer;
   trigger.fields.datatype = datatype;
@@ -35,20 +37,20 @@ __device__ flagcxResult_t flagcxDeviceRecv(void *sendbuff, size_t count,
   comm->proxyKernelState->fifo->enqueue(trigger);
   return flagcxSuccess;
 }
-__device__ flagcxResult_t flagcxDeviceWait(flagcxHeteroComm_t comm) {
-  int curr_p = __ldg(comm->fifo->produced[0]);
-  int curr_c = __ldg(comm->fifo->consumed[0]);
+__device__ flagcxResult_t flagcxDeviceWait(struct flagcxHeteroComm *comm) {
+  int curr_p = __ldg(comm->proxyKernelState->fifo->produced);
+  int curr_c = __ldg(comm->proxyKernelState->fifo->consumed);
   int iter = 0;
   while (curr_p > curr_c) {
-    // curr_p = __ldg(comm->fifo->produced[0]);
+    // curr_p = __ldg(comm->proxyKernelState->fifo->produced);
     // check a fixed point, not updating `produced` index
-    curr_c = __ldg(comm->fifo->consumed[0]);
+    curr_c = __ldg(comm->proxyKernelState->fifo->consumed);
     spin_backoff(iter);
     iter++;
   }
   return flagcxSuccess;
 }
-__device__ flagcxResult_t flagcxDeviceTerm(flagcxHeteroComm_t comm) {
+__device__ flagcxResult_t flagcxDeviceTerm(struct flagcxHeteroComm *comm) {
   flagcxDeviceTrigger trigger;
   trigger.fields.addr = 0;
   trigger.fields.count = 0;
@@ -72,12 +74,12 @@ __device__ flagcxResult_t flagcxFifo::enqueue(flagcxDeviceTrigger trigger) {
       }
     }
   }
-  buffer[idx] = trigger;
+  *(const_cast<flagcxDeviceTrigger_t>(buffer) + idx) = trigger;
   return flagcxSuccess;
 }
 
 __host__ flagcxResult_t flagcxFifo::dequeue(flagcxDeviceTrigger_t trigger) {
-  *trigger = buffer[++consumed[0]];
+  *trigger = *(const_cast<flagcxDeviceTrigger_t>(buffer) + (++consumed[0]));
   return flagcxSuccess;
 }
 
