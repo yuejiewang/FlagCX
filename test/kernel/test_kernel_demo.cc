@@ -1,8 +1,6 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 #include "tools.h"
-#include <cuda.h>
-#include <cuda_runtime.h>
 #include <cstring>
 #include <iostream>
 
@@ -70,16 +68,16 @@ int main(int argc, char *argv[]) {
   // Warm-up for large size
   for (int i = 0; i < num_warmup_iters; i++) {
     // launch p2p kernel
-    flagcxP2pDemo<<<1, 1, stream>>>(sendbuff, recvbuff, count, DATATYPE,
-                                    sendPeer, recvPeer, comm);
+    flagcxP2pKernel(sendbuff, recvbuff, count, DATATYPE, sendPeer, recvPeer,
+                    comm, stream);
   }
   devHandle->streamSynchronize(stream);
 
   // Warm-up for small size
   for (int i = 0; i < num_warmup_iters; i++) {
     // launch p2p kernel
-    flagcxP2pDemo<<<1, 1, stream>>>(sendbuff, recvbuff, count, DATATYPE,
-                                    sendPeer, recvPeer, comm);
+    flagcxP2pKernel(sendbuff, recvbuff, count, DATATYPE, sendPeer, recvPeer,
+                    comm, stream);
   }
   devHandle->streamSynchronize(stream);
 
@@ -105,8 +103,8 @@ int main(int argc, char *argv[]) {
     tim.reset();
     for (int i = 0; i < num_iters; i++) {
       // launch p2p kernel
-      flagcxP2pDemo<<<1, 1, stream>>>(sendbuff, recvbuff, count, DATATYPE,
-                                      sendPeer, recvPeer, comm);
+      flagcxP2pKernel(sendbuff, recvbuff, count, DATATYPE, sendPeer, recvPeer,
+                      comm, stream);
     }
     devHandle->streamSynchronize(stream);
 
