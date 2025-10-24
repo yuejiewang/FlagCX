@@ -68,16 +68,16 @@ int main(int argc, char *argv[]) {
   // Warm-up for large size
   for (int i = 0; i < num_warmup_iters; i++) {
     // launch p2p kernel
-    flagcxP2pKernel(sendbuff, recvbuff, count, DATATYPE, sendPeer, recvPeer,
-                    comm, stream);
+    flagcxP2pDemo(sendbuff, recvbuff, count, DATATYPE, sendPeer, recvPeer, comm,
+                  stream);
   }
   devHandle->streamSynchronize(stream);
 
   // Warm-up for small size
   for (int i = 0; i < num_warmup_iters; i++) {
     // launch p2p kernel
-    flagcxP2pKernel(sendbuff, recvbuff, count, DATATYPE, sendPeer, recvPeer,
-                    comm, stream);
+    flagcxP2pDemo(sendbuff, recvbuff, count, DATATYPE, sendPeer, recvPeer, comm,
+                  stream);
   }
   devHandle->streamSynchronize(stream);
 
@@ -103,8 +103,8 @@ int main(int argc, char *argv[]) {
     tim.reset();
     for (int i = 0; i < num_iters; i++) {
       // launch p2p kernel
-      flagcxP2pKernel(sendbuff, recvbuff, count, DATATYPE, sendPeer, recvPeer,
-                      comm, stream);
+      flagcxP2pDemo(sendbuff, recvbuff, count, DATATYPE, sendPeer, recvPeer,
+                    comm, stream);
     }
     devHandle->streamSynchronize(stream);
 
