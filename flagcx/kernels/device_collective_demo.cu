@@ -1,14 +1,7 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 #include "global_comm.h"
-__host__ void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
-                            flagcxDataType_t datatype, int sendPeer,
-                            int recvPeer, flagcxComm_t comm,
-                            flagcxStream_t stream) {
-  flagcxP2pKernel<<<1, 1, 0, stream->base>>>(
-      sendbuff, recvbuff, count, DATATYPE, sendPeer, recvPeer, comm);
-}
-
+#include "nvidia_adaptor.h"
 __global__ void flagcxP2pKernel(const void *sendbuff, void *recvbuff,
                               size_t count, flagcxDataType_t datatype,
                               int sendPeer, int recvPeer, flagcxComm_t comm) {
@@ -31,4 +24,12 @@ __global__ void flagcxP2pKernel(const void *sendbuff, void *recvbuff,
     flagcxDeviceTerm(comm->hetero_comm);
     flagcxDeviceWait(comm->hetero_comm);
   }
+}
+
+void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
+                            flagcxDataType_t datatype, int sendPeer,
+                            int recvPeer, flagcxComm_t comm,
+                            flagcxStream_t stream) {
+  flagcxP2pKernel<<<1, 1, 0, stream->base>>>(
+      sendbuff, recvbuff, count, datatype, sendPeer, recvPeer, comm);
 }

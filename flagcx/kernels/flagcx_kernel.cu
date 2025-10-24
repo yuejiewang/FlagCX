@@ -1,4 +1,5 @@
 #include "comm.h"
+#include "flagcx.h"
 #include "flagcx_kernel.h"
 #include "proxy_kernel.h"
 
