@@ -114,9 +114,8 @@ __device__ flagcxResult_t flagcxDeviceRecv(void *sendbuff, size_t count,
                                            struct flagcxHeteroComm *comm);
 __device__ flagcxResult_t flagcxDeviceWait(struct flagcxHeteroComm *comm);
 __device__ flagcxResult_t flagcxDeviceTerm(struct flagcxHeteroComm *comm);
-__host__ void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
-                            flagcxDataType_t datatype, int sendPeer,
-                            int recvPeer, flagcxComm_t comm,
-                            flagcxStream_t stream);
 __global__ void flagcxCollectiveKernel(flagcxFifo_t q); // TBD
+void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
+                   flagcxDataType_t datatype, int sendPeer, int recvPeer,
+                   flagcxComm_t comm, flagcxStream_t stream);
 #endif
