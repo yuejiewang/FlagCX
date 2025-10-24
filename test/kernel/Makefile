@@ -6,7 +6,7 @@ COMPILER = g++
 EXTRA_COMPILER_FLAG = -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wl,-rpath,../../build/lib -std=c++11 -g
 
 INCLUDEDIR := $(abspath include)
-LIBSRCFILES:= $(wildcard *.cc)
+LIBSRCFILES:= $(abspath tools.cc)
 
 DEVICE_HOME ?=
 DEVICE_LIB =
