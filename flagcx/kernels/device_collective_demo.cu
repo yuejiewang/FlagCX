@@ -1,7 +1,15 @@
+#include "flagcx.h"
 #include "flagcx_kernel.h"
 #include "global_comm.h"
+__host__ void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
+                            flagcxDataType_t datatype, int sendPeer,
+                            int recvPeer, flagcxComm_t comm,
+                            flagcxStream_t stream) {
+  flagcxP2pKernel<<<1, 1, 0, stream->base>>>(
+      sendbuff, recvbuff, count, DATATYPE, sendPeer, recvPeer, comm);
+}
 
-__global__ void flagcxP2pDemo(const void *sendbuff, void *recvbuff,
+__global__ void flagcxP2pKernel(const void *sendbuff, void *recvbuff,
                               size_t count, flagcxDataType_t datatype,
                               int sendPeer, int recvPeer, flagcxComm_t comm) {
   int tid = threadIdx.x;
