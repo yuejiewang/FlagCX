@@ -3,8 +3,22 @@
 
 #include "tuner.h" // struct flagcxEnvConfig
 #include <vector>
+#include <string>
 
 // This is a demonstration function that provide a way to load all config list for a specific GPU.
-flagcxResult_t loadConfigList(std::vector<struct flagcxEnvConfig> &cfgList);
+
+struct EnvVar {
+    std::string name;
+    std::vector<std::string> choices;
+    std::string defaultValue;
+    EnvVar(std::string n="") : name(std::move(n)) {}
+    EnvVar(std::string n, std::vector<std::string> c, std::string d = "")
+      : name(std::move(n)), choices(std::move(c)), defaultValue(std::move(d)) {}
+};
+
+flagcxResult_t generateCandidate(std::vector<struct flagcxEnvConfig> &cfgList);
+static void safeStrCopy(char *dst, size_t dstSize, const std::string &src);
+
+extern std::vector<EnvVar> vars;
 
 #endif // end include guard
