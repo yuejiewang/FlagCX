@@ -49,7 +49,7 @@ struct flagcxHostSemaphore {
   flagcxEvent_t getEvent() {
     events.push_back(nullptr);
     auto &event = events.back();
-    deviceAdaptor->eventCreate(&event);
+    deviceAdaptor->eventCreate(&event, flagcxEventDisableTiming);
     return event;
   }
   void signalStart() { __atomic_store_n(&start, 1, __ATOMIC_RELEASE); }
