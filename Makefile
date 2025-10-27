@@ -251,8 +251,6 @@ LIBSRCFILES:= \
 	$(wildcard flagcx/adaptor/ccl/*.cc) \
 	$(wildcard flagcx/adaptor/net/*.cc) \
 	$(wildcard flagcx/adaptor/tuner/*.cc) \
-	$(wildcard flagcx/kernels/flagcx_kernel.cu) \
-	$(wildcard flagcx/kernels/device_collective_demo.cu) \
 	$(wildcard flagcx/service/*.cc)
 
 DEVSRCFILES:= \
@@ -299,14 +297,8 @@ print_var:
 $(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJ) $(OBJDIR)/cuda_dlink.o
 	@mkdir -p `dirname $@`
 	@echo "Linking   $@"
-	@$(DEVICE_COMPILER) $(LIBOBJ) $(DEVOBJ0) $(OBJDIR)/cuda_dlink.o -o $@ -L$(CCL_LIB) -L$(DEVICE_LIB) -L$(HOST_CCL_LIB) -L$(UCX_LIB) -shared \
-		-Xcompiler -fvisibility=default \
-		-Xlinker --no-as-needed \
-		-Xlinker -rpath -Xlinker $(LIBDIR) \
-		-Xlinker -rpath -Xlinker $(CCL_LIB) \
-		-Xlinker -rpath -Xlinker $(HOST_CCL_LIB) \
-		-Xlinker -rpath -Xlinker $(UCX_LIB) \
-		-Xlinker -lpthread -lrt -ldl $(CCL_LINK) $(DEVICE_LINK) $(HOST_CCL_LINK) $(UCX_LINK) -g
+	@g++ $^ -o $@ -L$(CCL_LIB) -L$(DEVICE_LIB) -L$(HOST_CCL_LIB) -L$(UCX_LIB) -shared -fvisibility=default -Wl,--no-as-needed -Wl,-rpath,$(LIBDIR) -Wl,-rpath,$(CCL_LIB) -Wl,-rpath,$(HOST_CCL_LIB) -Wl,-rpath,$(UCX_LIB) -lpthread -lrt -ldl $(CCL_LINK) $(DEVICE_LINK) $(HOST_CCL_LINK) $(UCX_LINK) -g
+
 
 $(OBJDIR)/%.o: %.cc
 	@mkdir -p `dirname $@`
@@ -314,7 +306,7 @@ $(OBJDIR)/%.o: %.cc
 	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
 
 $(OBJDIR)/cuda_dlink.o: $(DEVOBJ)
-	@$(DEVICE_COMPILER) -dlink -o $@ $^ $(DEVICE_LINK) --cudart=shared -Xcompiler -fPIC
+	@$(DEVICE_COMPILER) -dlink $^ -o $@ $(DEVICE_LINK) --cudart=shared -Xcompiler -fPIC
 
 $(OBJDIR)/%.o: %.cu
 	@mkdir -p `dirname $@`
