@@ -6,7 +6,7 @@ COMPILER = g++
 EXTRA_COMPILER_FLAG = -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wl,-rpath,../../build/lib -std=c++11 -g
 
 INCLUDEDIR := $(abspath include)
-LIBSRCFILES:= $(abspath tools.cc)
+LIBSRCFILES:= $(wildcard *.cc)
 
 DEVICE_HOME ?=
 DEVICE_LIB =
@@ -23,9 +23,9 @@ endif
 
 all: test-kernel-demo
 
-test-kernel-demo: test_kernel_demo.cc
+test-kernel-demo: test_kernel_demo.cpp
 	@echo "Compiling $@"
-	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_kernel_demo test_kernel_demo.cc $(LIBSRCFILES) -I../../flagcx/include -I$(INCLUDEDIR) -I$(MPI_INCLUDE) -I$(DEVICE_INCLUDE) -L../../build/lib -L$(MPI_LIB) -L$(DEVICE_LIB) -lflagcx $(MPI_LINK) $(DEVICE_LINK)
+	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_kernel_demo test_kernel_demo.cpp $(LIBSRCFILES) -I../../flagcx/include -I$(INCLUDEDIR) -I$(MPI_INCLUDE) -I$(DEVICE_INCLUDE) -L../../build/lib -L$(MPI_LIB) -L$(DEVICE_LIB) -lflagcx $(MPI_LINK) $(DEVICE_LINK)
 
 clean:
 	@rm -f test_kernel_demo
