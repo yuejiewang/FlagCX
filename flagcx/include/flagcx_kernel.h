@@ -1,6 +1,5 @@
 #ifndef FLAGCX_KERNEL_H_
 #define FLAGCX_KERNEL_H_
-
 #include "flagcx.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
