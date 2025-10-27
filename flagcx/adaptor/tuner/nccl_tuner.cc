@@ -12,6 +12,7 @@ static EnvVar minChannel("NCCL_MIN_NCHANNELS", {"16", "32"}, "16");
 
 static EnvVar chunkSize("NCCL_P2P_NVL_CHUNKSIZE", {"1024", "2048"}, "1024");
 
-std::vector<EnvVar> vars = {algo, proto, thread, minChannel, chunkSize};
+std::vector<EnvVar> ncclTunerVars = {algo, proto, thread, minChannel,
+                                     chunkSize};
 
 #endif

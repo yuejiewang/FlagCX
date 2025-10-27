@@ -20,6 +20,8 @@ struct EnvVar {
 flagcxResult_t generateCandidate(std::vector<struct flagcxEnvConfig> &cfgList);
 static void safeStrCopy(char *dst, size_t dstSize, const std::string &src);
 
+extern std::vector<EnvVar> ncclTunerVars;
+extern std::vector<EnvVar> mcclTunerVars;
 extern std::vector<EnvVar> vars;
 
 #endif // end include guard
