@@ -49,6 +49,7 @@ void *flagcxProxyKernelService(void *args) {
     }
   }
   free(ptr);
+  return NULL;
 }
 
 flagcxResult_t flagcxProxyKernelInit(struct flagcxHeteroComm *comm) {
@@ -59,6 +60,7 @@ flagcxResult_t flagcxProxyKernelInit(struct flagcxHeteroComm *comm) {
 }
 
 flagcxResult_t flagcxProxyKernelDestroy(struct flagcxHeteroComm *comm) {
+  INFO(FLAGCX_INIT, "rank=%d flagcxProxyKernelDestroy called.", comm->rank);
   pthread_join(comm->proxyKernelState->thread, nullptr);
   comm->proxyKernelState->fifo->~flagcxFifo();
   free(comm->proxyKernelState->fifo);

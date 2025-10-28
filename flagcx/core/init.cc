@@ -224,6 +224,7 @@ static flagcxResult_t flagcxCommInitRankFunc(struct flagcxAsyncJob *job_) {
     }
     INFO(FLAGCX_INIT, "Flagcx KernelProxy flag set to %d", kernelProxy);
     if (kernelProxy) {
+      FLAGCXCHECK(flagcxCalloc(&comm->proxyKernelState, 1));
       FLAGCXCHECK(flagcxProxyKernelInit(comm));
     }
   }
