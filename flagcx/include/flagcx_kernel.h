@@ -84,6 +84,10 @@ public:
              int32_t *terminate_, uint64_t *buffer_)
       : capacity(capacity_), produced(produced_), consumed(consumed_),
         terminate(terminate_), buffer(buffer_) {
+    flagcxCalloc(&buffer, capacity);
+    flagcxCalloc(&produced, 1);
+    flagcxCalloc(&consumed, 1);
+    flagcxCalloc(&terminate, 1);
     produced[0] = -1;
     consumed[0] = -1;
     terminate[0] = -1;
