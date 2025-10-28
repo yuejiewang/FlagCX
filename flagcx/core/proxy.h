@@ -8,7 +8,9 @@
 #define FLAGCX_PROXY_H_
 
 #include "device.h"
+#include "flagcx_kernel.h"
 #include "flagcx_net.h"
+#include "group.h"
 #include "info.h"
 #include "ipcsocket.h"
 #include "launch_kernel.h"
@@ -22,6 +24,12 @@ enum flagcxProxyOpState {
   flagcxProxyOpNone,
   flagcxProxyOpReady,
   flagcxProxyOpProgress
+};
+
+struct flagcxProxyKernelState {
+  pthread_t thread;
+  flagcxFifo_t fifo;
+  flagcxStream_t stream;
 };
 
 struct flagcxProxyArgs;
@@ -332,6 +340,10 @@ struct flagcxProxyState {
   // Progress thread
   struct flagcxProxyProgressState progressState;
 
+  // Kernel thread
+  bool enableProxyKernel = false;
+  struct flagcxProxyKernelState kernelState;
+
   // Queue of expected responses from the proxy
   struct flagcxExpectedProxyResponse *expectedResponses;
 
@@ -381,6 +393,8 @@ flagcxResult_t flagcxProxyCreate(struct flagcxHeteroComm *comm);
 flagcxResult_t flagcxProxyConnect(struct flagcxHeteroComm *comm, int transport,
                                   int send, int proxyRank,
                                   struct flagcxProxyConnector *proxyConn);
+
+void *flagcxProxyKernelService(void *args);
 
 // Only flagcxProxyMsgConnect & flagcxProxyMsgStop types are used for now.
 enum flagcxProxyMsgType {
