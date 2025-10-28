@@ -11,7 +11,6 @@
 #include "flagcx.h"
 #include "group.h"
 #include "net.h"
-#include "proxy_kernel.h"
 #include "topo.h"
 #include "transport.h"
 #include "type.h"
@@ -216,19 +215,6 @@ static flagcxResult_t flagcxCommInitRankFunc(struct flagcxAsyncJob *job_) {
     }
   }
 
-  if (!job->parent) {
-    const char *kernelProxyEnv = flagcxGetEnv("FLAGCX_KERNEL_PROXY");
-    bool kernelProxy = false;
-    if (kernelProxyEnv) {
-      kernelProxy = (std::stoi(kernelProxyEnv) == 1) ? true : false;
-    }
-    INFO(FLAGCX_INIT, "Flagcx KernelProxy flag set to %d", kernelProxy);
-    if (kernelProxy) {
-      FLAGCXCHECK(flagcxCalloc(&comm->proxyKernelState, 1));
-      FLAGCXCHECK(flagcxProxyKernelInit(comm));
-    }
-  }
-
   FLAGCXCHECK(flagcxNetInit(comm));
   INFO(FLAGCX_INIT, "Using network %s", comm->netAdaptor->name);
   if (env && (strcmp(env, "TRUE") == 0 || strcmp(env, "True") == 0)) {
@@ -336,7 +322,6 @@ flagcxResult_t flagcxHeteroCommUserRank(const flagcxHeteroComm_t comm,
 
 flagcxResult_t flagcxHeteroCommDestroy(flagcxHeteroComm_t comm) {
   flagcxProxyDestroy(comm);
-  flagcxProxyKernelDestroy(comm);
   for (int i = 0; i < MAXCHANNELS; i++) {
     for (int r = 0; r < comm->nRanks; r++) {
       free(comm->channels[i].peers[r]);
@@ -350,7 +335,6 @@ flagcxResult_t flagcxHeteroCommDestroy(flagcxHeteroComm_t comm) {
   free(comm->connectSend);
   free(comm->connectRecv);
   free(comm->proxyState);
-  free(comm->proxyKernelState);
   free(comm->tasks.peers);
   free(comm->tasks.p2pOrder);
   free(comm->abortFlagRefCount);
