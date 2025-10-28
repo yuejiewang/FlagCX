@@ -1,8 +1,12 @@
 #ifndef FLAGCX_KERNEL_H_
 #define FLAGCX_KERNEL_H_
+
+#include "adaptor.h"
+#include "cuda.h"
+#include "cuda_runtime.h"
 #include "flagcx.h"
-#include <cuda.h>
-#include <cuda_runtime.h>
+
+#define FLAGCX_KERNEL_FIFO_CAPACITY 16
 
 typedef enum {
   flagcxDevicePrimSend = 0,
@@ -84,19 +88,24 @@ public:
              int32_t *terminate_, uint64_t *buffer_)
       : capacity(capacity_), produced(produced_), consumed(consumed_),
         terminate(terminate_), buffer(buffer_) {
-    flagcxCalloc(&buffer, capacity);
-    flagcxCalloc(&produced, 1);
-    flagcxCalloc(&consumed, 1);
-    flagcxCalloc(&terminate, 1);
+    // TODO: use a better way to initialize FIFO
+    deviceAdaptor->deviceMalloc((void **)&buffer, capacity * sizeof(uint64_t),
+                                flagcxMemHost, NULL);
+    deviceAdaptor->deviceMalloc((void **)&produced, sizeof(int32_t),
+                                flagcxMemHost, NULL);
+    deviceAdaptor->deviceMalloc((void **)&consumed, sizeof(int32_t),
+                                flagcxMemHost, NULL);
+    deviceAdaptor->deviceMalloc((void **)&terminate, sizeof(int32_t),
+                                flagcxMemHost, NULL);
     produced[0] = -1;
     consumed[0] = -1;
     terminate[0] = -1;
   }
   ~flagcxFifo() {
-    free(produced);
-    free(consumed);
-    free(terminate);
-    free(buffer);
+    deviceAdaptor->deviceFree((void *)terminate, flagcxMemHost, NULL);
+    deviceAdaptor->deviceFree((void *)consumed, flagcxMemHost, NULL);
+    deviceAdaptor->deviceFree((void *)produced, flagcxMemHost, NULL);
+    deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL);
   }
   // device-producer + host-consumer APIs
   __device__ flagcxResult_t enqueue(flagcxDeviceTrigger trigger);

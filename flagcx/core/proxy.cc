@@ -788,6 +788,14 @@ flagcxResult_t flagcxProxyInit(struct flagcxHeteroComm *comm) {
                                comm->magic, flagcxSocketTypeProxy));
   FLAGCXCHECK(flagcxSocketConnect(proxySock));
 
+  // Check if kernel proxy is enabled
+  const char *kernelProxyEnv = flagcxGetEnv("FLAGCX_KERNEL_PROXY");
+  if (kernelProxyEnv) {
+    comm->proxyState->enableProxyKernel = (std::stoi(kernelProxyEnv) == 1);
+  }
+  INFO(FLAGCX_INIT, "Flagcx KERNEL_PROXY flag set to %d",
+       (int)comm->proxyState->enableProxyKernel);
+
   char proxyMsg[10];
   memcpy(proxyMsg, (string("Proxy: ") + to_string(comm->rank)).c_str(), 10);
   flagcxSocketSend(proxySock, proxyMsg, 10);
@@ -796,6 +804,11 @@ flagcxResult_t flagcxProxyInit(struct flagcxHeteroComm *comm) {
                  (void *)comm);
   pthread_create(&comm->proxyState->progressState.thread, NULL,
                  flagcxProxyProgress, comm->proxyState);
+  if (comm->proxyState->enableProxyKernel) {
+    pthread_create(&comm->proxyState->kernelState.thread, NULL,
+                   flagcxProxyKernelService, (void *)comm);
+  }
+
   comm->proxyState->initialized = 1;
   return flagcxSuccess;
 }
@@ -919,6 +932,90 @@ out:
 
   INFO(FLAGCX_PROXY,
        "[Service thread] Wait for progress thread joined and free resources");
+  return NULL;
+}
+
+void *flagcxProxyKernelService(void *args) {
+  INFO(FLAGCX_P2P, "Enter into kernel proxy service thread");
+  int groupCount = 0;
+  flagcxDeviceTrigger_t ptr = NULL;
+  flagcxFifo_t fifo = NULL;
+  struct flagcxHeteroComm *comm = (struct flagcxHeteroComm *)args;
+  flagcxResult_t res = flagcxSuccess;
+
+  // Set device context
+  FLAGCXCHECKGOTO(deviceAdaptor->setDevice(comm->cudaDev), res, out);
+  INFO(FLAGCX_P2P, "Kernel proxy service thread BP1");
+
+  // Create FIFO
+  comm->proxyState->kernelState.fifo = new flagcxFifo(
+      FLAGCX_KERNEL_FIFO_CAPACITY, nullptr, nullptr, nullptr, nullptr);
+  fifo = comm->proxyState->kernelState.fifo;
+  INFO(FLAGCX_P2P, "Kernel proxy service thread BP2");
+
+  // Create a dedicated stream
+  flagcxStream_t stream;
+  res = deviceAdaptor->streamCreate(&stream);
+  INFO(FLAGCX_P2P, "Kernel proxy service thread BP3");
+
+  // Allocate trigger structure
+  res = flagcxCalloc(&ptr, sizeof(flagcxDeviceTrigger));
+  INFO(FLAGCX_P2P, "Kernel proxy service thread BP4");
+
+  // while (true) {
+  //   if (groupCount == 0) {
+  //     res = flagcxHeteroGroupStart();
+  //     INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-1");
+  //     TRACE(FLAGCX_P2P,
+  //           "rank=%d flagcxHeteroGroupStart called by proxyKernelService.",
+  //           comm->rank);
+  //     groupCount++;
+  //   }
+  //   fifo->dequeue(ptr);
+  //   flagcxDeviceTrigger trigger = *ptr;
+  //   switch (trigger.fields.type) {
+  //     case flagcxDevicePrimSend:
+  //       TRACE(FLAGCX_P2P,
+  //             "rank=%d flagcxDevicePrimSend called by proxyKernelService.",
+  //             comm->rank);
+  //       INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-2");
+  //       res = flagcxHeteroSend((const void
+  //       *)(uintptr_t)(trigger.fields.addr),
+  //                        trigger.fields.count,
+  //                        (flagcxDataType_t)(trigger.fields.datatype),
+  //                        trigger.fields.peerRank, comm, stream);
+  //       break;
+  //     case flagcxDevicePrimRecv:
+  //       INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-3");
+  //       TRACE(FLAGCX_P2P,
+  //             "rank=%d flagcxDevicePrimRecv called by proxyKernelService.",
+  //             comm->rank);
+  //       res = flagcxHeteroRecv((void *)(uintptr_t)(trigger.fields.addr),
+  //                        trigger.fields.count,
+  //                        (flagcxDataType_t)(trigger.fields.datatype),
+  //                        trigger.fields.peerRank, comm, stream);
+  //       break;
+  //     case flagcxDevicePrimTerm:
+  //       TRACE(FLAGCX_P2P,
+  //             "rank=%d flagcxHeteroGroupEnd called by proxyKernelService.",
+  //             comm->rank);
+  //       INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-4");
+  //       res = flagcxHeteroGroupEnd();
+  //       groupCount--;
+  //       break;
+  //     default:
+  //       break;
+  //   }
+  // }
+  INFO(FLAGCX_P2P, "Kernel proxy service thread BP5");
+  // deallocate trigger structure
+  free(ptr);
+  // destroy stream
+  res = deviceAdaptor->streamDestroy(stream);
+  // destroy fifo
+  delete comm->proxyState->kernelState.fifo;
+out:
+  pthread_join(comm->proxyState->kernelState.thread, nullptr);
   return NULL;
 }
 
