@@ -4,7 +4,13 @@
 #include "adaptor.h"
 #include "cuda.h"
 #include "cuda_runtime.h"
+
+#include "adaptor.h"
+#include "cuda.h"
+#include "cuda_runtime.h"
 #include "flagcx.h"
+
+#define FLAGCX_KERNEL_FIFO_CAPACITY 16
 
 #define FLAGCX_KERNEL_FIFO_CAPACITY 16
 
@@ -20,6 +26,7 @@ constexpr unsigned int flagcxDeviceTriggerBitsCount = 32;
 constexpr unsigned int flagcxDeviceTriggerBitsPeerRank = 20;
 constexpr unsigned int flagcxDeviceTriggerBitsDatatype = 4;
 constexpr unsigned int flagcxDeviceTriggerBitsPrim = 4;
+constexpr unsigned int flagcxDeviceTriggerBitsReady = 1;
 constexpr unsigned int flagcxDeviceTriggerBitsFifoReserved = 1;
 
 constexpr unsigned int flagcxReduceTriggerBitsAddr = 64;
@@ -47,8 +54,10 @@ typedef union alignas(16) {
     uint64_t
         : (64 - flagcxDeviceTriggerBitsCount - flagcxDeviceTriggerBitsPeerRank -
            flagcxDeviceTriggerBitsDatatype - flagcxDeviceTriggerBitsPrim -
+           flagcxDeviceTriggerBitsReady -
            flagcxDeviceTriggerBitsFifoReserved); // ensure 64-bit alignment
     uint64_t reserved : flagcxDeviceTriggerBitsFifoReserved;
+    uint64_t ready : flagcxDeviceTriggerBitsReady;
   } fields;
 } flagcxDeviceTrigger;
 typedef flagcxDeviceTrigger *flagcxDeviceTrigger_t;
@@ -84,29 +93,8 @@ struct flagcxFifo {
   uint64_t *buffer;
 
 public:
-  flagcxFifo(int32_t capacity_, int32_t *produced_, int32_t *consumed_,
-             int32_t *terminate_, uint64_t *buffer_)
-      : capacity(capacity_), produced(produced_), consumed(consumed_),
-        terminate(terminate_), buffer(buffer_) {
-    // TODO: use a better way to initialize FIFO
-    deviceAdaptor->deviceMalloc((void **)&buffer, capacity * sizeof(uint64_t),
-                                flagcxMemHost, NULL);
-    deviceAdaptor->deviceMalloc((void **)&produced, sizeof(int32_t),
-                                flagcxMemHost, NULL);
-    deviceAdaptor->deviceMalloc((void **)&consumed, sizeof(int32_t),
-                                flagcxMemHost, NULL);
-    deviceAdaptor->deviceMalloc((void **)&terminate, sizeof(int32_t),
-                                flagcxMemHost, NULL);
-    produced[0] = -1;
-    consumed[0] = -1;
-    terminate[0] = -1;
-  }
-  ~flagcxFifo() {
-    deviceAdaptor->deviceFree((void *)terminate, flagcxMemHost, NULL);
-    deviceAdaptor->deviceFree((void *)consumed, flagcxMemHost, NULL);
-    deviceAdaptor->deviceFree((void *)produced, flagcxMemHost, NULL);
-    deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL);
-  }
+  __host__ flagcxResult_t initFifo(int32_t capacity_);
+  __host__ flagcxResult_t freeFifo();
   // device-producer + host-consumer APIs
   __device__ flagcxResult_t enqueue(flagcxDeviceTrigger trigger);
   __host__ flagcxResult_t dequeue(flagcxDeviceTrigger_t trigger);
@@ -120,12 +108,12 @@ __device__ size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype);
 
 __device__ flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
-                                           struct flagcxHeteroComm *comm);
+                                           flagcxFifo_t fifo);
 __device__ flagcxResult_t flagcxDeviceRecv(void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
-                                           struct flagcxHeteroComm *comm);
-__device__ flagcxResult_t flagcxDeviceWait(struct flagcxHeteroComm *comm);
-__device__ flagcxResult_t flagcxDeviceTerm(struct flagcxHeteroComm *comm);
+                                           flagcxFifo_t fifo);
+__device__ flagcxResult_t flagcxDeviceWait(flagcxFifo_t fifo);
+__device__ flagcxResult_t flagcxDeviceTerm(flagcxFifo_t fifo);
 __global__ void flagcxCollectiveKernel(flagcxFifo_t q); // TBD
 void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
                    flagcxDataType_t datatype, int sendPeer, int recvPeer,

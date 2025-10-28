@@ -9,7 +9,9 @@
 
 #include "device.h"
 #include "flagcx_kernel.h"
+#include "flagcx_kernel.h"
 #include "flagcx_net.h"
+#include "group.h"
 #include "group.h"
 #include "info.h"
 #include "ipcsocket.h"
@@ -29,7 +31,6 @@ enum flagcxProxyOpState {
 struct flagcxProxyKernelState {
   pthread_t thread;
   flagcxFifo_t fifo;
-  flagcxStream_t stream;
 };
 
 struct flagcxProxyArgs;
@@ -395,6 +396,8 @@ flagcxResult_t flagcxProxyConnect(struct flagcxHeteroComm *comm, int transport,
                                   struct flagcxProxyConnector *proxyConn);
 
 void *flagcxProxyKernelService(void *args);
+flagcxResult_t flagcxProxyKernelInit(struct flagcxHeteroComm *comm);
+flagcxResult_t flagcxProxyKernelDestroy(struct flagcxHeteroComm *comm);
 
 // Only flagcxProxyMsgConnect & flagcxProxyMsgStop types are used for now.
 enum flagcxProxyMsgType {

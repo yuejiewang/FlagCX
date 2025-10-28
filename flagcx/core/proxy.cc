@@ -804,6 +804,7 @@ flagcxResult_t flagcxProxyInit(struct flagcxHeteroComm *comm) {
                  (void *)comm);
   pthread_create(&comm->proxyState->progressState.thread, NULL,
                  flagcxProxyProgress, comm->proxyState);
+
   if (comm->proxyState->enableProxyKernel) {
     pthread_create(&comm->proxyState->kernelState.thread, NULL,
                    flagcxProxyKernelService, (void *)comm);
@@ -936,86 +937,84 @@ out:
 }
 
 void *flagcxProxyKernelService(void *args) {
-  INFO(FLAGCX_P2P, "Enter into kernel proxy service thread");
+  flagcxResult_t res = flagcxSuccess;
   int groupCount = 0;
   flagcxDeviceTrigger_t ptr = NULL;
+  struct flagcxHeteroComm *comm = (flagcxHeteroComm *)args;
   flagcxFifo_t fifo = NULL;
-  struct flagcxHeteroComm *comm = (struct flagcxHeteroComm *)args;
-  flagcxResult_t res = flagcxSuccess;
+  TRACE(FLAGCX_P2P, "rank %d proxyKernelService start...", comm->rank);
+
+  // Create FIFO
+  res = flagcxProxyKernelInit(comm);
+  fifo = comm->proxyKernelState->fifo;
 
   // Set device context
   FLAGCXCHECKGOTO(deviceAdaptor->setDevice(comm->cudaDev), res, out);
-  INFO(FLAGCX_P2P, "Kernel proxy service thread BP1");
-
-  // Create FIFO
-  comm->proxyState->kernelState.fifo = new flagcxFifo(
-      FLAGCX_KERNEL_FIFO_CAPACITY, nullptr, nullptr, nullptr, nullptr);
-  fifo = comm->proxyState->kernelState.fifo;
-  INFO(FLAGCX_P2P, "Kernel proxy service thread BP2");
 
   // Create a dedicated stream
   flagcxStream_t stream;
-  res = deviceAdaptor->streamCreate(&stream);
-  INFO(FLAGCX_P2P, "Kernel proxy service thread BP3");
+  deviceAdaptor->streamCreate(&stream);
 
-  // Allocate trigger structure
   res = flagcxCalloc(&ptr, sizeof(flagcxDeviceTrigger));
-  INFO(FLAGCX_P2P, "Kernel proxy service thread BP4");
-
-  // while (true) {
-  //   if (groupCount == 0) {
-  //     res = flagcxHeteroGroupStart();
-  //     INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-1");
-  //     TRACE(FLAGCX_P2P,
-  //           "rank=%d flagcxHeteroGroupStart called by proxyKernelService.",
-  //           comm->rank);
-  //     groupCount++;
-  //   }
-  //   fifo->dequeue(ptr);
-  //   flagcxDeviceTrigger trigger = *ptr;
-  //   switch (trigger.fields.type) {
-  //     case flagcxDevicePrimSend:
-  //       TRACE(FLAGCX_P2P,
-  //             "rank=%d flagcxDevicePrimSend called by proxyKernelService.",
-  //             comm->rank);
-  //       INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-2");
-  //       res = flagcxHeteroSend((const void
-  //       *)(uintptr_t)(trigger.fields.addr),
-  //                        trigger.fields.count,
-  //                        (flagcxDataType_t)(trigger.fields.datatype),
-  //                        trigger.fields.peerRank, comm, stream);
-  //       break;
-  //     case flagcxDevicePrimRecv:
-  //       INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-3");
-  //       TRACE(FLAGCX_P2P,
-  //             "rank=%d flagcxDevicePrimRecv called by proxyKernelService.",
-  //             comm->rank);
-  //       res = flagcxHeteroRecv((void *)(uintptr_t)(trigger.fields.addr),
-  //                        trigger.fields.count,
-  //                        (flagcxDataType_t)(trigger.fields.datatype),
-  //                        trigger.fields.peerRank, comm, stream);
-  //       break;
-  //     case flagcxDevicePrimTerm:
-  //       TRACE(FLAGCX_P2P,
-  //             "rank=%d flagcxHeteroGroupEnd called by proxyKernelService.",
-  //             comm->rank);
-  //       INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-4");
-  //       res = flagcxHeteroGroupEnd();
-  //       groupCount--;
-  //       break;
-  //     default:
-  //       break;
-  //   }
-  // }
-  INFO(FLAGCX_P2P, "Kernel proxy service thread BP5");
-  // deallocate trigger structure
+  while (true) {
+    TRACE(FLAGCX_P2P, "rank %d proxyKernelService loop", comm->rank);
+    fifo->dequeue(ptr);
+    flagcxDeviceTrigger trigger = *ptr;
+    switch (trigger.fields.type) {
+      case flagcxDevicePrimSend:
+        TRACE(FLAGCX_P2P,
+              "rank=%d flagcxDevicePrimSend called by proxyKernelService.",
+              comm->rank);
+        if (groupCount == 0) {
+          flagcxHeteroGroupStart();
+          TRACE(FLAGCX_P2P,
+                "rank=%d flagcxHeteroGroupStart called by proxyKernelService.",
+                comm->rank);
+          groupCount++;
+        }
+        flagcxHeteroSend((const void *)(uintptr_t)(trigger.fields.addr),
+                         trigger.fields.count,
+                         (flagcxDataType_t)(trigger.fields.datatype),
+                         trigger.fields.peerRank, comm, stream);
+        break;
+      case flagcxDevicePrimRecv:
+        TRACE(FLAGCX_P2P,
+              "rank=%d flagcxDevicePrimRecv called by proxyKernelService.",
+              comm->rank);
+        if (groupCount == 0) {
+          flagcxHeteroGroupStart();
+          TRACE(FLAGCX_P2P,
+                "rank=%d flagcxHeteroGroupStart called by proxyKernelService.",
+                comm->rank);
+          groupCount++;
+        }
+        flagcxHeteroRecv((void *)(uintptr_t)(trigger.fields.addr),
+                         trigger.fields.count,
+                         (flagcxDataType_t)(trigger.fields.datatype),
+                         trigger.fields.peerRank, comm, stream);
+        break;
+      case flagcxDevicePrimTerm:
+        TRACE(FLAGCX_P2P,
+              "rank=%d flagcxHeteroGroupEnd called by proxyKernelService.",
+              comm->rank);
+        if (groupCount > 0) {
+          flagcxHeteroGroupEnd();
+          groupCount--;
+          TRACE(FLAGCX_P2P,
+                "rank=%d flagcxHeteroGroupStart called by proxyKernelService.",
+                comm->rank);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  // dealloc trigger
   free(ptr);
   // destroy stream
   res = deviceAdaptor->streamDestroy(stream);
-  // destroy fifo
-  delete comm->proxyState->kernelState.fifo;
 out:
-  pthread_join(comm->proxyState->kernelState.thread, nullptr);
+  res = flagcxProxyKernelDestroy(comm);
   return NULL;
 }
 
@@ -1048,5 +1047,27 @@ flagcxResult_t flagcxProxyDestroy(struct flagcxHeteroComm *comm) {
     pthread_join(comm->proxyState->thread, nullptr);
     flagcxProxyFree(comm);
   }
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxProxyKernelInit(struct flagcxHeteroComm *comm) {
+  INFO(FLAGCX_INIT, "rank=%d flagcxProxyKernelInit called.", comm->rank);
+  void *tmp_fifo;
+  deviceAdaptor->deviceMalloc(&tmp_fifo, sizeof(flagcxFifo), flagcxMemHost,
+                              NULL);
+  comm->proxyKernelState->fifo = (flagcxFifo *)tmp_fifo;
+  comm->proxyKernelState->fifo->initFifo(8);
+  pthread_create(&comm->proxyKernelState->thread, NULL,
+                 flagcxProxyKernelService, (void *)comm);
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxProxyKernelDestroy(struct flagcxHeteroComm *comm) {
+  INFO(FLAGCX_INIT, "rank=%d flagcxProxyKernelDestroy called.", comm->rank);
+  pthread_join(comm->proxyKernelState->thread, nullptr);
+  TRACE(FLAGCX_P2P, "rank=%d flagcxProxyKernel joined.", comm->rank);
+  comm->proxyKernelState->fifo->freeFifo();
+  TRACE(FLAGCX_P2P, "rank=%d flagcxProxyKernel fifo freed.", comm->rank);
+  free(comm->proxyKernelState->fifo);
   return flagcxSuccess;
 }
