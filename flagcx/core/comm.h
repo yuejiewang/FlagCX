@@ -335,8 +335,6 @@ struct flagcxHeteroComm {
   int finalizeRankCnt;
   // group job to support multi-thread FT
   struct flagcxGroupJob *groupJob;
-  // kernel p2p state
-  struct flagcxProxyKernelState *proxyKernelState;
 
   // Tuning plugin
   flagcxTuner_t *tuner;
