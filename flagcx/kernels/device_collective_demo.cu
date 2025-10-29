@@ -4,25 +4,32 @@
 #include "nvidia_adaptor.h"
 __global__ void flagcxP2pKernel(const void *sendbuff, void *recvbuff,
                               size_t count, flagcxDataType_t datatype,
-                              int sendPeer, int recvPeer, flagcxComm_t comm) {
+                              int sendPeer, int recvPeer, void *fifoBuffer) {
   int tid = threadIdx.x;
+  printf("FlagCX P2P Demo Kernel launched with tid %d\n", tid);
   if (tid == 0) {
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 1; i++) {
       const void *sendaddr = static_cast<const void *>(
-          static_cast<char *>(const_cast<void *>(sendbuff)) +
-          count / 16 * i * getFlagcxDataTypeSizeDevice(datatype));
-      flagcxDeviceSend(sendaddr, count / 16, datatype, sendPeer,
-                       comm->hetero_comm);
+          static_cast<char *>(const_cast<void *>(sendbuff)));
+          // static_cast<char *>(const_cast<void *>(sendbuff)) +
+          // count / 2 * i * getFlagcxDataTypeSizeDevice(datatype));
+      flagcxDeviceSend(sendaddr, count, datatype, sendPeer,
+                       fifoBuffer);
     }
-    for (int i = 0; i < 16; i++) {
+    printf("FlagCX P2P Demo Kernel flagcxDeviceSend with peer %d\n", sendPeer);
+    for (int i = 0; i < 1; i++) {
       void *recvaddr = static_cast<void *>(
-          static_cast<char *>(recvbuff) +
-          count / 16 * i * getFlagcxDataTypeSizeDevice(datatype));
-      flagcxDeviceRecv(recvaddr, count / 16, datatype, recvPeer,
-                       comm->hetero_comm);
+          static_cast<char *>(recvbuff)); 
+          // static_cast<char *>(recvbuff) +
+          // count / 2 * i * getFlagcxDataTypeSizeDevice(datatype));
+      flagcxDeviceRecv(recvaddr, count, datatype, recvPeer,
+                       fifoBuffer);
     }
-    flagcxDeviceTerm(comm->hetero_comm);
-    flagcxDeviceWait(comm->hetero_comm);
+    printf("FlagCX P2P Demo Kernel flagcxDeviceRecv with peer %d\n", recvPeer);
+    flagcxDeviceTerm(fifoBuffer);
+    printf("FlagCX P2P Demo Kernel flagcxDeviceTerm\n");
+    flagcxDeviceWait(fifoBuffer);
+    printf("FlagCX P2P Demo Kernel flagcxDeviceWait\n");
   }
 }
 
@@ -31,5 +38,5 @@ void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
                               int recvPeer, flagcxComm_t comm,
                               flagcxStream_t stream) {
   flagcxP2pKernel<<<1, 1, 0, stream->base>>>(
-      sendbuff, recvbuff, count, datatype, sendPeer, recvPeer, comm);
+      sendbuff, recvbuff, count, datatype, sendPeer, recvPeer, comm->hetero_comm->fifoBuffer);
 }
