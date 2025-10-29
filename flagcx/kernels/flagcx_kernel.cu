@@ -67,15 +67,15 @@ __device__ flagcxResult_t flagcxDeviceTerm(void *fifoBuffer) {
 __device__ flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
   enqueue(fifoBuffer, 0, 0, 0, 0, flagcxDevicePrimWait);
   unsigned long long int *buffer = (unsigned long long int *)fifoBuffer;
-  int curr_c = buffer[1];
-  int curr_p = buffer[2];
+  int capacity = buffer[0];
+  int distance = (buffer[2] - buffer[1] + capacity) % capacity;
   int iter = 0;
-  while (curr_p > curr_c) {
+  while (distance > 0) {
     spin_backoff(iter);
     iter++;
     __threadfence_system();
-    curr_c = buffer[1];
-    // printf("flagcxDeviceWait spinning... curr_c=%d, curr_p=%d, iter=%d\n", curr_c, curr_p, iter);
+    distance = (buffer[2] - buffer[1] + capacity) % capacity;
+    // printf("flagcxDeviceWait spinning... curr_c=%d, curr_p=%d, iter=%d\n", buffer[1], buffer[2], iter);
   }
   printf("Exit wait\n");
   return flagcxSuccess;
@@ -126,6 +126,7 @@ __host__ flagcxResult_t dequeue(void *fifoBuffer, flagcxDeviceTrigger_t trigger)
   } else {
     memset((void *)trigger, 0, sizeof(flagcxDeviceTrigger));
   }
+  // printf("Dequeue capacity=%d, consumed=%d, produced=%d\n", capacity, (int)buffer[1], (int)buffer[2]);
   return flagcxSuccess;
 }
 
