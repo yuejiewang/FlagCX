@@ -12,7 +12,7 @@ __global__ void flagcxP2pKernel(const void *sendbuff, void *recvbuff,
       const void *sendaddr = static_cast<const void *>(
           static_cast<char *>(const_cast<void *>(sendbuff)));
           // static_cast<char *>(const_cast<void *>(sendbuff)) +
-          // count / 16 * i * getFlagcxDataTypeSizeDevice(datatype));
+          // count / 2 * i * getFlagcxDataTypeSizeDevice(datatype));
       flagcxDeviceSend(sendaddr, count, datatype, sendPeer,
                        fifoBuffer);
     }
@@ -21,7 +21,7 @@ __global__ void flagcxP2pKernel(const void *sendbuff, void *recvbuff,
       void *recvaddr = static_cast<void *>(
           static_cast<char *>(recvbuff)); 
           // static_cast<char *>(recvbuff) +
-          // count / 16 * i * getFlagcxDataTypeSizeDevice(datatype));
+          // count / 2 * i * getFlagcxDataTypeSizeDevice(datatype));
       flagcxDeviceRecv(recvaddr, count, datatype, recvPeer,
                        fifoBuffer);
     }

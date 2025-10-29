@@ -67,15 +67,17 @@ __device__ flagcxResult_t flagcxDeviceTerm(void *fifoBuffer) {
 __device__ flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
   enqueue(fifoBuffer, 0, 0, 0, 0, flagcxDevicePrimWait);
   unsigned long long int *buffer = (unsigned long long int *)fifoBuffer;
-  int curr_c = __ldg(buffer + 1);
-  int curr_p = __ldg(buffer + 2);
+  int curr_c = buffer[1];
+  int curr_p = buffer[2];
   int iter = 0;
   while (curr_p > curr_c) {
-    curr_c = __ldg(buffer + 1);
     spin_backoff(iter);
     iter++;
-    printf("flagcxDeviceWait spinning... curr_c=%d, curr_p=%d, iter=%d\n", curr_c, curr_p, iter);
+    __threadfence_system();
+    curr_c = buffer[1];
+    // printf("flagcxDeviceWait spinning... curr_c=%d, curr_p=%d, iter=%d\n", curr_c, curr_p, iter);
   }
+  printf("Exit wait\n");
   return flagcxSuccess;
 }
 
@@ -105,7 +107,7 @@ __device__ flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, uint64_t coun
   *(buffer + 3 + 5 * idx + 3) = datatype;
   *(buffer + 3 + 5 * idx + 4) = type;
   __threadfence_system();
-  printf("Enqueue capacity=%d, consumed=%d, produced=%d\n", capacity, (int)buffer[1], (int)buffer[2]);
+  // printf("Enqueue capacity=%d, consumed=%d, produced=%d\n", capacity, (int)buffer[1], (int)buffer[2]);
   return flagcxSuccess;
 }
 
@@ -119,35 +121,13 @@ __host__ flagcxResult_t dequeue(void *fifoBuffer, flagcxDeviceTrigger_t trigger)
     // buffer[1] = (old_c + 1) % capacity;
     idx = old_c;
   }
-  trigger->addr     = (idx > -1) ? *(buffer + 3 + 5 * idx) : 0;
-  trigger->count    = (idx > -1) ? *(buffer + 3 + 5 * idx + 1) : 0;
-  trigger->peerRank = (idx > -1) ? *(buffer + 3 + 5 * idx + 2) : 0;
-  trigger->datatype = (idx > -1) ? *(buffer + 3 + 5 * idx + 3) : 0;
-  trigger->type     = (idx > -1) ? *(buffer + 3 + 5 * idx + 4) : 0;
-  // printf("Dequeue capacity=%d, consumed=%d, produced=%d, idx=%d\n", capacity, (int)buffer[1], (int)buffer[2], idx);
+  if (idx > -1) {
+    memcpy((void *)trigger, (void *)(buffer + 3 + 5 * idx), sizeof(flagcxDeviceTrigger));
+  } else {
+    memset((void *)trigger, 0, sizeof(flagcxDeviceTrigger));
+  }
   return flagcxSuccess;
 }
-
-// __host__ flagcxResult_t flagcxFifo::dequeue(flagcxDeviceTrigger_t trigger) {
-//   /*
-//   int idx = -1;
-//   while (true) {
-//     int old_c = consumed[0];
-//     int old_p = produced[0];
-//     if (old_c < old_p) {
-//       int prev = atomicCAS(consumed, old_c, old_c + 1);
-//       if (prev == old_c) {
-//         idx = old_c + 1;
-//         break;
-//       }
-//     }
-//   }
-//   */
-//   consumed[0]++;
-//   (*trigger).value.fst = *(buffer + 2 * consumed[0]);
-//   (*trigger).value.snd = *(buffer + 2 * consumed[0] + 1);
-//   return flagcxSuccess;
-// }
 
 // __host__ flagcxResult_t flagcxFifo::enqueue(flagcxReduceTrigger trigger) {
 //   // to be implemented

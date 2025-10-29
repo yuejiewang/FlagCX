@@ -86,21 +86,22 @@ typedef union alignas(16) {
 typedef flagcxReduceTrigger *flagcxReduceTrigger_t;
 
 struct flagcxFifo {
-  // [capacity, consumed, produced, terminate, trigger buffer]
+  // [capacity, consumed, produced, trigger buffer]
   uint64_t *buffer;
 
 public:
   flagcxFifo() {
     // TODO: use a better way to initialize FIFO
     deviceAdaptor->deviceMalloc((void **)&buffer,
-                                4 * sizeof(uint64_t) +
+                                3 * sizeof(uint64_t) +
                                     FLAGCX_KERNEL_FIFO_CAPACITY *
                                         sizeof(flagcxDeviceTrigger),
                                 flagcxMemHost, NULL);
     buffer[0] = FLAGCX_KERNEL_FIFO_CAPACITY;
     buffer[1] = 0;
     buffer[2] = 0;
-    buffer[3] = 0;
+    memset((void *)(buffer + 3), 0,
+           FLAGCX_KERNEL_FIFO_CAPACITY * sizeof(flagcxDeviceTrigger));
   }
   ~flagcxFifo() {
     deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL);
