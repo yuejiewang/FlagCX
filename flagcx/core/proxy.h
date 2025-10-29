@@ -30,6 +30,7 @@ struct flagcxProxyKernelState {
   pthread_t thread;
   flagcxFifo_t fifo;
   flagcxStream_t stream;
+  int stop = 0;
 };
 
 struct flagcxProxyArgs;

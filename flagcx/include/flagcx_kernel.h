@@ -11,7 +11,8 @@
 typedef enum {
   flagcxDevicePrimSend = 0,
   flagcxDevicePrimRecv = 1,
-  flagcxDevicePrimTerm = 2
+  flagcxDevicePrimTerm = 2,
+  flagcxDevicePrimWait = 3
 } flagcxDevicePrim;
 
 constexpr unsigned int flagcxDeviceTriggerBitsAddr = 64;
@@ -29,27 +30,35 @@ constexpr unsigned int flagcxReduceTriggerBitsDatatype = 4;
 constexpr unsigned int flagcxReduceTriggerBitsRedop = 4;
 constexpr unsigned int flagcxReduceTriggerBitsFifoReserved = 1;
 
-typedef union alignas(16) {
-  struct {
-    uint64_t fst;
-    uint64_t snd;
-  } value;
-  // The summation of number of bits must be 128 or less.
-  struct {
-    // First 64 bits: value[0]
-    uint64_t addr : flagcxDeviceTriggerBitsAddr;
-    // uint64_t offset : flagcxDeviceTriggerBitsOffset;
-    // Second 64 bits: value[1]
-    uint64_t count : flagcxDeviceTriggerBitsCount;
-    uint64_t peerRank : flagcxDeviceTriggerBitsPeerRank;
-    uint64_t datatype : flagcxDeviceTriggerBitsDatatype;
-    uint64_t type : flagcxDeviceTriggerBitsPrim;
-    uint64_t
-        : (64 - flagcxDeviceTriggerBitsCount - flagcxDeviceTriggerBitsPeerRank -
-           flagcxDeviceTriggerBitsDatatype - flagcxDeviceTriggerBitsPrim -
-           flagcxDeviceTriggerBitsFifoReserved); // ensure 64-bit alignment
-    uint64_t reserved : flagcxDeviceTriggerBitsFifoReserved;
-  } fields;
+// typedef union alignas(16) {
+//   struct {
+//     uint64_t fst;
+//     uint64_t snd;
+//   } value;
+//   // The summation of number of bits must be 128 or less.
+//   struct {
+//     // First 64 bits: value[0]
+//     uint64_t addr : flagcxDeviceTriggerBitsAddr;
+//     // uint64_t offset : flagcxDeviceTriggerBitsOffset;
+//     // Second 64 bits: value[1]
+//     uint64_t count : flagcxDeviceTriggerBitsCount;
+//     uint64_t peerRank : flagcxDeviceTriggerBitsPeerRank;
+//     uint64_t datatype : flagcxDeviceTriggerBitsDatatype;
+//     uint64_t type : flagcxDeviceTriggerBitsPrim;
+//     uint64_t
+//         : (64 - flagcxDeviceTriggerBitsCount -
+//         flagcxDeviceTriggerBitsPeerRank -
+//            flagcxDeviceTriggerBitsDatatype - flagcxDeviceTriggerBitsPrim -
+//            flagcxDeviceTriggerBitsFifoReserved); // ensure 64-bit alignment
+//     uint64_t reserved : flagcxDeviceTriggerBitsFifoReserved;
+//   } fields;
+// } flagcxDeviceTrigger;
+typedef struct {
+  uint64_t addr;
+  uint64_t count;
+  uint64_t peerRank;
+  uint64_t datatype;
+  uint64_t type;
 } flagcxDeviceTrigger;
 typedef flagcxDeviceTrigger *flagcxDeviceTrigger_t;
 
@@ -77,55 +86,48 @@ typedef union alignas(16) {
 typedef flagcxReduceTrigger *flagcxReduceTrigger_t;
 
 struct flagcxFifo {
-  int32_t capacity;
-  int32_t *produced;
-  int32_t *consumed;
-  int32_t *terminate;
+  // [capacity, consumed, produced, terminate, trigger buffer]
   uint64_t *buffer;
 
 public:
-  flagcxFifo(int32_t capacity_, int32_t *produced_, int32_t *consumed_,
-             int32_t *terminate_, uint64_t *buffer_)
-      : capacity(capacity_), produced(produced_), consumed(consumed_),
-        terminate(terminate_), buffer(buffer_) {
+  flagcxFifo() {
     // TODO: use a better way to initialize FIFO
-    deviceAdaptor->deviceMalloc((void **)&buffer, capacity * sizeof(uint64_t),
+    deviceAdaptor->deviceMalloc((void **)&buffer,
+                                4 * sizeof(uint64_t) +
+                                    FLAGCX_KERNEL_FIFO_CAPACITY *
+                                        sizeof(flagcxDeviceTrigger),
                                 flagcxMemHost, NULL);
-    deviceAdaptor->deviceMalloc((void **)&produced, sizeof(int32_t),
-                                flagcxMemHost, NULL);
-    deviceAdaptor->deviceMalloc((void **)&consumed, sizeof(int32_t),
-                                flagcxMemHost, NULL);
-    deviceAdaptor->deviceMalloc((void **)&terminate, sizeof(int32_t),
-                                flagcxMemHost, NULL);
-    produced[0] = -1;
-    consumed[0] = -1;
-    terminate[0] = -1;
+    buffer[0] = FLAGCX_KERNEL_FIFO_CAPACITY;
+    buffer[1] = 0;
+    buffer[2] = 0;
+    buffer[3] = 0;
   }
   ~flagcxFifo() {
-    deviceAdaptor->deviceFree((void *)terminate, flagcxMemHost, NULL);
-    deviceAdaptor->deviceFree((void *)consumed, flagcxMemHost, NULL);
-    deviceAdaptor->deviceFree((void *)produced, flagcxMemHost, NULL);
     deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL);
   }
-  // device-producer + host-consumer APIs
-  __device__ flagcxResult_t enqueue(flagcxDeviceTrigger trigger);
-  __host__ flagcxResult_t dequeue(flagcxDeviceTrigger_t trigger);
-  // host-producer + device-consumer APIs
-  __host__ flagcxResult_t enqueue(flagcxReduceTrigger trigger);
-  __device__ flagcxResult_t dequeue(flagcxReduceTrigger_t trigger);
 };
 typedef struct flagcxFifo *flagcxFifo_t;
+
+// device-producer + host-consumer APIs
+__device__ flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr,
+                                  uint64_t count, uint64_t peerRank,
+                                  uint64_t datatype, uint64_t type);
+__host__ flagcxResult_t dequeue(void *fifoBuffer,
+                                flagcxDeviceTrigger_t trigger);
+// host-producer + device-consumer APIs
+// __host__ flagcxResult_t enqueue(flagcxReduceTrigger trigger);
+// __device__ flagcxResult_t dequeue(flagcxReduceTrigger_t trigger);
 
 __device__ size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype);
 
 __device__ flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
-                                           struct flagcxHeteroComm *comm);
+                                           void *fifoBuffer);
 __device__ flagcxResult_t flagcxDeviceRecv(void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
-                                           struct flagcxHeteroComm *comm);
-__device__ flagcxResult_t flagcxDeviceWait(struct flagcxHeteroComm *comm);
-__device__ flagcxResult_t flagcxDeviceTerm(struct flagcxHeteroComm *comm);
+                                           void *fifoBuffer);
+__device__ flagcxResult_t flagcxDeviceTerm(void *fifoBuffer);
+__device__ flagcxResult_t flagcxDeviceWait(void *fifoBuffer);
 __global__ void flagcxCollectiveKernel(flagcxFifo_t q); // TBD
 void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
                    flagcxDataType_t datatype, int sendPeer, int recvPeer,
