@@ -2,7 +2,7 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 
-__device__ __forceinline__ void spin_backoff(int iter) {
+FLAGCX_DEVICE_INLINE_DECORATOR void spin_backoff(int iter) {
   int delay = 1 << (iter < 15 ? iter : 15);
 #if __CUDA_ARCH__ >= 700
   __nanosleep(delay);
@@ -13,7 +13,7 @@ __device__ __forceinline__ void spin_backoff(int iter) {
 #endif
 }
 
-__device__ size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype) {
+FLAGCX_DEVICE_DECORATOR size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype) {
   switch (dtype) {
     // case flagcxInt8:
     case flagcxChar:
@@ -45,26 +45,26 @@ __device__ size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype) {
   }
 }
 
-__device__ flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
+FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
                                            void *fifoBuffer) {
   enqueue(fifoBuffer, (uint64_t)((uintptr_t)sendbuff), count, peer, datatype, flagcxDevicePrimSend);
   return flagcxSuccess;
 }
 
-__device__ flagcxResult_t flagcxDeviceRecv(void *recvbuff, size_t count,
+FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceRecv(void *recvbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
                                            void *fifoBuffer) {
   enqueue(fifoBuffer, (uint64_t)((uintptr_t)recvbuff), count, peer, datatype, flagcxDevicePrimRecv);
   return flagcxSuccess;
 }
 
-__device__ flagcxResult_t flagcxDeviceTerm(void *fifoBuffer) {
+FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceTerm(void *fifoBuffer) {
   enqueue(fifoBuffer, 0, 0, 0, 0, flagcxDevicePrimTerm);
   return flagcxSuccess;
 }
 
-__device__ flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
+FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
   enqueue(fifoBuffer, 0, 0, 0, 0, flagcxDevicePrimWait);
   unsigned long long int *buffer = (unsigned long long int *)fifoBuffer;
   int capacity = buffer[0];
@@ -80,7 +80,7 @@ __device__ flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
   return flagcxSuccess;
 }
 
-__device__ flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, uint64_t count, uint64_t peerRank, uint64_t datatype, uint64_t type) {
+FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, uint64_t count, uint64_t peerRank, uint64_t datatype, uint64_t type) {
   int idx = -1;
   unsigned long long int *buffer = (unsigned long long int *)fifoBuffer;
   int capacity = buffer[0];
@@ -105,7 +105,7 @@ __device__ flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, uint64_t coun
   return flagcxSuccess;
 }
 
-__host__ flagcxResult_t dequeue(void *fifoBuffer, flagcxDeviceTrigger_t trigger) {
+FLAGCX_HOST_DECORATOR flagcxResult_t dequeue(void *fifoBuffer, flagcxDeviceTrigger_t trigger) {
   int idx = -1;
   unsigned long long int *buffer = (unsigned long long int *)fifoBuffer;
   int capacity = buffer[0];
