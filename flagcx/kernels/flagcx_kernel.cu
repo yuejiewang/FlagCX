@@ -74,7 +74,7 @@ __device__ flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
     curr_c = __ldg(buffer + 1);
     spin_backoff(iter);
     iter++;
-    // printf("flagcxDeviceWait spinning... curr_c=%d, curr_p=%d, iter=%d\n", curr_c, curr_p, iter);
+    printf("flagcxDeviceWait spinning... curr_c=%d, curr_p=%d, iter=%d\n", curr_c, curr_p, iter);
   }
   return flagcxSuccess;
 }
@@ -124,7 +124,7 @@ __host__ flagcxResult_t dequeue(void *fifoBuffer, flagcxDeviceTrigger_t trigger)
   trigger->peerRank = (idx > -1) ? *(buffer + 3 + 5 * idx + 2) : 0;
   trigger->datatype = (idx > -1) ? *(buffer + 3 + 5 * idx + 3) : 0;
   trigger->type     = (idx > -1) ? *(buffer + 3 + 5 * idx + 4) : 0;
-  printf("Dequeue capacity=%d, consumed=%d, produced=%d\n", capacity, (int)buffer[1], (int)buffer[2]);
+  // printf("Dequeue capacity=%d, consumed=%d, produced=%d, idx=%d\n", capacity, (int)buffer[1], (int)buffer[2], idx);
   return flagcxSuccess;
 }
 

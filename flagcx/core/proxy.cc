@@ -976,7 +976,9 @@ void *flagcxProxyKernelService(void *args) {
       groupCount++;
     }
     dequeue(fifo->buffer, ptr);
-    if (ptr->addr == 0) {
+    if ((ptr->type == flagcxDevicePrimSend ||
+         ptr->type == flagcxDevicePrimRecv) &&
+        ptr->addr == 0) {
       continue;
     }
     INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-2");
@@ -1005,9 +1007,9 @@ void *flagcxProxyKernelService(void *args) {
         TRACE(FLAGCX_P2P,
               "rank=%d flagcxHeteroGroupEnd called by proxyKernelService.",
               comm->rank);
-        INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-5");
         res = flagcxHeteroGroupEnd();
         fifo->buffer[1] = (fifo->buffer[1] + 1) % fifo->buffer[0];
+        INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-5");
         groupCount--;
         break;
       case flagcxDevicePrimWait:
