@@ -1,18 +1,9 @@
 #ifndef FLAGCX_KERNEL_H_
 #define FLAGCX_KERNEL_H_
 
-#include "adaptor.h"
-#include "cuda.h"
-#include "cuda_runtime.h"
-
-#include "adaptor.h"
 #include "cuda.h"
 #include "cuda_runtime.h"
 #include "flagcx.h"
-
-#define FLAGCX_KERNEL_FIFO_CAPACITY 16
-
-#define FLAGCX_KERNEL_FIFO_CAPACITY 16
 
 typedef enum {
   flagcxDevicePrimSend = 0,

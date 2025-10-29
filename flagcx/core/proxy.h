@@ -9,9 +9,7 @@
 
 #include "device.h"
 #include "flagcx_kernel.h"
-#include "flagcx_kernel.h"
 #include "flagcx_net.h"
-#include "group.h"
 #include "group.h"
 #include "info.h"
 #include "ipcsocket.h"
@@ -32,6 +30,8 @@ struct flagcxProxyKernelState {
   pthread_t thread;
   flagcxFifo_t fifo;
 };
+
+#define FLAGCX_KERNEL_FIFO_CAPACITY 16
 
 struct flagcxProxyArgs;
 typedef flagcxResult_t (*proxyProgressFunc_t)(struct flagcxProxyState *,
@@ -343,7 +343,7 @@ struct flagcxProxyState {
 
   // Kernel thread
   bool enableProxyKernel = false;
-  struct flagcxProxyKernelState kernelState;
+  struct flagcxProxyKernelState *proxyKernelState;
 
   // Queue of expected responses from the proxy
   struct flagcxExpectedProxyResponse *expectedResponses;

@@ -1,8 +1,8 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 #include "global_comm.h"
+#include "proxy.h"
 #include "nvidia_adaptor.h"
-#include "proxy_kernel.h"
 
 __global__ void flagcxP2pKernel(const void *sendbuff, void *recvbuff,
                                 size_t count, flagcxDataType_t datatype,
@@ -32,7 +32,7 @@ void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
   TRACE(FLAGCX_P2P, "rank %d launch P2P kernel", comm->rank);
   flagcxP2pKernel<<<1, 1, 0, stream->base>>>(
       sendbuff, recvbuff, count, datatype, sendPeer, recvPeer,
-      comm->hetero_comm->proxyKernelState->fifo);
+      comm->hetero_comm->proxyState->proxyKernelState->fifo);
   deviceAdaptor->streamSynchronize(stream);
   TRACE(FLAGCX_P2P, "rank %d P2P kernel terminate", comm->rank);
 }

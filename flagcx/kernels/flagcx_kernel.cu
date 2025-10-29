@@ -1,3 +1,4 @@
+#include "adaptor.h"
 #include "comm.h"
 #include "flagcx.h"
 #include "flagcx_kernel.h"
@@ -100,6 +101,7 @@ __device__ flagcxResult_t flagcxDeviceTerm(flagcxFifo_t fifo) {
 }
 
 __host__ flagcxResult_t flagcxFifo::initFifo(int32_t capacity_) {
+  TRACE(FLAGCX_P2P, "Initialize FIFO...");
   void *tmp_buff;
   deviceAdaptor->deviceMalloc(&tmp_buff, capacity * sizeof(flagcxDeviceTrigger),
                               flagcxMemHost, NULL);

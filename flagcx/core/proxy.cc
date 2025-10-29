@@ -806,8 +806,8 @@ flagcxResult_t flagcxProxyInit(struct flagcxHeteroComm *comm) {
                  flagcxProxyProgress, comm->proxyState);
 
   if (comm->proxyState->enableProxyKernel) {
-    pthread_create(&comm->proxyState->kernelState.thread, NULL,
-                   flagcxProxyKernelService, (void *)comm);
+    FLAGCXCHECK(flagcxCalloc(&comm->proxyState->proxyKernelState, 1));
+    FLAGCXCHECK(flagcxProxyKernelInit(comm));
   }
 
   comm->proxyState->initialized = 1;
@@ -945,8 +945,8 @@ void *flagcxProxyKernelService(void *args) {
   TRACE(FLAGCX_P2P, "rank %d proxyKernelService start...", comm->rank);
 
   // Create FIFO
-  res = flagcxProxyKernelInit(comm);
-  fifo = comm->proxyKernelState->fifo;
+  // res = flagcxProxyKernelInit(comm);
+  fifo = comm->proxyState->proxyKernelState->fifo;
 
   // Set device context
   FLAGCXCHECKGOTO(deviceAdaptor->setDevice(comm->cudaDev), res, out);
@@ -1055,19 +1055,20 @@ flagcxResult_t flagcxProxyKernelInit(struct flagcxHeteroComm *comm) {
   void *tmp_fifo;
   deviceAdaptor->deviceMalloc(&tmp_fifo, sizeof(flagcxFifo), flagcxMemHost,
                               NULL);
-  comm->proxyKernelState->fifo = (flagcxFifo *)tmp_fifo;
-  comm->proxyKernelState->fifo->initFifo(8);
-  pthread_create(&comm->proxyKernelState->thread, NULL,
+  comm->proxyState->proxyKernelState->fifo = (flagcxFifo *)tmp_fifo;
+  comm->proxyState->proxyKernelState->fifo->initFifo(
+      FLAGCX_KERNEL_FIFO_CAPACITY);
+  pthread_create(&comm->proxyState->proxyKernelState->thread, NULL,
                  flagcxProxyKernelService, (void *)comm);
   return flagcxSuccess;
 }
 
 flagcxResult_t flagcxProxyKernelDestroy(struct flagcxHeteroComm *comm) {
   INFO(FLAGCX_INIT, "rank=%d flagcxProxyKernelDestroy called.", comm->rank);
-  pthread_join(comm->proxyKernelState->thread, nullptr);
+  pthread_join(comm->proxyState->proxyKernelState->thread, nullptr);
   TRACE(FLAGCX_P2P, "rank=%d flagcxProxyKernel joined.", comm->rank);
-  comm->proxyKernelState->fifo->freeFifo();
+  comm->proxyState->proxyKernelState->fifo->freeFifo();
   TRACE(FLAGCX_P2P, "rank=%d flagcxProxyKernel fifo freed.", comm->rank);
-  free(comm->proxyKernelState->fifo);
+  free(comm->proxyState->proxyKernelState->fifo);
   return flagcxSuccess;
 }
