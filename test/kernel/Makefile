@@ -13,21 +13,19 @@ DEVICE_LIB =
 DEVICE_INCLUDE =
 DEVICE_LINK =
 DEVICE_COMPILER =
-DEVICE_COMPILE_FLAG =
 ifeq ($(USE_NVIDIA), 1)
 	DEVICE_HOME = /usr/local/cuda
 	DEVICE_LIB = $(DEVICE_HOME)/lib64
 	DEVICE_INCLUDE = $(DEVICE_HOME)/include
 	DEVICE_LINK = -lcudart -lcuda
 	DEVICE_COMPILER = $(DEVICE_HOME)/bin/nvcc
-	DEVICE_COMPILE_FLAG = -c --cudart=shared -Xcompiler -fPIC -MMD -MP -rdc=true -g
 endif
 
 all: test-kernel-demo
 
-test-kernel-demo: test_kernel_demo.cu
+test-kernel-demo: test_kernel_demo.cpp
 	@echo "Compiling $@"
-	@$(DEVICE_COMPILER) $(DEVICE_COMPILE_FLAG) -o test_kernel_demo test_kernel_demo.cu $(LIBSRCFILES) -I$(INCLUDEDIR) -I$(MPI_INCLUDE) -I$(DEVICE_INCLUDE) -L../../build/lib -L$(MPI_LIB) -L$(DEVICE_LIB) -lflagcx $(MPI_LINK) $(DEVICE_LINK)
+	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_kernel_demo test_kernel_demo.cpp $(LIBSRCFILES) -I../../flagcx/include -I../../flagcx/adaptor/include -I../../flagcx/service/ -I../../flagcx/core/ -I$(INCLUDEDIR) -I$(MPI_INCLUDE) -I$(DEVICE_INCLUDE) -L../../build/lib -L$(MPI_LIB) -L$(DEVICE_LIB) -lflagcx $(MPI_LINK) $(DEVICE_LINK)
 
 clean:
 	@rm -f test_kernel_demo

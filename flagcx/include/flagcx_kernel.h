@@ -2,7 +2,6 @@
 #define FLAGCX_KERNEL_H_
 
 #include "adaptor.h"
-#include "device_utils.h"
 #include "flagcx.h"
 
 #define FLAGCX_KERNEL_FIFO_CAPACITY 16
@@ -132,5 +131,7 @@ flagcxDeviceRecv(void *sendbuff, size_t count, flagcxDataType_t datatype,
 FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceTerm(void *fifoBuffer);
 FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceWait(void *fifoBuffer);
 // FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(flagcxFifo_t q); // TBD
-
+void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
+                   flagcxDataType_t datatype, int sendPeer, int recvPeer,
+                   flagcxComm_t comm, flagcxStream_t stream);
 #endif
