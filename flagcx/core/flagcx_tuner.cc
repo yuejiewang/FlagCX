@@ -9,7 +9,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
 // A category of collective operation. the minimal unit for tuning.
 struct TunerCollCategory {
   flagcxCommOp_t collType = flagcxNumCommOps;
@@ -310,8 +309,19 @@ static flagcxResult_t findBestComm(struct flagcxTunerContext *ctx,
          cat.nBytes);
     return flagcxInternalError;
   }
-  INFO(FLAGCX_TUNING, "Find (coll=%d,size=%zu) best CommId=%d.", cat.collType,
-       cat.nBytes, bestCommIdx);
+
+  const flagcxEnvConfig& bestConfig = ctx->configList[bestCommIdx];
+  std::stringstream msg;
+  msg << "Best Envs: ";
+  for (int i = 0; i < bestConfig.envCount; i++) {
+      msg << bestConfig.envs[i].name << "=" << bestConfig.envs[i].value
+          << "(default=" << bestConfig.envs[i].defaultValue << ")";
+      if (i < bestConfig.envCount - 1) msg << "  ";
+  }
+  // Output the best config
+  INFO(FLAGCX_TUNING, "Find (coll=%d,size=%zu) best CommId=%d. %s", cat.collType,
+       cat.nBytes, bestCommIdx, msg.str().c_str());
+  
   ctx->collBestCommMap[cat] = bestCommIdx;
   return flagcxSuccess;
 }
