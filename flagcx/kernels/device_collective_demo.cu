@@ -37,6 +37,8 @@ void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
                               flagcxDataType_t datatype, int sendPeer,
                               int recvPeer, flagcxComm_t comm,
                               flagcxStream_t stream) {
+  void *fifo = NULL;
+  flagcxCommFifoBuffer(comm, &fifo);
   flagcxP2pKernel<<<1, 1, 0, *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(
-      sendbuff, recvbuff, count, datatype, sendPeer, recvPeer, comm->hetero_comm->fifoBuffer);
+      sendbuff, recvbuff, count, datatype, sendPeer, recvPeer, fifo);
 }
