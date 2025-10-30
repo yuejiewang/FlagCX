@@ -7,6 +7,7 @@
 #define FLAGCX_GLOBAL_DECORATOR __global__
 #define FLAGCX_DEVICE_INLINE_DECORATOR __forceinline__ __device__
 #define FLAGCX_DEVICE_STREAM_PTR cudaStream_t *
+#define FLAGCX_DEVICE_THREAD_FENCE() __threadfence_system()
 #include <cuda.h>
 #include <cuda_runtime.h>
 #else

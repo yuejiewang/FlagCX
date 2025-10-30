@@ -73,7 +73,7 @@ FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
   while (distance > 0) {
     spin_backoff(iter);
     iter++;
-    __threadfence_system();
+    FLAGCX_DEVICE_THREAD_FENCE();
     distance = buffer[2] - buffer[1];
     // printf("flagcxDeviceWait spinning... curr_c=%d, curr_p=%d, iter=%d\n", buffer[1], buffer[2], iter);
   }
@@ -90,7 +90,7 @@ FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, 
   while (distance >= capacity) {
     spin_backoff(iter);
     iter++;
-    __threadfence_system();
+    FLAGCX_DEVICE_THREAD_FENCE();
     distance = buffer[2] - buffer[1];
   }
   idx = buffer[2] % capacity;
@@ -100,7 +100,7 @@ FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, 
   *(buffer + 3 + 5 * idx + 2) = peerRank;
   *(buffer + 3 + 5 * idx + 3) = datatype;
   *(buffer + 3 + 5 * idx + 4) = type;
-  __threadfence_system();
+  FLAGCX_DEVICE_THREAD_FENCE();
   // printf("Enqueue capacity=%d, consumed=%d, produced=%d\n", capacity, (int)buffer[1], (int)buffer[2]);
   return flagcxSuccess;
 }
