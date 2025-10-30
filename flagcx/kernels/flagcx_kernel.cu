@@ -2,7 +2,7 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 
-__device__ __forceinline__ void spin_backoff(int iter) {
+FLAGCX_DEVICE_INLINE_DECORATOR void spin_backoff(int iter) {
   int delay = 1 << (iter < 15 ? iter : 15);
 #if __CUDA_ARCH__ >= 700
   __nanosleep(delay);
@@ -13,7 +13,7 @@ __device__ __forceinline__ void spin_backoff(int iter) {
 #endif
 }
 
-__device__ size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype) {
+FLAGCX_DEVICE_DECORATOR size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype) {
   switch (dtype) {
     // case flagcxInt8:
     case flagcxChar:
@@ -45,62 +45,56 @@ __device__ size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype) {
   }
 }
 
-__device__ flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
+FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
                                            void *fifoBuffer) {
   enqueue(fifoBuffer, (uint64_t)((uintptr_t)sendbuff), count, peer, datatype, flagcxDevicePrimSend);
   return flagcxSuccess;
 }
 
-__device__ flagcxResult_t flagcxDeviceRecv(void *recvbuff, size_t count,
+FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceRecv(void *recvbuff, size_t count,
                                            flagcxDataType_t datatype, int peer,
                                            void *fifoBuffer) {
   enqueue(fifoBuffer, (uint64_t)((uintptr_t)recvbuff), count, peer, datatype, flagcxDevicePrimRecv);
   return flagcxSuccess;
 }
 
-__device__ flagcxResult_t flagcxDeviceTerm(void *fifoBuffer) {
+FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceTerm(void *fifoBuffer) {
   enqueue(fifoBuffer, 0, 0, 0, 0, flagcxDevicePrimTerm);
   return flagcxSuccess;
 }
 
-__device__ flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
+FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
   enqueue(fifoBuffer, 0, 0, 0, 0, flagcxDevicePrimWait);
   unsigned long long int *buffer = (unsigned long long int *)fifoBuffer;
   int capacity = buffer[0];
-  int distance = (buffer[2] - buffer[1] + capacity) % capacity;
+  int distance = buffer[2] - buffer[1];
   int iter = 0;
   while (distance > 0) {
     spin_backoff(iter);
     iter++;
     __threadfence_system();
-    distance = (buffer[2] - buffer[1] + capacity) % capacity;
+    distance = buffer[2] - buffer[1];
     // printf("flagcxDeviceWait spinning... curr_c=%d, curr_p=%d, iter=%d\n", buffer[1], buffer[2], iter);
   }
-  printf("Exit wait\n");
   return flagcxSuccess;
 }
 
-__device__ flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, uint64_t count, uint64_t peerRank, uint64_t datatype, uint64_t type) {
+FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, uint64_t count, uint64_t peerRank, uint64_t datatype, uint64_t type) {
   int idx = -1;
   unsigned long long int *buffer = (unsigned long long int *)fifoBuffer;
   int capacity = buffer[0];
-  int old_c = buffer[1];
-  int old_p = buffer[2];
+  int distance = buffer[2] - buffer[1];
+  int iter = 0;
   // printf("Enter Enqueue capacity=%d, consumed=%d, produced=%d\n", capacity, (int)buffer[1], (int)buffer[2]);
-  while (true) {
-    old_c = buffer[1];
-    old_p = buffer[2];
-    int n = old_p - old_c;
-    if (n < 0) n += capacity;
-    if (n < capacity) {
-      int prev = atomicCAS(buffer + 2, old_p, (old_p + 1) % capacity);
-      if (prev == old_p) {
-        idx = old_p;
-        break;
-      }
-    }
+  while (distance >= capacity) {
+    spin_backoff(iter);
+    iter++;
+    __threadfence_system();
+    distance = buffer[2] - buffer[1];
   }
+  idx = buffer[2] % capacity;
+  buffer[2] = buffer[2] + 1;
   *(buffer + 3 + 5 * idx) = addr;
   *(buffer + 3 + 5 * idx + 1) = count;
   *(buffer + 3 + 5 * idx + 2) = peerRank;
@@ -111,15 +105,15 @@ __device__ flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, uint64_t coun
   return flagcxSuccess;
 }
 
-__host__ flagcxResult_t dequeue(void *fifoBuffer, flagcxDeviceTrigger_t trigger) {
+FLAGCX_HOST_DECORATOR flagcxResult_t dequeue(void *fifoBuffer, flagcxDeviceTrigger_t trigger) {
   int idx = -1;
   unsigned long long int *buffer = (unsigned long long int *)fifoBuffer;
   int capacity = buffer[0];
-  int old_c = buffer[1];
-  int old_p = buffer[2];
-  if (old_c != old_p) {
-    // buffer[1] = (old_c + 1) % capacity;
-    idx = old_c;
+  int distance = buffer[2] - buffer[1];
+  if (distance > 0) {
+    idx = buffer[1] % capacity;
+    buffer[1] = buffer[1] + 1;
+    __sync_synchronize();
   }
   if (idx > -1) {
     memcpy((void *)trigger, (void *)(buffer + 3 + 5 * idx), sizeof(flagcxDeviceTrigger));

@@ -991,7 +991,7 @@ void *flagcxProxyKernelService(void *args) {
         res = flagcxHeteroSend((const void *)(uintptr_t)(ptr->addr), ptr->count,
                                (flagcxDataType_t)(ptr->datatype), ptr->peerRank,
                                comm, stream);
-        fifo->buffer[1] = (fifo->buffer[1] + 1) % fifo->buffer[0];
+        // fifo->buffer[1] = (fifo->buffer[1] + 1) % fifo->buffer[0];
         break;
       case flagcxDevicePrimRecv:
         INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-4");
@@ -1001,7 +1001,7 @@ void *flagcxProxyKernelService(void *args) {
         res = flagcxHeteroRecv((void *)(uintptr_t)(ptr->addr), ptr->count,
                                (flagcxDataType_t)(ptr->datatype), ptr->peerRank,
                                comm, stream);
-        fifo->buffer[1] = (fifo->buffer[1] + 1) % fifo->buffer[0];
+        // fifo->buffer[1] = (fifo->buffer[1] + 1) % fifo->buffer[0];
         break;
       case flagcxDevicePrimTerm:
         TRACE(FLAGCX_P2P,
@@ -1009,16 +1009,19 @@ void *flagcxProxyKernelService(void *args) {
               comm->rank);
         res = flagcxHeteroGroupEnd();
         groupCount--;
-        fifo->buffer[1] = (fifo->buffer[1] + 1) % fifo->buffer[0];
+        // fifo->buffer[1] = (fifo->buffer[1] + 1) % fifo->buffer[0];
         INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-5");
         break;
       case flagcxDevicePrimWait:
         TRACE(FLAGCX_P2P,
               "rank=%d flagcxDevicePrimWait called by proxyKernelService.",
               comm->rank);
-        INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-6");
+        INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-6 with groupCount=%d",
+             groupCount);
+        res = flagcxHeteroGroupEnd();
+        groupCount--;
         deviceAdaptor->streamSynchronize(stream);
-        fifo->buffer[1] = (fifo->buffer[1] + 1) % fifo->buffer[0];
+        // fifo->buffer[1] = (fifo->buffer[1] + 1) % fifo->buffer[0];
         break;
       default:
         INFO(FLAGCX_P2P, "Kernel proxy service thread BP4-7");
@@ -1029,10 +1032,10 @@ void *flagcxProxyKernelService(void *args) {
   }
   INFO(FLAGCX_P2P, "Kernel proxy service thread BP5");
 
-  // deallocate trigger structure
-  free(ptr);
   // destroy stream
   res = deviceAdaptor->streamDestroy(stream);
+  // deallocate trigger structure
+  free(ptr);
   // destroy fifo
   delete comm->proxyState->kernelState.fifo;
 out:

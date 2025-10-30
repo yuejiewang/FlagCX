@@ -2,8 +2,6 @@
 #define FLAGCX_KERNEL_H_
 
 #include "adaptor.h"
-#include "cuda.h"
-#include "cuda_runtime.h"
 #include "flagcx.h"
 
 #define FLAGCX_KERNEL_FIFO_CAPACITY 16
@@ -110,26 +108,29 @@ public:
 typedef struct flagcxFifo *flagcxFifo_t;
 
 // device-producer + host-consumer APIs
-__device__ flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr,
-                                  uint64_t count, uint64_t peerRank,
-                                  uint64_t datatype, uint64_t type);
-__host__ flagcxResult_t dequeue(void *fifoBuffer,
-                                flagcxDeviceTrigger_t trigger);
+FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr,
+                                               uint64_t count,
+                                               uint64_t peerRank,
+                                               uint64_t datatype,
+                                               uint64_t type);
+FLAGCX_HOST_DECORATOR flagcxResult_t dequeue(void *fifoBuffer,
+                                             flagcxDeviceTrigger_t trigger);
 // host-producer + device-consumer APIs
-// __host__ flagcxResult_t enqueue(flagcxReduceTrigger trigger);
-// __device__ flagcxResult_t dequeue(flagcxReduceTrigger_t trigger);
+// FLAGCX_HOST_DECORATOR flagcxResult_t enqueue(flagcxReduceTrigger trigger);
+// FLAGCX_HOST_DECORATOR  flagcxResult_t dequeue(flagcxReduceTrigger_t trigger);
 
-__device__ size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype);
+FLAGCX_DEVICE_DECORATOR size_t
+getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype);
 
-__device__ flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
-                                           flagcxDataType_t datatype, int peer,
-                                           void *fifoBuffer);
-__device__ flagcxResult_t flagcxDeviceRecv(void *sendbuff, size_t count,
-                                           flagcxDataType_t datatype, int peer,
-                                           void *fifoBuffer);
-__device__ flagcxResult_t flagcxDeviceTerm(void *fifoBuffer);
-__device__ flagcxResult_t flagcxDeviceWait(void *fifoBuffer);
-__global__ void flagcxCollectiveKernel(flagcxFifo_t q); // TBD
+FLAGCX_DEVICE_DECORATOR flagcxResult_t
+flagcxDeviceSend(const void *sendbuff, size_t count, flagcxDataType_t datatype,
+                 int peer, void *fifoBuffer);
+FLAGCX_DEVICE_DECORATOR flagcxResult_t
+flagcxDeviceRecv(void *sendbuff, size_t count, flagcxDataType_t datatype,
+                 int peer, void *fifoBuffer);
+FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceTerm(void *fifoBuffer);
+FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceWait(void *fifoBuffer);
+// FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(flagcxFifo_t q); // TBD
 void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
                    flagcxDataType_t datatype, int sendPeer, int recvPeer,
                    flagcxComm_t comm, flagcxStream_t stream);

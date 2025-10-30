@@ -98,7 +98,12 @@ endif
 DEVICE_LIB =
 DEVICE_INCLUDE =
 DEVICE_LINK =
+DEVICE_RUNTIME =
 DEVICE_COMPILER =
+DEVICE_LINKER =
+DEVICE_COMPILE_FLAG =
+DEVICE_LINK_FLAG =
+DEVICE_FILE_EXTENSION =
 CCL_LIB =
 CCL_INCLUDE =
 CCL_LINK =
@@ -115,7 +120,12 @@ ifeq ($(USE_NVIDIA), 1)
 	DEVICE_LIB = $(DEVICE_HOME)/lib64
 	DEVICE_INCLUDE = $(DEVICE_HOME)/include
 	DEVICE_LINK = -lcudart -lcuda
+	DEVICE_RUNTIME = CUDA
 	DEVICE_COMPILER = $(DEVICE_HOME)/bin/nvcc
+	DEVICE_LINKER = $(DEVICE_HOME)/bin/nvcc -dlink
+	DEVICE_COMPILE_FLAG = -c --cudart=shared -Xcompiler -fPIC -MMD -MP -rdc=true -g
+	DEVICE_LINK_FLAG = --cudart=shared -Xcompiler -fPIC
+	DEVICE_FILE_EXTENSION = cu
 	CCL_LIB = $(CCL_HOME)/lib
 	CCL_INCLUDE = $(CCL_HOME)/include
 	CCL_LINK = -lnccl
@@ -254,8 +264,7 @@ LIBSRCFILES:= \
 	$(wildcard flagcx/service/*.cc)
 
 DEVSRCFILES:= \
-	$(wildcard flagcx/kernels/flagcx_kernel.cu) \
-	$(wildcard flagcx/kernels/device_collective_demo.cu)
+	$(wildcard flagcx/kernels/*.$(DEVICE_FILE_EXTENSION))
 
 LIBOBJ:= $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
 DEVOBJ:= $(DEVSRCFILES:%.cu=$(OBJDIR)/%.o)
@@ -294,7 +303,7 @@ print_var:
 	@echo "USE_IBUC: $(USE_IBUC)"
 	@echo "NET_ADAPTOR_FLAG: $(NET_ADAPTOR_FLAG)"
 
-$(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJ) $(OBJDIR)/cuda_dlink.o
+$(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJ) $(OBJDIR)/kernel_dlink.o
 	@mkdir -p `dirname $@`
 	@echo "Linking   $@"
 	@g++ $^ -o $@ -L$(CCL_LIB) -L$(DEVICE_LIB) -L$(HOST_CCL_LIB) -L$(UCX_LIB) -shared -fvisibility=default -Wl,--no-as-needed -Wl,-rpath,$(LIBDIR) -Wl,-rpath,$(CCL_LIB) -Wl,-rpath,$(HOST_CCL_LIB) -Wl,-rpath,$(UCX_LIB) -lpthread -lrt -ldl $(CCL_LINK) $(DEVICE_LINK) $(HOST_CCL_LINK) $(UCX_LINK) -g
@@ -305,13 +314,13 @@ $(OBJDIR)/%.o: %.cc
 	@echo "Compiling $@"
 	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
 
-$(OBJDIR)/cuda_dlink.o: $(DEVOBJ)
-	@$(DEVICE_COMPILER) -dlink $^ -o $@ $(DEVICE_LINK) --cudart=shared -Xcompiler -fPIC
+$(OBJDIR)/kernel_dlink.o: $(DEVOBJ)
+	@$(DEVICE_LINKER) $^ -o $@ $(DEVICE_LINK) $(DEVICE_LINK_FLAG)
 
-$(OBJDIR)/%.o: %.cu
+$(OBJDIR)/%.o: %.$(DEVICE_FILE_EXTENSION)
 	@mkdir -p `dirname $@`
-	@echo "Compiling $@ (CUDA)"
-	@$(DEVICE_COMPILER) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -c --cudart=shared -Xcompiler -fPIC -MMD -MP -rdc=true -g
+	@echo "Compiling $@ ($(DEVICE_RUNTIME))"
+	@$(DEVICE_COMPILER) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(DEVICE_COMPILE_FLAG)
 
 -include $(LIBOBJ:.o=.d) $(DEVOBJ:.o=.d)
 
