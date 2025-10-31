@@ -17,6 +17,7 @@ USE_DU ?= 0
 USE_MPI ?= 0
 USE_UCX ?= 0
 USE_IBUC ?= 0
+COMPILE_KERNEL ?= 0
 
 # set to empty if not provided
 DEVICE_HOME ?=
@@ -116,6 +117,7 @@ UCX_LIB =
 UCX_INCLUDE =
 UCX_LINK =
 NET_ADAPTOR_FLAG =
+COMPILE_KERNEL_FLAG =
 ifeq ($(USE_NVIDIA), 1)
 	DEVICE_LIB = $(DEVICE_HOME)/lib64
 	DEVICE_INCLUDE = $(DEVICE_HOME)/include
@@ -242,6 +244,10 @@ ifeq ($(USE_IBUC), 1)
 	NET_ADAPTOR_FLAG += -DUSE_IBUC
 endif
 
+ifeq ($(COMPILE_KERNEL), 1)
+	COMPILE_KERNEL_FLAG = -DCOMPILE_KERNEL
+endif
+
 LIBDIR := $(BUILDDIR)/lib
 OBJDIR := $(BUILDDIR)/obj
 
@@ -263,11 +269,12 @@ LIBSRCFILES:= \
 	$(wildcard flagcx/adaptor/tuner/*.cc) \
 	$(wildcard flagcx/service/*.cc)
 
+ifeq ($(COMPILE_KERNEL), 1)
 DEVSRCFILES:= \
 	$(wildcard flagcx/kernels/*.$(DEVICE_FILE_EXTENSION))
-
-LIBOBJ:= $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
 DEVOBJ:= $(DEVSRCFILES:%.$(DEVICE_FILE_EXTENSION)=$(OBJDIR)/%.o)
+endif
+LIBOBJ:= $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
 
 TARGET = libflagcx.so
 all: $(LIBDIR)/$(TARGET)
@@ -288,6 +295,7 @@ print_var:
 	@echo "USE_MUSA: $(USE_MUSA)"
 	@echo "USE_DU: $(USE_DU)"
 	@echo "USE_AMD: $(USE_AMD)"
+	@echo "COMPILE_KERNEL: $(COMPILE_KERNEL)"
 	@echo "DEVICE_LIB: $(DEVICE_LIB)"
 	@echo "DEVICE_INCLUDE: $(DEVICE_INCLUDE)"
 	@echo "CCL_LIB: $(CCL_LIB)"
@@ -303,26 +311,37 @@ print_var:
 	@echo "USE_IBUC: $(USE_IBUC)"
 	@echo "NET_ADAPTOR_FLAG: $(NET_ADAPTOR_FLAG)"
 
-$(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJ) $(OBJDIR)/kernel_dlink.o
+ifeq ($(COMPILE_KERNEL), 1)
+DEVOBJS = $(DEVOBJ) $(OBJDIR)/kernel_dlink.o
+else
+DEVOBJS =
+endif
+
+$(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJS)
 	@mkdir -p `dirname $@`
 	@echo "Linking   $@"
 	@g++ $^ -o $@ -L$(CCL_LIB) -L$(DEVICE_LIB) -L$(HOST_CCL_LIB) -L$(UCX_LIB) -shared -fvisibility=default -Wl,--no-as-needed -Wl,-rpath,$(LIBDIR) -Wl,-rpath,$(CCL_LIB) -Wl,-rpath,$(HOST_CCL_LIB) -Wl,-rpath,$(UCX_LIB) -lpthread -lrt -ldl $(CCL_LINK) $(DEVICE_LINK) $(HOST_CCL_LINK) $(UCX_LINK) -g
-
 
 $(OBJDIR)/%.o: %.cc
 	@mkdir -p `dirname $@`
 	@echo "Compiling $@"
 	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
 
+ifeq ($(COMPILE_KERNEL), 1)
 $(OBJDIR)/kernel_dlink.o: $(DEVOBJ)
 	@$(DEVICE_LINKER) $^ -o $@ $(DEVICE_LINK) $(DEVICE_LINK_FLAG)
 
 $(OBJDIR)/%.o: %.$(DEVICE_FILE_EXTENSION)
 	@mkdir -p `dirname $@`
 	@echo "Compiling $@ ($(DEVICE_RUNTIME))"
-	@$(DEVICE_COMPILER) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(DEVICE_COMPILE_FLAG)
+	@$(DEVICE_COMPILER) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(DEVICE_COMPILE_FLAG) $(COMPILE_KERNEL_FLAG) -g
+endif
 
+ifeq ($(COMPILE_KERNEL), 1)
 -include $(LIBOBJ:.o=.d) $(DEVOBJ:.o=.d)
+else
+-include $(LIBOBJ:.o=.d)
+endif
 
 clean:
 	@rm -rf $(LIBDIR)/$(TARGET) $(OBJDIR)
