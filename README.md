@@ -68,24 +68,32 @@ Additionally, FlagCX supports three collective communication libraries for host-
 
 FlagCX also integrates with upper-layer applications such as PyTorch and PaddlePaddle based on its unified APIs. The table below presents all supported frameworks by FlagCX and their related communication operations, where the `batch_XXX` and `XXX_coalesced` ops refer to the usage of group primitives.
 
-| Framework                         | PyTorch                      | PaddlePaddle |
-|:----------------------------------|:-----------------------------|:-------------|
-| send                              | ✓                            |✓             |
-| recv                              | ✓                            |✓             |
-| batch_isend_irecv                 | ✓                            |✓             |
-| broadcast                         | ✓                            |✓             |
-| all_reduce                        | ✓                            |✓             |
-| all_reduce_coalesced              | ✓ (in order, no aggregation) |✘             |
-| reduce                            | ✓                            |✓             |
-| all_gather                        | ✓                            |✓             |
-| all_gather_into_tensor_coalesced  | ✓ (in order, no aggregation) |✘             |
-| gather                            | ✓                            |✓             |
-| scatter                           | ✓                            |✓             |
-| reduce_scatter                    | ✓                            |✓             |
-| reduce_scatter_tensor_coalesced   | ✓ (in order, no aggregation) |✘             |
-| all_to_all                        | ✓                            |✓             |
-| all_to_all_single                 | ✓                            |✓             |
-| barrier                           | ✓                            |✓             |
+| Framework                        | PyTorch                      | PaddlePaddle |
+| :------------------------------- | :--------------------------- | :----------- |
+| send                             | ✓                            | ✓            |
+| recv                             | ✓                            | ✓            |
+| batch_isend_irecv                | ✓                            | ✓            |
+| broadcast                        | ✓                            | ✓            |
+| all_reduce                       | ✓                            | ✓            |
+| all_reduce_coalesced             | ✓ (in order, no aggregation) | ☓            |
+| reduce                           | ✓                            | ✓            |
+| all_gather                       | ✓                            | ✓            |
+| all_gather_into_tensor_coalesced | ✓ (in order, no aggregation) | ☓            |
+| gather                           | ✓                            | ✓            |
+| scatter                          | ✓                            | ✓            |
+| reduce_scatter                   | ✓                            | ✓            |
+| reduce_scatter_tensor_coalesced  | ✓ (in order, no aggregation) | ☓            |
+| all_to_all                       | ✓                            | ✓            |
+| all_to_all_single                | ✓                            | ✓            |
+| barrier                          | ✓                            | ✓            |
+
+The FlagCX PyTorch plugin has undergone comprehensive validation across multiple communication backends, as summarized below:
+
+| FlagCX Backend         | NCCL | IXCCL | CNCL | MCCL | XCCL | DUCCL | HCCL | MUSACCL | RCCL |
+| ---------------------- | ---- | ----- | ---- | ---- | ---- | ----- | ---- | ------- | ---- |
+| PyTorch Plugin Support | ✓    | ✓     | ✓    | ✓    | ✓    | ✓     | ✓    | ☓       | ✓    |
+
+To enable heterogeneous cross-chip communication using the PyTorch DDP FlagCX backend, it is recommended to use identical PyTorch versions across all nodes. Mismatched versions may lead to initialization failures during process group setup. Further compatibility and performance tests will be conducted in future releases, and we warmly welcome community contributions to help expand and strengthen the validation matrix.
 
 ## Quick Start
 
