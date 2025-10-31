@@ -130,6 +130,12 @@ struct flagcxProxyArgs {
   void *regHandle = nullptr;
   int regBufFlag = 0;
 
+  // P2P operation slot management
+  int p2pOpHash = -1;
+  int p2pPeerOpHash = -1;
+  size_t p2pSlotIdx = 0;
+  size_t p2pPeerSlotIdx = 0;
+
   union flagcxProxyOpSpecifics specifics;
 };
 
