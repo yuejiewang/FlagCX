@@ -1068,17 +1068,21 @@ void *flagcxProxyKernelService(void *args) {
 
   // Create FIFO
   comm->proxyState->kernelState.fifo = new flagcxFifo();
+  FLAGCXCHECKGOTO(comm->proxyState->kernelState.fifo->flagcxFifoInit(), res,
+                  out);
   fifo = comm->proxyState->kernelState.fifo;
   // comm->fifoBuffer = (void *)comm->proxyState->kernelState.fifo->buffer;
-  res = deviceAdaptor->hostGetDevicePointer(
-      &comm->fifoBuffer, (void *)comm->proxyState->kernelState.fifo->buffer);
+  FLAGCXCHECKGOTO(deviceAdaptor->hostGetDevicePointer(
+                      &comm->fifoBuffer,
+                      (void *)comm->proxyState->kernelState.fifo->buffer),
+                  res, out);
 
   // Create a dedicated stream
   flagcxStream_t stream;
-  res = deviceAdaptor->streamCreate(&stream);
+  FLAGCXCHECKGOTO(deviceAdaptor->streamCreate(&stream), res, out);
 
   // Allocate trigger structure
-  res = flagcxCalloc(&ptr, sizeof(flagcxDeviceTrigger));
+  FLAGCXCHECKGOTO(flagcxCalloc(&ptr, sizeof(flagcxDeviceTrigger)), res, out);
 
   while (true) {
     if (comm->proxyState->kernelState.stop == 1)
@@ -1147,6 +1151,8 @@ void *flagcxProxyKernelService(void *args) {
   // deallocate trigger structure
   free(ptr);
   // destroy fifo
+  FLAGCXCHECKGOTO(comm->proxyState->kernelState.fifo->flagcxFifoDestroy(), res,
+                  out);
   delete comm->proxyState->kernelState.fifo;
 out:
   return NULL;

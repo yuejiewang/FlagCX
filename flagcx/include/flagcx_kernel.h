@@ -88,21 +88,25 @@ struct flagcxFifo {
   uint64_t *buffer;
 
 public:
-  flagcxFifo() {
+  flagcxFifo() {}
+  ~flagcxFifo() {}
+  flagcxResult_t flagcxFifoInit() {
     // TODO: use a better way to initialize FIFO
-    deviceAdaptor->deviceMalloc((void **)&buffer,
-                                3 * sizeof(uint64_t) +
-                                    FLAGCX_KERNEL_FIFO_CAPACITY *
-                                        sizeof(flagcxDeviceTrigger),
-                                flagcxMemHost, NULL);
+    FLAGCXCHECK(deviceAdaptor->deviceMalloc((void **)&buffer,
+                                            3 * sizeof(uint64_t) +
+                                                FLAGCX_KERNEL_FIFO_CAPACITY *
+                                                    sizeof(flagcxDeviceTrigger),
+                                            flagcxMemHost, NULL));
     buffer[0] = FLAGCX_KERNEL_FIFO_CAPACITY;
     buffer[1] = 0;
     buffer[2] = 0;
     memset((void *)(buffer + 3), 0,
            FLAGCX_KERNEL_FIFO_CAPACITY * sizeof(flagcxDeviceTrigger));
+    return flagcxSuccess;
   }
-  ~flagcxFifo() {
-    deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL);
+  flagcxResult_t flagcxFifoDestroy() {
+    FLAGCXCHECK(deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL));
+    return flagcxSuccess;
   }
 };
 typedef struct flagcxFifo *flagcxFifo_t;
