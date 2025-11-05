@@ -13,7 +13,8 @@ FLAGCX_DEVICE_INLINE_DECORATOR void spin_backoff(int iter) {
 #endif
 }
 
-FLAGCX_DEVICE_DECORATOR size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype) {
+FLAGCX_DEVICE_DECORATOR size_t
+getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype) {
   switch (dtype) {
     // case flagcxInt8:
     case flagcxChar:
@@ -45,17 +46,64 @@ FLAGCX_DEVICE_DECORATOR size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtyp
   }
 }
 
-FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceSend(const void *sendbuff, size_t count,
-                                           flagcxDataType_t datatype, int peer,
-                                           void *fifoBuffer) {
-  enqueue(fifoBuffer, (uint64_t)((uintptr_t)sendbuff), count, peer, datatype, flagcxDevicePrimSend);
+FLAGCX_DEVICE_DECORATOR FLAGCX_HOST_DECORATOR uint64_t
+flagcxTriggerMask(size_t w) {
+  return (w == 64) ? ~0ull : ((1ull << w) - 1);
+}
+
+FLAGCX_HOST_DECORATOR void
+flagcxDeviceTrigger::get_value(flagcxDeviceTrigger *t) {
+  t->fst = fst;
+  t->snd = snd;
+}
+
+FLAGCX_DEVICE_DECORATOR void
+flagcxDeviceTrigger::set_value(uint64_t addr, uint64_t count, uint64_t peerRank,
+                               uint64_t datatype, uint64_t type) {
+  fst = addr;
+  snd = (count & flagcxTriggerMask(flagcxReduceTriggerBitsCount))
+            << flagcxDeviceTriggerOffCount |
+        (peerRank & flagcxTriggerMask(flagcxDeviceTriggerBitsPeerRank))
+            << flagcxDeviceTriggerOffPeerRank |
+        (datatype & flagcxTriggerMask(flagcxDeviceTriggerBitsDatatype))
+            << flagcxDeviceTriggerOffDatatype |
+        (type & flagcxTriggerMask(flagcxDeviceTriggerBitsPrim))
+            << flagcxDeviceTriggerOffPrim;
+}
+
+flagcxResult_t flagcxFifo::flagcxFifoInit() {
+  // TODO: use a better way to initialize FIFO
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc((void **)&buffer,
+                                          3 * sizeof(uint64_t) +
+                                              FLAGCX_KERNEL_FIFO_CAPACITY *
+                                                  sizeof(flagcxDeviceTrigger),
+                                          flagcxMemHost, NULL));
+  buffer[0] = FLAGCX_KERNEL_FIFO_CAPACITY;
+  buffer[1] = 0;
+  buffer[2] = 0;
+  memset((void *)(buffer + 3), 0,
+         FLAGCX_KERNEL_FIFO_CAPACITY * sizeof(flagcxDeviceTrigger));
   return flagcxSuccess;
 }
 
-FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceRecv(void *recvbuff, size_t count,
-                                           flagcxDataType_t datatype, int peer,
-                                           void *fifoBuffer) {
-  enqueue(fifoBuffer, (uint64_t)((uintptr_t)recvbuff), count, peer, datatype, flagcxDevicePrimRecv);
+flagcxResult_t flagcxFifo::flagcxFifoDestroy() {
+  FLAGCXCHECK(deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL));
+  return flagcxSuccess;
+}
+
+FLAGCX_DEVICE_DECORATOR flagcxResult_t
+flagcxDeviceSend(const void *sendbuff, size_t count, flagcxDataType_t datatype,
+                 int peer, void *fifoBuffer) {
+  enqueue(fifoBuffer, (uint64_t)((uintptr_t)sendbuff), count, peer, datatype,
+          flagcxDevicePrimSend);
+  return flagcxSuccess;
+}
+
+FLAGCX_DEVICE_DECORATOR flagcxResult_t
+flagcxDeviceRecv(void *recvbuff, size_t count, flagcxDataType_t datatype,
+                 int peer, void *fifoBuffer) {
+  enqueue(fifoBuffer, (uint64_t)((uintptr_t)recvbuff), count, peer, datatype,
+          flagcxDevicePrimRecv);
   return flagcxSuccess;
 }
 
@@ -78,7 +126,11 @@ FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
   return flagcxSuccess;
 }
 
-FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, uint64_t count, uint64_t peerRank, uint64_t datatype, uint64_t type) {
+FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr,
+                                               uint64_t count,
+                                               uint64_t peerRank,
+                                               uint64_t datatype,
+                                               uint64_t type) {
   int idx = -1;
   unsigned long long int *buffer = (unsigned long long int *)fifoBuffer;
   int capacity = buffer[0];
@@ -92,18 +144,19 @@ FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, 
   }
   idx = buffer[2] % capacity;
   buffer[2] = buffer[2] + 1;
-  flagcxDeviceTrigger* trigger = ((flagcxDeviceTrigger*)(buffer + 3)) + idx;
-  trigger->addr = addr;
-  trigger->count = count;
-  trigger->peerRank = peerRank;
-  trigger->datatype = datatype;
-  trigger->type = type;
+  flagcxDeviceTrigger *trigger = ((flagcxDeviceTrigger *)(buffer + 3)) + idx;
+  // trigger->addr = addr;
+  // trigger->count = count;
+  // trigger->peerRank = peerRank;
+  // trigger->datatype = datatype;
+  // trigger->type = type;
+  trigger->set_value(addr, count, peerRank, datatype, type);
   FLAGCX_DEVICE_THREAD_FENCE();
   return flagcxSuccess;
 }
 
-// __device__ flagcxResult_t flagcxFifo::dequeue(flagcxReduceTrigger_t trigger) {
+// __device__ flagcxResult_t flagcxFifo::dequeue(flagcxReduceTrigger_t trigger)
+// {
 //   // to be implemented
 //   return flagcxNotSupported;
 // }
-
