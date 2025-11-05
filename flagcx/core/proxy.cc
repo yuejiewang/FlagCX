@@ -1088,13 +1088,13 @@ void *flagcxProxyKernelService(void *args) {
     if (comm->proxyState->kernelState.stop == 1)
       break;
     dequeue(fifo->buffer, ptr);
-    if ((ptr->type == flagcxDevicePrimSend ||
-         ptr->type == flagcxDevicePrimRecv) &&
-        ptr->addr == 0) {
+    if ((ptr->getType() == flagcxDevicePrimSend ||
+         ptr->getType() == flagcxDevicePrimRecv) &&
+        ptr->getAddr() == 0) {
       sched_yield();
       continue;
     }
-    switch (ptr->type) {
+    switch (ptr->getType()) {
       case flagcxDevicePrimSend:
         if (groupCount == 0) {
           res = flagcxHeteroGroupStart();
@@ -1106,9 +1106,10 @@ void *flagcxProxyKernelService(void *args) {
         TRACE(FLAGCX_P2P,
               "rank=%d flagcxDevicePrimSend called by proxyKernelService.",
               comm->rank);
-        res = flagcxHeteroSend((const void *)(uintptr_t)(ptr->addr), ptr->count,
-                               (flagcxDataType_t)(ptr->datatype), ptr->peerRank,
-                               comm, stream);
+        res = flagcxHeteroSend((const void *)(uintptr_t)(ptr->getAddr()),
+                               ptr->getCount(),
+                               (flagcxDataType_t)(ptr->getDatatype()),
+                               ptr->getPeerRank(), comm, stream);
         break;
       case flagcxDevicePrimRecv:
         if (groupCount == 0) {
@@ -1121,9 +1122,10 @@ void *flagcxProxyKernelService(void *args) {
         TRACE(FLAGCX_P2P,
               "rank=%d flagcxDevicePrimRecv called by proxyKernelService.",
               comm->rank);
-        res = flagcxHeteroRecv((void *)(uintptr_t)(ptr->addr), ptr->count,
-                               (flagcxDataType_t)(ptr->datatype), ptr->peerRank,
-                               comm, stream);
+        res = flagcxHeteroRecv((void *)(uintptr_t)(ptr->getAddr()),
+                               ptr->getCount(),
+                               (flagcxDataType_t)(ptr->getDatatype()),
+                               ptr->getPeerRank(), comm, stream);
         break;
       case flagcxDevicePrimTerm:
         TRACE(FLAGCX_P2P,

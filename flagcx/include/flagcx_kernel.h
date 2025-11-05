@@ -14,8 +14,7 @@ typedef enum {
 } flagcxDevicePrim;
 
 constexpr unsigned int flagcxDeviceTriggerBitsAddr = 64;
-constexpr unsigned int flagcxDeviceTriggerOffCount =
-    flagcxDeviceTriggerBitsAddr;
+constexpr unsigned int flagcxDeviceTriggerOffCount = 0;
 constexpr unsigned int flagcxDeviceTriggerBitsCount = 32;
 constexpr unsigned int flagcxDeviceTriggerOffPeerRank =
     flagcxDeviceTriggerOffCount + flagcxDeviceTriggerBitsCount;
@@ -66,8 +65,12 @@ struct flagcxDeviceTrigger {
                       uint64_t datatype, uint64_t type) {
     set_value(addr, count, peerRank, datatype, type);
   }
-  FLAGCX_HOST_DECORATOR void get_value(flagcxDeviceTrigger *t);
-  FLAGCX_DEVICE_DECORATOR void set_value(uint64_t addr, uint64_t count,
+  FLAGCX_HOST_DECORATOR uint64_t getAddr();
+  FLAGCX_HOST_DECORATOR uint64_t getCount();
+  FLAGCX_HOST_DECORATOR uint64_t getPeerRank();
+  FLAGCX_HOST_DECORATOR uint64_t getDatatype();
+  FLAGCX_HOST_DECORATOR uint64_t getType();
+  FLAGCX_DEVICE_DECORATOR void setValue(uint64_t addr, uint64_t count,
                                          uint64_t peerRank, uint64_t datatype,
                                          uint64_t type);
 };
