@@ -19,6 +19,8 @@ FLAGCX_HOST_DECORATOR flagcxResult_t dequeue(void *fifoBuffer,
                     sizeof(flagcxDeviceTrigger) /
                         sizeof(unsigned long long int) * idx),
            sizeof(flagcxDeviceTrigger));
+    printf("host dequeue idx %d, fst 0x%016llx, snd 0x%016llx\n", idx,
+           *(buffer + 3 + 2 * idx), *(buffer + 4 + 2 * idx));
   } else {
     memset((void *)trigger, 0, sizeof(flagcxDeviceTrigger));
   }
