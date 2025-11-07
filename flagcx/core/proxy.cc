@@ -1141,6 +1141,7 @@ void *flagcxProxyKernelService(void *args) {
               "rank=%d flagcxDevicePrimWait called by proxyKernelService.",
               comm->rank);
         deviceAdaptor->streamSynchronize(stream);
+        comm->proxyState->kernelState.stop = 1;
         break;
       default:
         break;
@@ -1149,14 +1150,18 @@ void *flagcxProxyKernelService(void *args) {
       break;
   }
   // destroy stream
+  INFO(FLAGCX_INIT, "end host loop");
+  // deviceAdaptor->streamSynchronize(stream);
+  // INFO(FLAGCX_INIT, "stream synchronized");
   res = deviceAdaptor->streamDestroy(stream);
   // deallocate trigger structure
   free(ptr);
+
+out:
   // destroy fifo
   FLAGCXCHECKGOTO(comm->proxyState->kernelState.fifo->flagcxFifoDestroy(), res,
                   out);
   delete comm->proxyState->kernelState.fifo;
-out:
   return NULL;
 }
 
