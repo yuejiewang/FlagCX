@@ -34,36 +34,10 @@ constexpr unsigned int flagcxReduceTriggerBitsDatatype = 4;
 constexpr unsigned int flagcxReduceTriggerBitsRedop = 4;
 constexpr unsigned int flagcxReduceTriggerBitsFifoReserved = 1;
 
-// typedef union alignas(16) {
-//   struct {
-//     uint64_t fst;
-//     uint64_t snd;
-//   } value;
-//   // The summation of number of bits must be 128 or less.
-//   struct {
-//     // First 64 bits: value[0]
-//     uint64_t addr : flagcxDeviceTriggerBitsAddr;
-//     // uint64_t offset : flagcxDeviceTriggerBitsOffset;
-//     // Second 64 bits: value[1]
-//     uint64_t count : flagcxDeviceTriggerBitsCount;
-//     uint64_t peerRank : flagcxDeviceTriggerBitsPeerRank;
-//     uint64_t datatype : flagcxDeviceTriggerBitsDatatype;
-//     uint64_t type : flagcxDeviceTriggerBitsPrim;
-//     uint64_t
-//         : (64 - flagcxDeviceTriggerBitsCount -
-//         flagcxDeviceTriggerBitsPeerRank -
-//            flagcxDeviceTriggerBitsDatatype - flagcxDeviceTriggerBitsPrim -
-//            flagcxDeviceTriggerBitsFifoReserved); // ensure 64-bit alignment
-//     uint64_t reserved : flagcxDeviceTriggerBitsFifoReserved;
-//   } fields;
-// } flagcxDeviceTrigger;
 struct flagcxDeviceTrigger {
   uint64_t fst;
   uint64_t snd;
 
-  // FLAGCX_HOST_DECORATOR FLAGCX_DEVICE_DECORATOR
-  // flagcxDeviceTrigger(uint64_t addr, uint64_t count, uint64_t peerRank,
-  //                     uint64_t datatype, uint64_t type);
   FLAGCX_HOST_DECORATOR uint64_t getAddr();
   FLAGCX_HOST_DECORATOR uint64_t getCount();
   FLAGCX_HOST_DECORATOR uint64_t getPeerRank();
@@ -73,13 +47,6 @@ struct flagcxDeviceTrigger {
                                         uint64_t peerRank, uint64_t datatype,
                                         uint64_t type);
 };
-// typedef struct {
-//   uint64_t addr;
-//   uint64_t count;
-//   uint64_t peerRank;
-//   uint64_t datatype;
-//   uint64_t type;
-// } flagcxDeviceTrigger;
 typedef flagcxDeviceTrigger *flagcxDeviceTrigger_t;
 
 typedef union alignas(16) {

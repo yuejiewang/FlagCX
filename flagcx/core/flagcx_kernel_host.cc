@@ -30,6 +30,7 @@ FLAGCX_HOST_DECORATOR uint64_t flagcxDeviceTrigger::getType() {
 
 flagcxResult_t flagcxFifo::flagcxFifoInit() {
   // TODO: use a better way to initialize FIFO
+  INFO(FLAGCX_KERNEL, "flagcxFifoInit called");
   FLAGCXCHECK(deviceAdaptor->deviceMalloc((void **)&buffer,
                                           3 * sizeof(uint64_t) +
                                               FLAGCX_KERNEL_FIFO_CAPACITY *
@@ -44,7 +45,7 @@ flagcxResult_t flagcxFifo::flagcxFifoInit() {
 }
 
 flagcxResult_t flagcxFifo::flagcxFifoDestroy() {
-  INFO(FLAGCX_INIT, "fifo destroy called");
+  INFO(FLAGCX_KERNEL, "flagcxFifoDestroy called");
   FLAGCXCHECK(deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL));
   return flagcxSuccess;
 }
@@ -65,14 +66,8 @@ FLAGCX_HOST_DECORATOR flagcxResult_t dequeue(void *fifoBuffer,
            sizeof(flagcxDeviceTrigger));
     __sync_synchronize();
     buffer[1] = buffer[1] + 1;
-    // __sync_synchronize();
   } else {
     memset((void *)trigger, 0, sizeof(flagcxDeviceTrigger));
   }
   return flagcxSuccess;
 }
-
-// __host__ flagcxResult_t flagcxFifo::enqueue(flagcxReduceTrigger trigger) {
-//   // to be implemented
-//   return flagcxNotSupported;
-// }

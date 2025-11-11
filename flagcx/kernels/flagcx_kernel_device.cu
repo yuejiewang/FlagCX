@@ -93,7 +93,6 @@ FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
   while (distance > 0) {
     spin_backoff(iter);
     iter++;
-    // FLAGCX_DEVICE_THREAD_FENCE();
     uint64_t cons = buffer[1];
     uint64_t prod = buffer[2];
     distance = prod - cons;
@@ -114,7 +113,6 @@ FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr,
   while (distance >= capacity) {
     spin_backoff(iter);
     iter++;
-    // FLAGCX_DEVICE_THREAD_FENCE();
     distance = buffer[2] - buffer[1];
   }
   idx = buffer[2] % capacity;
@@ -122,12 +120,5 @@ FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr,
   trigger->setValue(addr, count, peerRank, datatype, type);
   FLAGCX_DEVICE_THREAD_FENCE();
   buffer[2] = buffer[2] + 1;
-  // FLAGCX_DEVICE_THREAD_FENCE();
   return flagcxSuccess;
 }
-
-// __device__ flagcxResult_t flagcxFifo::dequeue(flagcxReduceTrigger_t trigger)
-// {
-//   // to be implemented
-//   return flagcxNotSupported;
-// }
