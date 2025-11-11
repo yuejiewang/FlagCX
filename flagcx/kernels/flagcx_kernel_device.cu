@@ -6,7 +6,7 @@
 #define flagcxTriggerMask(w) ((w == 64) ? ~0ull : ((1ull << w) - 1))
 #endif
 
-FLAGCX_DEVICE_INLINE_DECORATOR void spin_backoff(int iter) {
+FLAGCX_DEVICE_INLINE_DECORATOR void spinBackoff(int iter) {
   int delay = 1 << (iter < 15 ? iter : 15);
 #if __CUDA_ARCH__ >= 700
   __nanosleep(delay);
@@ -91,7 +91,7 @@ FLAGCX_DEVICE_DECORATOR flagcxResult_t flagcxDeviceWait(void *fifoBuffer) {
   int distance = buffer[2] - buffer[1];
   int iter = 0;
   while (distance > 0) {
-    spin_backoff(iter);
+    spinBackoff(iter);
     iter++;
     uint64_t cons = buffer[1];
     uint64_t prod = buffer[2];
@@ -111,7 +111,7 @@ FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr,
   int distance = buffer[2] - buffer[1];
   int iter = 0;
   while (distance >= capacity) {
-    spin_backoff(iter);
+    spinBackoff(iter);
     iter++;
     distance = buffer[2] - buffer[1];
   }
