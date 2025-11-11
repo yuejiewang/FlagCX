@@ -1068,29 +1068,34 @@ void *flagcxProxyKernelService(void *args) {
 
   // Create FIFO
   comm->proxyState->kernelState.fifo = new flagcxFifo();
+  FLAGCXCHECKGOTO(comm->proxyState->kernelState.fifo->flagcxFifoInit(), res,
+                  out);
   fifo = comm->proxyState->kernelState.fifo;
   // comm->fifoBuffer = (void *)comm->proxyState->kernelState.fifo->buffer;
-  res = deviceAdaptor->hostGetDevicePointer(
-      &comm->fifoBuffer, (void *)comm->proxyState->kernelState.fifo->buffer);
+  FLAGCXCHECKGOTO(deviceAdaptor->hostGetDevicePointer(
+                      &comm->fifoBuffer,
+                      (void *)comm->proxyState->kernelState.fifo->buffer),
+                  res, out);
 
   // Create a dedicated stream
   flagcxStream_t stream;
-  res = deviceAdaptor->streamCreate(&stream);
+  FLAGCXCHECKGOTO(deviceAdaptor->streamCreate(&stream), res, out);
+  INFO(FLAGCX_P2P, "rank %d p2p stream %lu", comm->rank, (uintptr_t)stream);
 
   // Allocate trigger structure
-  res = flagcxCalloc(&ptr, sizeof(flagcxDeviceTrigger));
+  FLAGCXCHECKGOTO(flagcxCalloc(&ptr, sizeof(flagcxDeviceTrigger)), res, out);
 
   while (true) {
     if (comm->proxyState->kernelState.stop == 1)
       break;
     dequeue(fifo->buffer, ptr);
-    if ((ptr->type == flagcxDevicePrimSend ||
-         ptr->type == flagcxDevicePrimRecv) &&
-        ptr->addr == 0) {
+    if ((ptr->getType() == flagcxDevicePrimSend ||
+         ptr->getType() == flagcxDevicePrimRecv) &&
+        ptr->getAddr() == 0) {
       sched_yield();
       continue;
     }
-    switch (ptr->type) {
+    switch (ptr->getType()) {
       case flagcxDevicePrimSend:
         if (groupCount == 0) {
           res = flagcxHeteroGroupStart();
@@ -1102,9 +1107,10 @@ void *flagcxProxyKernelService(void *args) {
         TRACE(FLAGCX_P2P,
               "rank=%d flagcxDevicePrimSend called by proxyKernelService.",
               comm->rank);
-        res = flagcxHeteroSend((const void *)(uintptr_t)(ptr->addr), ptr->count,
-                               (flagcxDataType_t)(ptr->datatype), ptr->peerRank,
-                               comm, stream);
+        res = flagcxHeteroSend((const void *)(uintptr_t)(ptr->getAddr()),
+                               ptr->getCount(),
+                               (flagcxDataType_t)(ptr->getDatatype()),
+                               ptr->getPeerRank(), comm, stream);
         break;
       case flagcxDevicePrimRecv:
         if (groupCount == 0) {
@@ -1117,16 +1123,20 @@ void *flagcxProxyKernelService(void *args) {
         TRACE(FLAGCX_P2P,
               "rank=%d flagcxDevicePrimRecv called by proxyKernelService.",
               comm->rank);
-        res = flagcxHeteroRecv((void *)(uintptr_t)(ptr->addr), ptr->count,
-                               (flagcxDataType_t)(ptr->datatype), ptr->peerRank,
-                               comm, stream);
+        res = flagcxHeteroRecv((void *)(uintptr_t)(ptr->getAddr()),
+                               ptr->getCount(),
+                               (flagcxDataType_t)(ptr->getDatatype()),
+                               ptr->getPeerRank(), comm, stream);
         break;
       case flagcxDevicePrimTerm:
         TRACE(FLAGCX_P2P,
-              "rank=%d flagcxHeteroGroupEnd called by proxyKernelService.",
+              "rank=%d flagcxDevicePrimTerm called by proxyKernelService.",
               comm->rank);
         if (groupCount > 0) {
           res = flagcxHeteroGroupEnd();
+          TRACE(FLAGCX_P2P,
+                "rank=%d flagcxHeteroGroupEnd called by proxyKernelService.",
+                comm->rank);
           groupCount--;
         }
         break;
@@ -1143,12 +1153,16 @@ void *flagcxProxyKernelService(void *args) {
       break;
   }
   // destroy stream
+  res = deviceAdaptor->streamSynchronize(stream);
   res = deviceAdaptor->streamDestroy(stream);
   // deallocate trigger structure
   free(ptr);
-  // destroy fifo
-  delete comm->proxyState->kernelState.fifo;
+
 out:
+  // destroy fifo
+  res = comm->proxyState->kernelState.fifo->flagcxFifoDestroy();
+  delete comm->proxyState->kernelState.fifo;
+  comm->fifoBuffer = NULL;
   return NULL;
 }
 
