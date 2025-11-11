@@ -1,4 +1,6 @@
-[<img src="docs/images/flagopen.png">](https://flagopen.baai.ac.cn/)
+
+[<img width="4750" height="958" alt="github+banner__2025-11-11+13_27_10" src="https://github.com/user-attachments/assets/31746439-e7b0-4391-8418-2f3597a88141" />](https://www.flagopen.ac.cn/)
+
 
 ## Latest News
 - **[2025/10]** Released [v0.6](https://github.com/FlagOpen/FlagCX/tree/release/v0.6):
@@ -98,6 +100,11 @@ In particular, PyTorch support is enabled via the FlagCX Torch Plugin, which pro
 | PyTorch Support | ✓    | ✓     | ✓    | ✓    | ✓    | ✓     | ✓    | ✓       | ✓    |
 
 To enable heterogeneous cross-chip communication using the PyTorch DDP FlagCX backend, it is recommended to use identical PyTorch versions across all nodes. Mismatched versions may lead to initialization failures during process group setup. Further compatibility and performance tests will be conducted in future releases, and we warmly welcome community contributions to help expand and strengthen the validation matrix.
+
+## Join our Discussion Channel
+
+
+<img width="204" height="180" alt="开源小助手" src="https://github.com/user-attachments/assets/af9f98be-8176-4039-be4a-7f5b15513ff1" />
 
 ## Quick Start
 
