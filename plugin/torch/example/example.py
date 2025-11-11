@@ -12,7 +12,12 @@ except:
         from torch_npu.contrib import transfer_to_npu
         dev_name = "npu"
     except:
-        dev_name = "cuda"
+        try:
+            import torch_musa
+            import transfer_to_musa
+            dev_name = "musa"
+        except:
+            dev_name = "cuda"
 
 import flagcx
 import torch.distributed as dist

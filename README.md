@@ -93,9 +93,9 @@ FlagCX also integrates with upper-layer applications such as PyTorch and PaddleP
 
 In particular, PyTorch support is enabled via the FlagCX Torch Plugin, which provides native integration with the PyTorch distributed backend. This plugin has undergone comprehensive validation across diverse communication backends and hardware platforms, ensuring robust functionality, consistent performance, and compatibility in heterogeneous multi-chip environments, as summarized below:
 
-| FlagCX Backend   | NCCL | IXCCL | CNCL | MCCL | XCCL | DUCCL | HCCL | MUSACCL | RCCL |
-|:-----------------|:-----|:------|:-----|:-----|:-----|:------|:-----|:--------|:-----|
-| PyTorch Support  | ✓    | ✓     | ✓    | ✓    | ✓    | ✓     | ✓    | ☓       | ✓    |
+| FlagCX Backend  | NCCL | IXCCL | CNCL | MCCL | XCCL | DUCCL | HCCL | MUSACCL | RCCL |
+| :-------------- | :--- | :---- | :--- | :--- | :--- | :---- | :--- | :------ | :--- |
+| PyTorch Support | ✓    | ✓     | ✓    | ✓    | ✓    | ✓     | ✓    | ✓       | ✓    |
 
 To enable heterogeneous cross-chip communication using the PyTorch DDP FlagCX backend, it is recommended to use identical PyTorch versions across all nodes. Mismatched versions may lead to initialization failures during process group setup. Further compatibility and performance tests will be conducted in future releases, and we warmly welcome community contributions to help expand and strengthen the validation matrix.
 
