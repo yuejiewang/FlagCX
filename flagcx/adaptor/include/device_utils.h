@@ -11,6 +11,14 @@
 #define FLAGCX_DEVICE_LAUNCH_KERNEL cudaLaunchKernel
 #include <cuda.h>
 #include <cuda_runtime.h>
+#elif defined(USE_METAX_ADAPTOR)
+#define FLAGCX_HOST_DECORATOR __host__
+#define FLAGCX_DEVICE_DECORATOR __device__
+#define FLAGCX_GLOBAL_DECORATOR __global__
+#define FLAGCX_DEVICE_INLINE_DECORATOR __forceinline__ __device__
+#define FLAGCX_DEVICE_STREAM_PTR cudaStream_t *
+#define FLAGCX_DEVICE_THREAD_FENCE __threadfence_system
+#define FLAGCX_DEVICE_LAUNCH_KERNEL cudaLaunchKernel
 #else
 #define FLAGCX_HOST_DECORATOR
 #define FLAGCX_DEVICE_DECORATOR

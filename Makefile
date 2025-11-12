@@ -158,7 +158,13 @@ else ifeq ($(USE_CAMBRICON), 1)
 	ADAPTOR_FLAG = -DUSE_CAMBRICON_ADAPTOR
 else ifeq ($(USE_METAX), 1)
 	DEVICE_LIB = $(DEVICE_HOME)/lib64
-	DEVICE_INCLUDE = $(DEVICE_HOME)/include
+	DEVICE_INCLUDE = $(DEVICE_HOME)/tools/cu-bridge/include
+	DEVICE_RUNTIME = CUCC
+	DEVICE_COMPILER = $(DEVICE_HOME)/tools/cu-bridge/bin/cucc
+	DEVICE_LINKER = $(DEVICE_HOME)/tools/cu-bridge/bin/cucc -dlink
+	DEVICE_COMPILE_FLAG = -c --cudart=shared -Xcompiler -fPIC -MMD -MP -rdc=true -g
+	DEVICE_LINK_FLAG = --cudart=shared -Xcompiler -fPIC
+	DEVICE_FILE_EXTENSION = cu
 	CCL_LIB = $(CCL_HOME)/lib64
 	CCL_INCLUDE = $(CCL_HOME)/include
 	CCL_LINK = -lmccl
