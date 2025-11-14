@@ -98,6 +98,8 @@ endif
 
 DEVICE_LIB =
 DEVICE_INCLUDE =
+DEVICE_RUNTIME_INCLUDE =
+DEVICE_KENRNEL_INCLUDE =
 DEVICE_LINK =
 DEVICE_RUNTIME =
 DEVICE_COMPILER =
@@ -159,6 +161,8 @@ else ifeq ($(USE_CAMBRICON), 1)
 else ifeq ($(USE_METAX), 1)
 	DEVICE_LIB = $(DEVICE_HOME)/lib64
 	DEVICE_INCLUDE = $(DEVICE_HOME)/tools/cu-bridge/include
+	DEVICE_RUNTIME_INCLUDE = $(DEVICE_HOME)/include/mcr
+	DEVICE_KERNEL_INCLUDE = $(DEVICE_HOME)/tools/cu-bridge/include
 	DEVICE_RUNTIME = CUCC
 	DEVICE_COMPILER = $(DEVICE_HOME)/tools/cu-bridge/bin/cucc
 	DEVICE_LINKER = $(DEVICE_HOME)/tools/cu-bridge/bin/cucc -dlink
@@ -331,7 +335,7 @@ $(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJS)
 $(OBJDIR)/%.o: %.cc
 	@mkdir -p `dirname $@`
 	@echo "Compiling $@"
-	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
+	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(DEVICE_RUNTIME_INCLUDE) -I$(DEVICE_KERNEL_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
 
 ifeq ($(COMPILE_KERNEL), 1)
 $(OBJDIR)/kernel_dlink.o: $(DEVOBJ)
@@ -340,7 +344,7 @@ $(OBJDIR)/kernel_dlink.o: $(DEVOBJ)
 $(OBJDIR)/%.o: %.$(DEVICE_FILE_EXTENSION)
 	@mkdir -p `dirname $@`
 	@echo "Compiling $@ ($(DEVICE_RUNTIME))"
-	@$(DEVICE_COMPILER) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(DEVICE_COMPILE_FLAG) $(COMPILE_KERNEL_FLAG) -g
+	@$(DEVICE_COMPILER) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(DEVICE_RUNTIME_INCLUDE) -I$(DEVICE_KERNEL_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(DEVICE_COMPILE_FLAG) $(COMPILE_KERNEL_FLAG) -g
 endif
 
 ifeq ($(COMPILE_KERNEL), 1)

@@ -19,6 +19,8 @@
 #define FLAGCX_DEVICE_STREAM_PTR cudaStream_t *
 #define FLAGCX_DEVICE_THREAD_FENCE __threadfence_system
 #define FLAGCX_DEVICE_LAUNCH_KERNEL cudaLaunchKernel
+#include <cuda.h>
+#include <cuda_runtime.h>
 #else
 #define FLAGCX_HOST_DECORATOR
 #define FLAGCX_DEVICE_DECORATOR

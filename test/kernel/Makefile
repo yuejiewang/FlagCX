@@ -11,6 +11,8 @@ LIBSRCFILES:= $(wildcard *.cc)
 DEVICE_HOME ?=
 DEVICE_LIB =
 DEVICE_INCLUDE =
+DEVICE_RUNTIME_INCLUDE =
+DEVICE_KERNEL_INCLUDE =
 DEVICE_LINK =
 DEVICE_COMPILER =
 ifeq ($(USE_NVIDIA), 1)
@@ -19,13 +21,21 @@ ifeq ($(USE_NVIDIA), 1)
 	DEVICE_INCLUDE = $(DEVICE_HOME)/include
 	DEVICE_LINK = -lcudart -lcuda
 	DEVICE_COMPILER = $(DEVICE_HOME)/bin/nvcc
+else ifeq ($(USE_METAX), 1)
+	DEVICE_HOME = /opt/maca
+	DEVICE_LIB = $(DEVICE_HOME)/lib64
+	DEVICE_INCLUDE = $(DEVICE_HOME)/include
+	DEVICE_RUNTIME_INCLUDE = $(DEVICE_HOME)/include/mcr
+	DEVICE_KERNEL_INCLUDE = $(DEVICE_HOME)/tools/cu-bridge/include
+	DEVICE_RUNTIME = CUCC
+	DEVICE_COMPILER = $(DEVICE_HOME)/tools/cu-bridge/bin/cucc
 endif
 
 all: test-kernel-demo
 
 test-kernel-demo: test_kernel_demo.cpp
 	@echo "Compiling $@"
-	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_kernel_demo test_kernel_demo.cpp $(LIBSRCFILES) -I../../flagcx/include -I../../flagcx/adaptor/include -I../../flagcx/service/ -I../../flagcx/core/ -I$(INCLUDEDIR) -I$(MPI_INCLUDE) -I$(DEVICE_INCLUDE) -L../../build/lib -L$(MPI_LIB) -L$(DEVICE_LIB) -lflagcx $(MPI_LINK) $(DEVICE_LINK) -DCOMPILE_KERNEL
+	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_kernel_demo test_kernel_demo.cpp $(LIBSRCFILES) -I../../flagcx/include -I../../flagcx/adaptor/include -I../../flagcx/service/ -I../../flagcx/core/ -I$(INCLUDEDIR) -I$(MPI_INCLUDE) -I$(DEVICE_INCLUDE) -I$(DEVICE_RUNTIME_INCLUDE) -I$(DEVICE_KERNEL_INCLUDE) -L../../build/lib -L$(MPI_LIB) -L$(DEVICE_LIB) -lflagcx $(MPI_LINK) $(DEVICE_LINK) -DCOMPILE_KERNEL
 
 clean:
 	@rm -f test_kernel_demo
