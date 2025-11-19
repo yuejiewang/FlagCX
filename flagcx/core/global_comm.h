@@ -42,7 +42,6 @@ struct flagcxComm {
   flagcxInnerComm_t homo_comm;
   flagcxHeteroComm_t hetero_comm;
   flagcxInnerComm_t homoInterComm;
-  flagcxInnerComm_t tunerInnerComm; // innerComm selected by tuner
   // experimental for multi-nic support
   int homoInterRootRank;
   int homoInterMyRank;
@@ -51,8 +50,13 @@ struct flagcxComm {
   std::vector<flagcxVendorType> clusterVendorMap;
   struct flagcxTuner *tuner;
   void *tunerContext;
-  std::map<struct flagcxCommTag, flagcxInnerComm_t>
+  std::map<struct TunerCollCategory, flagcxInnerComm_t>
       homoCommMap; // key: commTag returned by tuner
+  std::map<struct TunerCollCategory, flagcxInnerComm_t>
+      homoBestCommMap;              // key: commTag returned by tuner
+  flagcxInnerComm_t tunerInnerComm; // innerComm selected by tuner
+  flagcxUniqueId_t commId;
+  flagcxUniqueId *uniqueIdData;
 };
 
 #endif // end include guard
