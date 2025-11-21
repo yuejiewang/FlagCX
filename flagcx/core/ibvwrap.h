@@ -19,6 +19,7 @@
 #endif
 
 #include "core.h"
+#include <errno.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -102,6 +103,23 @@ flagcxResult_t flagcxWrapIbvQueryEce(struct ibv_qp *qp, struct ibv_ece *ece,
                                      int *supported);
 flagcxResult_t flagcxWrapIbvSetEce(struct ibv_qp *qp, struct ibv_ece *ece,
                                    int *supported);
+/* SRQ support */
+flagcxResult_t flagcxWrapIbvCreateSrq(struct ibv_srq **ret, struct ibv_pd *pd,
+                                      struct ibv_srq_init_attr *srq_init_attr);
+flagcxResult_t flagcxWrapIbvDestroySrq(struct ibv_srq *srq);
+
+static inline flagcxResult_t
+flagcxWrapIbvPostSrqRecv(struct ibv_srq *srq, struct ibv_recv_wr *wr,
+                         struct ibv_recv_wr **bad_wr) {
+  int ret = srq->context->ops.post_srq_recv(
+      srq, wr, bad_wr); /*returns 0 on success, or the value of errno on failure
+                          (which indicates the failure reason)*/
+  if (ret != IBV_SUCCESS) {
+    WARN("ibv_post_srq_recv() failed with error %s", strerror(ret));
+    return flagcxSystemError;
+  }
+  return flagcxSuccess;
+}
 
 static inline flagcxResult_t
 flagcxWrapIbvPostSend(struct ibv_qp *qp, struct ibv_send_wr *wr,
@@ -110,8 +128,11 @@ flagcxWrapIbvPostSend(struct ibv_qp *qp, struct ibv_send_wr *wr,
       qp, wr, bad_wr); /*returns 0 on success, or the value of errno on failure
                           (which indicates the failure reason)*/
   if (ret != IBV_SUCCESS) {
-    WARN("ibv_post_send() failed with error %s, Bad WR %p, First WR %p",
-         strerror(ret), wr, *bad_wr);
+    // Don't warn on ENOMEM (Cannot allocate memory) as it's expected when send queue is full
+    if (ret != ENOMEM) {
+      WARN("ibv_post_send() failed with error %s, Bad WR %p, First WR %p",
+           strerror(ret), wr, *bad_wr);
+    }
     return flagcxSystemError;
   }
   return flagcxSuccess;

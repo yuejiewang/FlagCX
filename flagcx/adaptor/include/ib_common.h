@@ -1,6 +1,5 @@
 /*************************************************************************
- * Copyright (c) 2024, FlagCX Inc.
- * All rights reserved.
+ * Copyright (c) 2023 BAAI. All rights reserved.
  *
  * This file contains common InfiniBand structures and constants
  * shared between IBRC and UCX adaptors.
@@ -11,6 +10,7 @@
 
 #include "flagcx_net.h"
 #include "ibvcore.h"
+#include "ibvwrap.h"
 #include "net.h"
 #include <pthread.h>
 #include <stdint.h>
@@ -125,8 +125,106 @@ struct flagcxIbMrHandle {
 #define FLAGCX_NET_IB_REQ_SEND 1
 #define FLAGCX_NET_IB_REQ_RECV 2
 #define FLAGCX_NET_IB_REQ_FLUSH 3
+#define FLAGCX_NET_IB_REQ_ACK 4
 
 extern const char *reqTypeStr[];
+
+#define FLAGCX_IB_RETRANS_MAX_INFLIGHT 2048
+#define FLAGCX_IB_RETRANS_BUFFER_SIZE 1024
+#define FLAGCX_IB_RETRANS_MAX_CHUNK_SIZE (8 * 1024 * 1024)
+#define FLAGCX_IB_SRQ_SIZE 1024
+
+#define FLAGCX_IB_ACK_BUF_PADDING 40
+#define FLAGCX_IB_ACK_BUF_COUNT 64
+
+struct flagcxIbRetransHdr {
+  uint32_t magic;
+  uint32_t seq;
+  uint32_t size;
+  uint32_t rkey;
+  uint64_t remoteAddr;
+  uint32_t immData;
+  uint32_t padding;
+} __attribute__((packed));
+
+struct flagcxIbAckMsg {
+  uint16_t peerId;
+  uint16_t flowId;
+  uint16_t path;
+  uint16_t ackSeq;
+  uint16_t sackBitmapCount;
+  uint16_t padding;
+  uint64_t timestampUs;
+  uint64_t sackBitmap;
+} __attribute__((packed));
+
+struct flagcxIbCtrlQp {
+  struct ibv_qp *qp;
+  struct ibv_cq *cq;
+  struct ibv_ah *ah;
+  uint32_t remoteQpn;
+  uint32_t remoteQkey;
+};
+
+struct flagcxIbRetransRecvBuf {
+  void *buffer;
+  struct ibv_mr *mr;
+  size_t size;
+  int inUse;
+};
+
+struct flagcxIbSrqMgr {
+  void *srq;
+  struct ibv_cq *cq;
+  struct flagcxIbRetransRecvBuf bufs[FLAGCX_IB_SRQ_SIZE];
+  int bufCount;
+  // Buffer management for SRQ (similar to UCCL)
+  int freeBufIndices[FLAGCX_IB_SRQ_SIZE]; // Stack of free buffer indices
+  int freeBufCount;                       // Number of free buffers available
+  int postSrqCount; // Number of recv WRs that need to be posted to SRQ
+};
+
+struct flagcxIbRetransEntry {
+  uint32_t seq;
+  uint32_t size;
+  uint64_t sendTimeUs;
+  uint64_t remoteAddr;
+  void *data;
+  uint32_t lkeys[FLAGCX_IB_MAX_DEVS_PER_NIC];
+  uint32_t rkeys[FLAGCX_IB_MAX_DEVS_PER_NIC];
+  int retry_count;
+  int valid;
+};
+
+struct flagcxIbRetransState {
+  uint32_t sendSeq;
+  uint32_t sendUna;
+  uint32_t recvSeq;
+
+  struct flagcxIbRetransEntry buffer[FLAGCX_IB_RETRANS_MAX_INFLIGHT];
+  int bufferHead;
+  int bufferTail;
+  int bufferCount;
+
+  uint64_t lastAckTimeUs;
+  uint64_t rtoUs;
+  uint64_t srttUs;
+  uint64_t rttvarUs;
+
+  uint64_t totalSent;
+  uint64_t totalRetrans;
+  uint64_t totalAcked;
+  uint64_t totalTimeout;
+
+  int enabled;
+  int maxRetry;
+  int ackInterval;
+  uint32_t minRtoUs;
+  uint32_t maxRtoUs;
+  int retransQPIndex;
+  uint32_t lastAckSeq;
+  uint64_t lastAckSendTimeUs;
+};
 
 struct flagcxIbQp {
   struct ibv_qp *qp;
@@ -176,6 +274,11 @@ struct flagcxIbConnectionMetadata {
   char devName[MAX_MERGED_DEV_NAME];
   uint64_t fifoAddr;
   int ndevs;
+
+  uint32_t ctrlQpn[FLAGCX_IB_MAX_DEVS_PER_NIC];
+  union ibv_gid ctrlGid[FLAGCX_IB_MAX_DEVS_PER_NIC];
+  uint16_t ctrlLid[FLAGCX_IB_MAX_DEVS_PER_NIC];
+  int retransEnabled;
 };
 
 struct flagcxIbNetCommDevBase {
@@ -199,6 +302,10 @@ struct flagcxIbRemSizesFifo {
 struct flagcxIbSendCommDev {
   struct flagcxIbNetCommDevBase base;
   struct ibv_mr *fifoMr;
+
+  struct flagcxIbCtrlQp ctrlQp;
+  struct ibv_mr *ackMr;
+  void *ackBuffer;
 };
 
 struct alignas(32) flagcxIbNetCommBase {
@@ -226,7 +333,17 @@ struct flagcxIbSendComm {
   struct ibv_send_wr wrs[FLAGCX_NET_IB_MAX_RECVS + 1];
   struct flagcxIbRemSizesFifo remSizesFifo;
   uint64_t fifoHead;
-  int ar; // Use adaptive routing when all merged devices have it enabled
+  int ar;
+
+  struct flagcxIbRetransState retrans;
+  uint64_t last_timeout_check_us;
+
+  int outstanding_sends;
+  int outstanding_retrans;
+  int max_outstanding;
+
+  struct flagcxIbRetransHdr retrans_hdr_pool[32];
+  struct ibv_mr *retrans_hdr_mr;
 };
 
 struct flagcxIbGpuFlush {
@@ -249,6 +366,13 @@ struct alignas(16) flagcxIbRecvCommDev {
   struct ibv_mr *fifoMr;
   struct ibv_sge fifoSge;
   struct ibv_mr *sizesFifoMr;
+  struct flagcxIbCtrlQp ctrlQp;
+  struct ibv_mr *ackMr;
+  void *ackBuffer;
+
+  void *retransRecvBufs[32];
+  struct ibv_mr *retransRecvMr;
+  int retransRecvBufCount;
 };
 
 struct alignas(32) flagcxIbRecvComm {
@@ -258,6 +382,9 @@ struct alignas(32) flagcxIbRecvComm {
   int sizesFifo[MAX_REQUESTS][FLAGCX_NET_IB_MAX_RECVS];
   int gpuFlushHostMem;
   int flushEnabled;
+
+  struct flagcxIbRetransState retrans;
+  struct flagcxIbSrqMgr srqMgr;
 };
 
 // Global arrays (declared as extern, defined in adaptor files)
@@ -326,6 +453,24 @@ extern flagcxResult_t flagcxIbDevices(int *ndev);
 extern flagcxResult_t flagcxIbGdrSupport(void);
 extern flagcxResult_t flagcxIbDmaBufSupport(int dev);
 extern flagcxResult_t flagcxIbFreeRequest(struct flagcxIbRequest *r);
+
+struct flagcxIbCommonTestOps {
+  const char *component;
+  flagcxResult_t (*pre_check)(struct flagcxIbRequest *req);
+  flagcxResult_t (*process_wc)(struct flagcxIbRequest *req, struct ibv_wc *wc,
+                               int devIndex, bool *handled);
+};
+
+flagcxResult_t
+flagcxIbCommonPostFifo(struct flagcxIbRecvComm *comm, int n, void **data,
+                       size_t *sizes, int *tags, void **mhandles,
+                       struct flagcxIbRequest *req,
+                       void (*addEventFunc)(struct flagcxIbRequest *, int,
+                                            struct flagcxIbNetCommDevBase *));
+
+flagcxResult_t
+flagcxIbCommonTestDataQp(struct flagcxIbRequest *r, int *done, int *sizes,
+                         const struct flagcxIbCommonTestOps *ops);
 
 static_assert((sizeof(struct flagcxIbNetCommBase) % 32) == 0,
               "flagcxIbNetCommBase size must be 32-byte multiple to ensure "
