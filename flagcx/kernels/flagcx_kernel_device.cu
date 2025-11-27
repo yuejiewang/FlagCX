@@ -2,10 +2,6 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 
-#ifndef flagcxTriggerMask
-#define flagcxTriggerMask(w) ((w == 64) ? ~0ull : ((1ull << w) - 1))
-#endif
-
 FLAGCX_DEVICE_INLINE_DECORATOR void spinBackoff(int iter) {
   int delay = 1 << (iter < 15 ? iter : 15);
 #if __CUDA_ARCH__ >= 700
@@ -15,7 +11,6 @@ FLAGCX_DEVICE_INLINE_DECORATOR void spinBackoff(int iter) {
   while (clock64() - start < (uint64_t)delay) { /* spin */
   }
 #endif
-}
 
 FLAGCX_DEVICE_DECORATOR size_t
 getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype) {
