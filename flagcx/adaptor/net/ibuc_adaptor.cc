@@ -2264,9 +2264,7 @@ struct flagcxNetAdaptor flagcxNetIbuc = {
     flagcxIbucIsend, flagcxIbucIrecv, flagcxIbucIflush, flagcxIbucTest,
 
     // One-sided functions
-    NULL, // write
-    NULL, // read
-    NULL, // signal
+    NULL, NULL, NULL, // put, putSignal, waitValue
 
     // Device name lookup
     flagcxIbucGetDevFromName};

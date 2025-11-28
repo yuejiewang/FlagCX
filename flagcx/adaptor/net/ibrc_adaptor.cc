@@ -835,8 +835,10 @@ ib_connect_check:
   for (int q = 0; q < comm->base.nqps; q++) {
     flagcxIbSendCommDev *commDev = comm->devs + devIndex;
     flagcxIbDev *ibDev = flagcxIbDevs + commDev->base.ibDevN;
-    FLAGCXCHECK(flagcxIbCreateQp(ibDev->portNum, &commDev->base,
-                                 IBV_ACCESS_REMOTE_WRITE, comm->base.qps + q));
+    FLAGCXCHECK(
+        flagcxIbCreateQp(ibDev->portNum, &commDev->base,
+                         IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC,
+                         comm->base.qps + q));
     comm->base.qps[q].devIndex = devIndex;
     meta.qpInfo[q].qpn = comm->base.qps[q].qp->qp_num;
     meta.qpInfo[q].devIndex = comm->base.qps[q].devIndex;
@@ -1308,8 +1310,9 @@ ib_recv:
     // Local ibDevN
     ibDevN = rComm->devs[devIndex].base.ibDevN;
     ibDev = flagcxIbDevs + ibDevN;
-    FLAGCXCHECK(flagcxIbCreateQp(ibDev->portNum, &rCommDev->base,
-                                 IBV_ACCESS_REMOTE_WRITE, qp));
+    FLAGCXCHECK(flagcxIbCreateQp(
+        ibDev->portNum, &rCommDev->base,
+        IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC, qp));
     qp->devIndex = devIndex;
     devIndex = (devIndex + 1) % rComm->base.ndevs;
 
@@ -1573,7 +1576,7 @@ flagcxResult_t flagcxIbRegMrDmaBufInternal(flagcxIbNetCommDevBase *base,
       // Deregister / register
       struct ibv_mr *mr;
       unsigned int flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                           IBV_ACCESS_REMOTE_READ;
+                           IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC;
       if (flagcxIbRelaxedOrderingEnabled)
         flags |= IBV_ACCESS_RELAXED_ORDERING;
       if (fd != -1) {
@@ -2418,7 +2421,111 @@ flagcxResult_t flagcxIbGetProperties(int dev, void *props) {
   properties->netDeviceVersion = FLAGCX_NET_DEVICE_INVALID_VERSION;
   return flagcxSuccess;
 }
+flagcxResult_t flagcxIbPut(void *sendComm, uint64_t srcOff, uint64_t dstOff,
+                           size_t size, int srcRank, int dstRank,
+                           void **gHandles, void **request) {
+  struct flagcxIbSendComm *comm = (struct flagcxIbSendComm *)sendComm;
+  struct flagcxIbGlobalHandleInfo *info =
+      (struct flagcxIbGlobalHandleInfo *)gHandles;
 
+  struct flagcxIbQp *qp = &comm->base.qps[0];
+  void *srcPtr = (void *)(info->base_vas[srcRank] + srcOff);
+  void *dstPtr = (void *)(info->base_vas[dstRank] + dstOff);
+  int lkey = info->lkeys[srcRank];
+  int rkey = info->rkeys[dstRank];
+  struct flagcxIbRequest *req;
+  FLAGCXCHECK(flagcxIbGetRequest(&comm->base, &req));
+  req->type = FLAGCX_NET_IB_REQ_IPUT;
+  req->sock = &comm->base.sock;
+  for (int i = 0; i < comm->base.ndevs; i++) {
+    req->devBases[i] = &comm->devs[i].base;
+  }
+
+  struct ibv_send_wr wr;
+  memset(&wr, 0, sizeof(wr));
+  struct ibv_sge sge;
+  memset(&sge, 0, sizeof(sge));
+
+  wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.wr_id = req - comm->base.reqs;
+  wr.next = NULL;
+  wr.wr.rdma.remote_addr = (uint64_t)dstPtr;
+  wr.wr.rdma.rkey = rkey;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+
+  sge.addr = (uintptr_t)srcPtr; // Local buffer address
+  sge.length = size;            // Size of the transfer
+  sge.lkey = lkey;              // Local key
+
+  struct ibv_send_wr *bad_wr;
+  FLAGCXCHECK(flagcxWrapIbvPostSend(qp->qp, &wr, &bad_wr));
+  flagcxIbAddEvent(req, qp->devIndex, &comm->devs[qp->devIndex].base);
+
+  *request = req;
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxIbPutSignal(void *sendComm, uint64_t dstOff, int tag,
+                                 int srcRank, int dstRank, void **gHandles,
+                                 void **request) {
+  struct flagcxIbSendComm *comm = (struct flagcxIbSendComm *)sendComm;
+  struct flagcxIbGlobalHandleInfo *info =
+      (struct flagcxIbGlobalHandleInfo *)gHandles;
+
+  struct flagcxIbQp *qp = &comm->base.qps[0];
+  int devIndex = qp->devIndex;
+  void *dstPtr = (void *)(info->base_vas[dstRank] + dstOff);
+  int rkey = info->rkeys[dstRank];
+  struct flagcxIbRequest *req;
+  FLAGCXCHECK(flagcxIbGetRequest(&comm->base, &req));
+  req->type = FLAGCX_NET_IB_REQ_IPUT;
+  req->sock = &comm->base.sock;
+  for (int i = 0; i < comm->base.ndevs; i++) {
+    req->devBases[i] = &comm->devs[i].base;
+  }
+
+  struct ibv_send_wr wr;
+  memset(&wr, 0, sizeof(wr));
+  struct ibv_sge sge;
+  memset(&sge, 0, sizeof(sge));
+  wr.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.wr_id = req - comm->base.reqs;
+  wr.next = NULL;
+  wr.wr.atomic.remote_addr = (uint64_t)dstPtr;
+  wr.wr.atomic.compare_add = 1;
+  wr.wr.atomic.rkey = rkey;
+  wr.imm_data = (uint32_t)tag;
+
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+
+  sge.addr = (uintptr_t)&comm->fifo;
+  sge.length = sizeof(comm->fifo);
+  sge.lkey = comm->devs[devIndex].fifoMr->lkey;
+  struct ibv_send_wr *bad_wr;
+  FLAGCXCHECK(flagcxWrapIbvPostSend(qp->qp, &wr, &bad_wr));
+  flagcxIbAddEvent(req, qp->devIndex, &comm->devs[qp->devIndex].base);
+
+  *request = req;
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxIbWaitValue(void **gHandles, int rank, uint64_t offset,
+                                 uint64_t expected) {
+  struct flagcxIbGlobalHandleInfo *info =
+      (struct flagcxIbGlobalHandleInfo *)gHandles;
+  volatile uint64_t *addr =
+      (volatile uint64_t *)(info->base_vas[rank] + offset);
+
+  while (__atomic_load_n(addr, __ATOMIC_ACQUIRE) != expected) {
+    sched_yield();
+  }
+
+  return flagcxSuccess;
+}
 // Adapter wrapper functions
 
 struct flagcxNetAdaptor flagcxNetIb = {
@@ -2439,9 +2546,7 @@ struct flagcxNetAdaptor flagcxNetIb = {
     flagcxIbIsend, flagcxIbIrecv, flagcxIbIflush, flagcxIbTest,
 
     // One-sided functions
-    NULL, // write
-    NULL, // read
-    NULL, // signal
+    flagcxIbPut, flagcxIbPutSignal, flagcxIbWaitValue,
 
     // Device name lookup
     flagcxIbGetDevFromName};
