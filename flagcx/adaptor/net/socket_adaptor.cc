@@ -697,9 +697,7 @@ flagcxNetAdaptor flagcxNetSocket = {
     flagcxNetSocketTest,
 
     // One-sided functions
-    NULL, // write - not implemented
-    NULL, // read - not implemented
-    NULL, // signal - not implemented
+    NULL, NULL, NULL, // put, putSignal, waitValue
 
     // Device name lookup
     NULL, // getDevFromName

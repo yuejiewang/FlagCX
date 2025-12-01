@@ -121,11 +121,18 @@ struct flagcxIbMrHandle {
   ibv_mr *mrs[FLAGCX_IB_MAX_DEVS_PER_NIC];
 };
 
+// Structure to store handle info for allgather
+struct flagcxIbGlobalHandleInfo {
+  uintptr_t *base_vas;
+  uint32_t *rkeys;
+  uint32_t *lkeys;
+};
+
 #define FLAGCX_NET_IB_REQ_UNUSED 0
 #define FLAGCX_NET_IB_REQ_SEND 1
 #define FLAGCX_NET_IB_REQ_RECV 2
 #define FLAGCX_NET_IB_REQ_FLUSH 3
-#define FLAGCX_NET_IB_REQ_ACK 4
+#define FLAGCX_NET_IB_REQ_IPUT 4
 
 extern const char *reqTypeStr[];
 
@@ -329,8 +336,8 @@ struct flagcxIbSendComm {
   // Each dev correlates to a mergedIbDev
   struct flagcxIbSendCommDev devs[FLAGCX_IB_MAX_DEVS_PER_NIC];
   struct flagcxIbRequest *fifoReqs[MAX_REQUESTS][FLAGCX_NET_IB_MAX_RECVS];
-  struct ibv_sge sges[FLAGCX_NET_IB_MAX_RECVS];
-  struct ibv_send_wr wrs[FLAGCX_NET_IB_MAX_RECVS + 1];
+  alignas(32) struct ibv_sge sges[FLAGCX_NET_IB_MAX_RECVS];
+  alignas(32) struct ibv_send_wr wrs[FLAGCX_NET_IB_MAX_RECVS + 1];
   struct flagcxIbRemSizesFifo remSizesFifo;
   uint64_t fifoHead;
   int ar;

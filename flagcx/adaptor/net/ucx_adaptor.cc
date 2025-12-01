@@ -1509,9 +1509,7 @@ struct flagcxNetAdaptor flagcxNetUcx = {
     flagcxUcxTest,   // test
 
     // One-sided functions
-    NULL, // write - TODO: Implement
-    NULL, // read - TODO: Implement
-    NULL, // signal - TODO: Implement
+    NULL, NULL, NULL, // put, putSignal, waitValue
 
     // Device name lookup
     flagcxUcxGetDevFromName // getDevFromName
