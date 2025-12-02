@@ -269,7 +269,8 @@ INCLUDEDIR := \
 	$(abspath flagcx/adaptor/include) \
 	$(abspath flagcx/runner/include) \
 	$(abspath flagcx/core/include) \
-	$(abspath flagcx/service/include)
+	$(abspath flagcx/service/include) \
+	$(abspath third-party/json/single_include)
 
 LIBSRCFILES:= \
 	$(wildcard flagcx/*.cc) \

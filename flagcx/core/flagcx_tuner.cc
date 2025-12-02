@@ -6,6 +6,7 @@
 #include "tuner_util.h"
 #include "utils.h"
 #include <cfloat>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -129,6 +130,12 @@ struct flagcxTunerContext {
   std::map<struct TunerCommTagCounterKey, int>
       configCounterMap; // record per (collType,nBytes,configIdx) counter.
 
+  int commConfigId = 0; // record the current communicator config id, used when
+                        // tuning with FlagScale
+
+  int bestConfigId = -1; // record the best communicator config id, used when
+                         // tuning with FlagScale
+
   // timer
   flagcxTimer<TunerProfileKey> timer;
 };
@@ -209,6 +216,10 @@ flagcxResult_t flagcxTunerInit(size_t nRanks, size_t nNodes,
   // initialize profilingResults pointer
   FLAGCXCHECK(
       flagcxCalloc(&internalTuner.profilingResults, internalTuner.nranks));
+  if (flagcxGetEnv("TUNING_WITH_FLAGSCALE")) {
+    setenv("FLAGCX_TUNER_DONE", "0", 1);
+    return flagcxSuccess;
+  }
   // start timer
   ctx->timer.start();
   return flagcxSuccess;
@@ -497,6 +508,159 @@ flagcxResult_t flagcxTunerGetCollInfo(void *context, flagcxCommOp_t collType,
   return flagcxSuccess;
 }
 
+// Handle flagscale tuning logic
+// This function processes flagscale tuning configuration:
+// 1. Matches the collective operation and size against tune_objects to
+// determine
+//    if this comm needs tuning (sets comm->isTunningComm)
+// 2. Reads FLAGCX_TUNER_CONFIG_ID and FLAGCX_TUNER_BEST_CONFIG_ID from
+// environment
+// 3. Switches communicator config if config_id increments by 1
+// Returns flagcxSuccess on success, flagcxInternalError if config_id is invalid
+flagcxResult_t flagcxHandleFlagscaleTuning(flagcxComm_t comm,
+                                           flagcxCommOp_t commOp,
+                                           size_t nBytes) {
+  // Execute matching only once when tune_objects has values
+  static bool matchingDone = false;
+  if (!matchingDone) {
+    // Determine if this comm needs tuning
+    FlagScaleConfig config = readFlagScaleJson();
+    if (!config.tune_objects.empty()) {
+      bool isTuningComm = false;
+      flagcxCommOp_t currentCommOp = commOp;
+      for (size_t idx = 0; idx < config.tune_objects.size(); ++idx) {
+        const TuneObject &item = config.tune_objects[idx];
+        std::string opStr = getTuneObjectCommOp(item);
+        flagcxCommOp_t tuneCommOp = commOpStringToEnum(opStr);
+        if (tuneCommOp == currentCommOp && item.nBytes == (int64_t)nBytes) {
+          isTuningComm = true;
+          break;
+        }
+      }
+      comm->isTunningComm = isTuningComm;
+      matchingDone = true;
+    }
+  }
+
+  // If not tuning this comm, directly return
+  if (!comm->isTunningComm) {
+    return flagcxSuccess;
+  }
+
+  // Need tuning this comm
+  // Handle config_id logic
+  static int lastFlagscaleConfigId = -1;
+  const char *configIdEnv = getenv("FLAGCX_TUNER_CONFIG_ID");
+  const int config_id = (configIdEnv != NULL) ? atoi(configIdEnv) : -1;
+  const char *bestConfigIdEnv = getenv("FLAGCX_TUNER_BEST_CONFIG_ID");
+  const int bestConfigId =
+      (bestConfigIdEnv != NULL) ? atoi(bestConfigIdEnv) : -1;
+
+  // if config_id is -1, use the default communicator config
+  if (config_id == -1) {
+    return flagcxSuccess;
+  }
+
+  // if config_id is greater than lastFlagscaleConfigId by 1,
+  // switch to the new communicator config
+  if (config_id - lastFlagscaleConfigId == 1) {
+    lastFlagscaleConfigId = config_id;
+    FLAGCXCHECK(
+        comm->tuner->switchCommConfig(comm->tunerContext, &comm, bestConfigId));
+    return flagcxSuccess;
+  }
+
+  // if config_id is equal to lastFlagscaleConfigId, don't switch communicator
+  // config
+  if (config_id - lastFlagscaleConfigId == 0) {
+    return flagcxSuccess; // Should call call() and return
+  }
+
+  // Invalid config_id
+  WARN("config_id=%d is invalid", config_id);
+  return flagcxInternalError;
+}
+
+flagcxResult_t flagcxTunerSwitchCommConfig(void *context, flagcxComm_t *comm,
+                                           int bestConfigId) {
+  struct flagcxTunerContext *ctx =
+      static_cast<struct flagcxTunerContext *>(context);
+
+  if (ctx->commConfigId < ctx->configList.size()) {
+    if (bestConfigId != -1) {
+      WARN("bestConfigId=%d is not -1, but commConfigId=%d is less than "
+           "configList.size()=%zu",
+           bestConfigId, ctx->commConfigId, ctx->configList.size());
+      return flagcxInternalError;
+    }
+
+    const auto &cfg = ctx->configList[ctx->commConfigId];
+    auto inner = (*comm)->tunerInnerComm;
+    if (inner == nullptr) {
+      WARN("comm->tunerInnerComm is null");
+      return flagcxInternalError;
+    }
+
+    FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->commDestroy(inner));
+    FLAGCXCHECK(setEnvConfig(cfg, FLAGCX_ENV_TYPE_CREATION));
+    flagcxInnerComm_t newInner = NULL;
+    FLAGCXCHECK(
+        flagcxHomoCommInit((*comm)->commId, (*comm)->uniqueIdData,
+                           (struct bootstrapState *)((*comm)->tuner->bootstrap),
+                           *comm, &newInner));
+    (*comm)->tunerInnerComm = newInner;
+    (*comm)->homo_comm = newInner;
+    FLAGCXCHECK(setEnvConfig(cfg, FLAGCX_ENV_TYPE_COLL));
+    INFO(FLAGCX_TUNING, "switch to the new communicator config, config_id=%d",
+         ctx->commConfigId);
+    ctx->commConfigId += 1;
+    // if all communicator configurations have been tested, set the environment
+    // variable FLAGCX_TUNER_DONE to 1
+    if (ctx->commConfigId >= ctx->configList.size()) {
+      setenv("FLAGCX_TUNER_DONE", "1", 1);
+      INFO(FLAGCX_TUNING,
+           "Tuning completed: all %zu communicator configurations have been "
+           "tested. ENV FLAGCX_TUNER_DONE=%s",
+           ctx->configList.size(), getenv("FLAGCX_TUNER_DONE"));
+    }
+    return flagcxSuccess;
+  }
+
+  if (bestConfigId != -1 && ctx->bestConfigId == -1) {
+    ctx->bestConfigId = bestConfigId;
+    const auto &cfg = ctx->configList[ctx->bestConfigId];
+    auto inner = (*comm)->tunerInnerComm;
+    if (inner == nullptr) {
+      WARN("comm->tunerInnerComm is null");
+      return flagcxInternalError;
+    }
+
+    FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->commDestroy(inner));
+    FLAGCXCHECK(setEnvConfig(cfg, FLAGCX_ENV_TYPE_CREATION));
+    flagcxInnerComm_t newInner = NULL;
+    FLAGCXCHECK(
+        flagcxHomoCommInit((*comm)->commId, (*comm)->uniqueIdData,
+                           (struct bootstrapState *)((*comm)->tuner->bootstrap),
+                           *comm, &newInner));
+    (*comm)->tunerInnerComm = newInner;
+    (*comm)->homo_comm = newInner;
+    FLAGCXCHECK(setEnvConfig(cfg, FLAGCX_ENV_TYPE_COLL));
+    std::stringstream msg;
+    msg << "Best Envs: ";
+    for (int i = 0; i < cfg.envCount; i++) {
+      msg << cfg.envs[i].name << "=" << cfg.envs[i].value
+          << "(default=" << cfg.envs[i].defaultValue << ")";
+      if (i < cfg.envCount - 1) {
+        msg << "  ";
+      }
+    }
+    INFO(FLAGCX_TUNING, "switch to the best config, config_id=%d. %s",
+         ctx->bestConfigId, msg.str().c_str());
+    return flagcxSuccess;
+  }
+  return flagcxSuccess;
+}
+
 flagcxResult_t flagcxTunerStartProfiling(void *context, flagcxCommOp_t collType,
                                          size_t nBytes, flagcxStream_t stream,
                                          const struct flagcxCommTag *commTag,
@@ -593,4 +757,6 @@ flagcxTuner_t internalTuner = {"internal tuner",
                                flagcxTunerStartProfiling,
                                flagcxTunerStopProfiling,
                                flagcxTunerDestroy,
-                               flagcxCreateOrReplaceHomoComm};
+                               flagcxCreateOrReplaceHomoComm,
+                               flagcxTunerSwitchCommConfig,
+                               flagcxHandleFlagscaleTuning};

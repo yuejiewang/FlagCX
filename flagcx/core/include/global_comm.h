@@ -57,6 +57,8 @@ struct flagcxComm {
   flagcxInnerComm_t tunerInnerComm; // innerComm selected by tuner
   flagcxUniqueId_t commId;
   flagcxUniqueId *uniqueIdData;
+  bool isTuningWithFlagscale; // whether tuning with flagscale
+  bool isTunningComm;         // whether tuning the communicator
 };
 
 #endif // end include guard

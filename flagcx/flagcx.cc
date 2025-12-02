@@ -402,6 +402,17 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
     (*comm)->commId = commId;
     (*comm)->uniqueIdData = uniqueIdData;
     (*comm)->tunerInnerComm = NULL;
+    (*comm)->isTunningComm = false;
+    (*comm)->isTuningWithFlagscale = false;
+    bool isTuningWithFlagscale = false;
+    const char *isTuningWithFlagscaleEnv =
+        flagcxGetEnv("TUNING_WITH_FLAGSCALE");
+    if (isTuningWithFlagscaleEnv) {
+      isTuningWithFlagscale =
+          (std::stoi(isTuningWithFlagscaleEnv) == 1) ? true : false;
+    }
+    (*comm)->isTuningWithFlagscale = isTuningWithFlagscale;
+
     FLAGCXCHECK((*comm)->tuner->init((*comm)->nranks, 0, flagcxDebugLog,
                                      &((*comm)->tunerContext)));
     uint32_t nConfigs = 0;
@@ -413,6 +424,16 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
     }
     (*comm)->homoCommMap.clear();
     (*comm)->homoBestCommMap.clear();
+    if (isTuningWithFlagscale) {
+      // Create a default communicator based on the default config
+      flagcxInnerComm_t innerComm = NULL;
+      FLAGCXCHECK(
+          flagcxHomoCommInit(commId, uniqueIdData, state, *comm, &innerComm));
+      // Insert item into homoCommMap
+      (*comm)->tunerInnerComm = innerComm;
+      // For backward compatible, also assign homo_comm field.
+      (*comm)->homo_comm = innerComm;
+    }
   } else {
     (*comm)->tuner = NULL;
     FLAGCXCHECK(flagcxHomoCommInit(commId, uniqueIdData, state, *comm,

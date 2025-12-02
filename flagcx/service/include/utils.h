@@ -16,13 +16,16 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <new>
+#include <nlohmann/json.hpp>
 #include <sched.h>
 #include <stdint.h>
+#include <string>
 #include <time.h>
+#include <vector>
 
 #define LOADAPI(struct, api, ptr)                                              \
   api:                                                                         \
-  (typeof(struct ::api)) ptr
+  (typeof(struct ::api))ptr
 
 // PCI Bus ID <-> int64 conversion functions
 flagcxResult_t int64ToBusId(int64_t id, char *busId);
@@ -710,4 +713,34 @@ void max(void *res, const void *op1, const void *op2, size_t n) {
 
 void *flagcxOpenLib(const char *path, int flags,
                     void (*error_handler)(const char *, int, const char *));
+
+////////////////////////////////////////////////////////////////////////////////
+// FlagScale configuration structures and functions
+
+struct TuneObject {
+  std::string commOp;
+  int64_t nBytes;
+
+  // Construct from JSON
+  TuneObject(const nlohmann::json &j);
+};
+
+struct FlagScaleConfig {
+  std::vector<TuneObject> tune_objects;
+  int config_id;
+  int best_config_id;
+};
+
+// Read flagscale.json file and return all values （for tuning）
+FlagScaleConfig readFlagScaleJson(const std::string &filename = "");
+
+// Convert commOp string to flagcxCommOp_t enum
+flagcxCommOp_t commOpStringToEnum(const std::string &commOpStr);
+
+// Helper function to get commOp from TuneObject (avoids macro parameter
+// substitution)
+inline std::string getTuneObjectCommOp(const TuneObject &obj) {
+  return obj.commOp;
+}
+
 #endif
