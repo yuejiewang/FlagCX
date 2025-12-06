@@ -8,13 +8,13 @@
 #include "shmutils.h"
 #include "transport.h"
 #include <stddef.h>
-#define FLAGCX_P2P_BUFFERSIZE                                                  \
-  (64ULL * 1024 * 1024) // 64MB buffer for P2P transfers
-#define FLAGCX_P2P_CHUNKSIZE (4ULL * 1024 * 1024) // 4MB chunk size
-#define FLAGCX_P2P_STEPS                                                       \
-  (FLAGCX_P2P_BUFFERSIZE / FLAGCX_P2P_CHUNKSIZE) // 16 steps
-#define FLAGCX_P2P_MAX_OPS                                                     \
-  32 // Maximum number of concurrent P2P operation pairs
+
+extern int64_t flagcxP2PBufferSize;
+extern int64_t flagcxP2PChunkSize;
+
+#define FLAGCX_P2P_MAX_STEPS  16
+#define FLAGCX_P2P_MAX_OPS                                                  \
+  (FLAGCX_P2P_MAX_STEPS * 2) // Maximum number of concurrent P2P operation pairs
 #define FLAGCX_P2P_IPC_HANDLE_SIZE 64
 
 #ifdef __cplusplus
@@ -79,7 +79,7 @@ struct flagcxP2pShmProxyInfo {
   // Device side
   char *recvFifo;
   flagcxStream_t stream;
-  flagcxEvent_t events[FLAGCX_P2P_STEPS];
+  flagcxEvent_t events[FLAGCX_P2P_MAX_STEPS];
 };
 
 struct flagcxP2pResources {

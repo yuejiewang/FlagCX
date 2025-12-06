@@ -6,6 +6,10 @@
 
 #include <errno.h>
 #include <string.h>
+#include <string>
+
+int64_t flagcxNetBufferSize;
+int64_t flagcxNetChunkSize;
 
 static pthread_mutex_t netLock = PTHREAD_MUTEX_INITIALIZER;
 // Use adaptor system for all network types
@@ -143,12 +147,12 @@ flagcxResult_t flagcxProxySend(sendNetResources *resources, void *data,
     int stepMask = args->sendStepMask;
 
     if (args->waitCopy < args->chunkSteps &&
-        args->waitCopy - args->transmitted < MAXSTEPS) {
+        args->waitCopy - args->transmitted < FLAGCX_NET_MAX_STEPS) {
       int step = args->waitCopy & stepMask;
       args->subs[step].stepSize =
           std::min(args->chunkSize, size - args->totalCopySize);
       if (!args->regBufFlag) {
-        args->subs[step].stepBuff = resources->buffers[0] + (CHUNKSIZE * step);
+        args->subs[step].stepBuff = resources->buffers[0] + (flagcxNetChunkSize * step);
         if (resources->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
           FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
               args->subs[step].stepBuff, (char *)data + args->totalCopySize,
@@ -164,7 +168,7 @@ flagcxResult_t flagcxProxySend(sendNetResources *resources, void *data,
                                                resources->cpStream));
       } else {
         args->subs[step].stepBuff =
-            (void *)((char *)data + (CHUNKSIZE * args->waitCopy));
+            (void *)((char *)data + (flagcxNetChunkSize * args->waitCopy));
       }
       args->totalCopySize += args->subs[step].stepSize;
       args->waitCopy++;
@@ -226,17 +230,17 @@ flagcxResult_t flagcxProxyRecv(recvNetResources *resources, void *data,
   if (args->copied < args->chunkSteps) {
     int stepMask = args->sendStepMask;
     if (args->posted < args->chunkSteps &&
-        args->posted - args->copied < MAXSTEPS) {
+        args->posted - args->copied < FLAGCX_NET_MAX_STEPS) {
       int tags[8] = {0};
       void *req = NULL;
       args->subs[args->posted & stepMask].stepSize =
           std::min(args->chunkSize, size - args->totalPostSize);
       if (!args->regBufFlag) {
         args->subs[args->posted & stepMask].stepBuff =
-            resources->buffers[0] + CHUNKSIZE * (args->posted & stepMask);
+            resources->buffers[0] + flagcxNetChunkSize * (args->posted & stepMask);
       } else {
         args->subs[args->posted & stepMask].stepBuff =
-            (void *)((char *)data + CHUNKSIZE * args->posted);
+            (void *)((char *)data + flagcxNetChunkSize * args->posted);
       }
       resources->netAdaptor->irecv(
           resources->netRecvComm, 1,
@@ -340,7 +344,7 @@ flagcxResult_t flagcxProxyRecv(recvNetResources *resources, void *data,
 }
 
 flagcxResult_t flagcxSendProxyFree(sendNetResources *resources) {
-  for (int s = 0; s < MAXSTEPS; s++) {
+  for (int s = 0; s < FLAGCX_NET_MAX_STEPS; s++) {
     FLAGCXCHECK(deviceAdaptor->eventDestroy(resources->cpEvents[s]));
   }
   FLAGCXCHECK(deviceAdaptor->streamDestroy(resources->cpStream));
@@ -356,7 +360,7 @@ flagcxResult_t flagcxSendProxyFree(sendNetResources *resources) {
 }
 
 flagcxResult_t flagcxRecvProxyFree(recvNetResources *resources) {
-  for (int s = 0; s < MAXSTEPS; s++) {
+  for (int s = 0; s < FLAGCX_NET_MAX_STEPS; s++) {
     FLAGCXCHECK(deviceAdaptor->eventDestroy(resources->cpEvents[s]));
   }
   FLAGCXCHECK(deviceAdaptor->streamDestroy(resources->cpStream));
