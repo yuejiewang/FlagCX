@@ -223,10 +223,10 @@ static flagcxResult_t initUniRunnerState(flagcxUniRunnerState *runnerState,
          (P2P_EVENT_POOL_SIZE + 63) / 64 * sizeof(uint64_t));
   // TRACE(FLAGCX_KERNEL, "initUniRunnerState bp15 (P2P event map initialized)");
 
-  INFO(FLAGCX_INIT,
-       "DAG scheduler initialized with %d-rank Ring AllReduce topology (%d "
-       "slices)",
-       nranks, numSlices);
+  TRACE(FLAGCX_INIT,
+        "DAG scheduler initialized with %d-rank Ring AllReduce topology (%d "
+        "slices)",
+        nranks, numSlices);
 
   return flagcxSuccess;
 }
@@ -401,7 +401,7 @@ static flagcxResult_t processInflightQueue(flagcxUniRunnerState *runnerState) {
       // Mark trigger as available
       // TRACE(FLAGCX_KERNEL, "processInflightQueue bp (node complete)");
       if (current->nodeType == uniRunnerDagNodeTypeP2p) {
-        runnerState->setAvail(current->nodeData.p2p.eventIdx);
+        runnerState->resetEvent(current->nodeData.p2p.eventIdx);
         current->nodeData.p2p.eventIdx = -1;
         current->nodeData.p2p.event = NULL;
         // TRACE(FLAGCX_KERNEL, "processInflightQueue bp3 (p2p marked
@@ -491,7 +491,9 @@ int flagcxUniRunnerState::getEvent() {
   return idx;
 }
 
-void flagcxUniRunnerState::setAvail(int idx) { p2pEventMap.markAvailable(idx); }
+void flagcxUniRunnerState::resetEvent(int idx) {
+  p2pEventMap.markAvailable(idx);
+}
 
 flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
                             flagcxDataType_t datatype, flagcxRedOp_t op,
