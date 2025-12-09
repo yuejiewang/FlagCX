@@ -88,6 +88,14 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
 
   int globalNodeIdx = 0;
 
+  /* reduce-scatter phase (nranks - 1 steps)
+   * slice = s, step = i
+   * p2pNodeIdx = s * nodesPerSlice + i * 2
+   * redNodeIdx = s * nodesPerSlice + i * 2 + 1
+   * all-gather phase (nranks - 1 steps)
+   * slice = s, step = i
+   * p2pNodeIdx = s * nodesPerSlice + (nranks - 1) * 2 + i
+   */
   for (int s = 0; s < numSlices; s++) {
     int sliceNodeBaseIdx = globalNodeIdx;
     size_t sliceOffsetInChunk = s * sliceCount * typeSize;
@@ -139,8 +147,8 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[redNodeIdx].nodeData.red.input1 =
           static_cast<void *>(static_cast<char *>(recvbuff) + rx_offset);
       runnerState->dagNodes[redNodeIdx].nodeData.red.input2 =
-          static_cast<void *>(static_cast<char *>(const_cast<void *>(sendbuff)) +
-                              rx_offset);
+          static_cast<void *>(
+              static_cast<char *>(const_cast<void *>(sendbuff)) + rx_offset);
       runnerState->dagNodes[redNodeIdx].nodeData.red.output =
           static_cast<void *>(static_cast<char *>(recvbuff) + rx_offset);
       runnerState->dagNodes[redNodeIdx].nodeData.red.count = sliceCount;
@@ -228,7 +236,8 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
   // TRACE(FLAGCX_KERNEL, "initUniRunnerState bp14 (P2P events created)");
   memset(runnerState->p2pEventMap.bits, 0,
          (P2P_EVENT_POOL_SIZE + 63) / 64 * sizeof(uint64_t));
-  // TRACE(FLAGCX_KERNEL, "initUniRunnerState bp15 (P2P event map initialized)");
+  // TRACE(FLAGCX_KERNEL, "initUniRunnerState bp15 (P2P event map
+  // initialized)");
 
   TRACE(FLAGCX_INIT,
         "DAG scheduler initialized with %d-rank Ring AllReduce topology (%d "
