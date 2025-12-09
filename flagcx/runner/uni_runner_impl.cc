@@ -36,12 +36,19 @@ static void dagQueueEnqueue(struct uniRunnerDagQueue *queue,
   queue->size++;
 }
 
-static flagcxResult_t initUniRunnerState(flagcxUniRunnerState *runnerState,
-                                         const void *sendbuff, void *recvbuff,
-                                         size_t count,
-                                         flagcxDataType_t datatype,
-                                         flagcxRedOp_t op, flagcxComm_t comm,
-                                         int numSlices = 1) {
+static flagcxResult_t initUniRunnerStateDummy() {
+  // Initialize queues
+  runnerState->readyQueue = {0};
+  runnerState->inflightQueue = {0};
+  runnerState->pendingQueue = {0};
+  return flagcxNotSupported;
+}
+
+static flagcxResult_t
+initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
+                         const void *sendbuff, void *recvbuff, size_t count,
+                         flagcxDataType_t datatype, flagcxRedOp_t op,
+                         flagcxComm_t comm, int numSlices = 1) {
   TRACE(FLAGCX_INIT, "rank %d initUniRunnerState called", comm->rank);
 
   // Initialize queues
@@ -497,11 +504,11 @@ void flagcxUniRunnerState::resetEvent(int idx) {
 
 flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
                             flagcxDataType_t datatype, flagcxRedOp_t op,
-                            flagcxComm_t comm, flagcxStream_t stream) {
+                            flagcxComm_t comm, flagcxStream_t stream,
+                            flagcxCommOp_t commOp) {
   flagcxFifo_t fifo = NULL;
   flagcxResult_t res = flagcxSuccess;
   flagcxHeteroComm_t hcomm = comm->hetero_comm;
-  size_t loop_counter = 0;
 
   // Set device context
   FLAGCXCHECKGOTO(deviceAdaptor->setDevice(hcomm->cudaDev), res, out);
@@ -517,6 +524,16 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
                       (void *)hcomm->proxyState->uniRunnerState.fifo->buffer),
                   res, out);
 
+  // Initialize DAG scheduler
+  if (commOp == flagcxCommOpAllReduce) {
+    FLAGCXCHECKGOTO(initUniRunnerStateRingAR(&hcomm->proxyState->uniRunnerState,
+                                             sendbuff, recvbuff, count,
+                                             datatype, op, comm),
+                    res, out);
+  } else {
+    FLAGCXCHECKGOTO(initUniRunnerStateDummy(), res, out);
+  }
+
   // Create a dedicated stream
   flagcxStream_t red_stream;
   FLAGCXCHECKGOTO(deviceAdaptor->streamCreate(&red_stream), res, out);
@@ -525,12 +542,6 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
   // Launch collective kernel
   flagcxLaunchCollectiveKernel(hcomm->uniRunnerFifoBuffer, UNIRUNNER_NTHREADS,
                                UNIRUNNER_NBLOCKS, red_stream);
-
-  // Initialize DAG scheduler
-  FLAGCXCHECKGOTO(initUniRunnerState(&hcomm->proxyState->uniRunnerState,
-                                     sendbuff, recvbuff, count, datatype, op,
-                                     comm),
-                  res, out);
 
   // Main scheduling loop using DAG-based three-queue scheduling
   while (true) {
@@ -548,7 +559,6 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
             "runUniRunner: all queues empty, terminating runner loop");
       // set terminate flag
       __atomic_store_n(fifo->buffer + 3, 1, __ATOMIC_RELEASE);
-      __sync_synchronize();
       break;
     }
 
@@ -559,20 +569,14 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
     FLAGCXCHECK(processInflightQueue(&hcomm->proxyState->uniRunnerState));
     loop_counter++;
   }
-  TRACE(FLAGCX_KERNEL, "rank %d runUniRunner bp (before sync stream)",
-        hcomm->rank);
   deviceAdaptor->streamSynchronize(red_stream);
-  TRACE(FLAGCX_KERNEL, "rank %d runUniRunner bp (after sync stream)",
-        hcomm->rank);
 
   // Clean up DAG scheduler
   cleanupDagScheduler(&hcomm->proxyState->uniRunnerState);
-  // TRACE(FLAGCX_KERNEL, "rank %d runUniRunner bp (DAG scheduler cleaned up)",
-  //       hcomm->rank);
 
   // destroy stream
-  FLAGCXCHECKGOTO(deviceAdaptor->streamSynchronize(red_stream), res, out);
-  FLAGCXCHECKGOTO(deviceAdaptor->streamDestroy(red_stream), res, out);
+  FLAGCXCHECK(deviceAdaptor->streamSynchronize(red_stream));
+  FLAGCXCHECK(deviceAdaptor->streamDestroy(red_stream));
 
 out:
   // destroy fifo
