@@ -36,7 +36,8 @@ static void dagQueueEnqueue(struct uniRunnerDagQueue *queue,
   queue->size++;
 }
 
-static flagcxResult_t initUniRunnerStateDummy() {
+static flagcxResult_t
+initUniRunnerStateDummy(flagcxUniRunnerState *runnerState) {
   // Initialize queues
   runnerState->readyQueue = {0};
   runnerState->inflightQueue = {0};
@@ -540,7 +541,8 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
                                              datatype, op, comm),
                     res, out);
   } else {
-    FLAGCXCHECKGOTO(initUniRunnerStateDummy(), res, out);
+    FLAGCXCHECKGOTO(initUniRunnerStateDummy(&hcomm->proxyState->uniRunnerState),
+                    res, out);
   }
 
   // Create a dedicated stream
@@ -576,7 +578,6 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
 
     // Step 2: Process inflight queue - check completion and update dependencies
     FLAGCXCHECK(processInflightQueue(&hcomm->proxyState->uniRunnerState));
-    loop_counter++;
   }
   deviceAdaptor->streamSynchronize(red_stream);
 
