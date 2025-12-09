@@ -38,7 +38,14 @@ FLAGCX_DEVICE_INLINE_DECORATOR void flagcxReduceTrigger::setComplete() {
            (flagcxReduceTriggerComplete &
             flagcxTriggerMask(flagcxReduceTriggerBitsState))
                << flagcxReduceTriggerOffState);
-  FLAGCX_DEVICE_THREAD_FENCE(); 
+  // uint64_t* ptr =
+  //   reinterpret_cast<uint64_t*>(value) + 3;
+  // uint64_t mask =
+  //   (flagcxReduceTriggerComplete &
+  //    flagcxTriggerMask(flagcxReduceTriggerBitsState))
+  //       << flagcxReduceTriggerOffState;
+  // *ptr |= mask;
+  // FLAGCX_DEVICE_THREAD_FENCE();
 }
 
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(void *fifoBuffer,
@@ -97,10 +104,11 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
     int c = -1;
     int p = -1;
     int term = -1;
+    volatile uint64_t *vBuf =  (volatile uint64_t*)fifoBuffer;
     if (tid == 0) {
-      c = static_cast<uint64_t *>(fifoBuffer)[1]; // consumed
-      p = static_cast<uint64_t *>(fifoBuffer)[2]; // produced
-      term = static_cast<uint64_t *>(fifoBuffer)[3];
+      c = vBuf[1]; // consumed
+      p = vBuf[2]; // produced
+      term = vBuf[3];
     }
     c = __shfl_sync(FULL_MASK, c, 0);
     p = __shfl_sync(FULL_MASK, p, 0);
@@ -134,20 +142,20 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
     // (5) perform reduce task
     empty_iter = 0;
     int slot = myIdx & (*(uint64_t *)fifoBuffer - 1);
-    flagcxReduceTrigger t =
-        ((flagcxReduceTrigger *)((uint64_t *)fifoBuffer + 4))[slot];
-    flagcxReduceKernel(t.getInput1(), t.getInput2(), t.getOutput(),
-                       t.getCount(), t.getNThreads(), t.getDatatype(),
-                       t.getRedop());
-
-    // (6) set completion flag
+    flagcxReduceTrigger *t =
+        ((flagcxReduceTrigger *)((uint64_t *)fifoBuffer + 4)) + slot;
+    flagcxReduceKernel(t->getInput1(), t->getInput2(), t->getOutput(),
+                       t->getCount(), t->getNThreads(), t->getDatatype(),
+                       t->getRedop());
     __syncthreads();
     FLAGCX_DEVICE_THREAD_FENCE();
+
+    // (6) set completion flag
     if (tid == 0) {
-      reinterpret_cast<flagcxReduceTrigger *>((uint64_t *)fifoBuffer + 4)->setComplete();
+      t->setComplete();
     }
   }
-  FLAGCX_DEVICE_THREAD_FENCE();
+  //FLAGCX_DEVICE_THREAD_FENCE();
 }
 
 void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,

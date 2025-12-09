@@ -36,12 +36,20 @@ static void dagQueueEnqueue(struct uniRunnerDagQueue *queue,
   queue->size++;
 }
 
-static flagcxResult_t initUniRunnerState(flagcxUniRunnerState *runnerState,
-                                         const void *sendbuff, void *recvbuff,
-                                         size_t count,
-                                         flagcxDataType_t datatype,
-                                         flagcxRedOp_t op, flagcxComm_t comm,
-                                         int numSlices = 1) {
+static flagcxResult_t
+initUniRunnerStateDummy(flagcxUniRunnerState *runnerState) {
+  // Initialize queues
+  runnerState->readyQueue = {0};
+  runnerState->inflightQueue = {0};
+  runnerState->pendingQueue = {0};
+  return flagcxNotSupported;
+}
+
+static flagcxResult_t
+initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
+                         const void *sendbuff, void *recvbuff, size_t count,
+                         flagcxDataType_t datatype, flagcxRedOp_t op,
+                         flagcxComm_t comm, int numSlices = 1) {
   TRACE(FLAGCX_INIT, "rank %d initUniRunnerState called", comm->rank);
 
   // Initialize queues
@@ -81,6 +89,14 @@ static flagcxResult_t initUniRunnerState(flagcxUniRunnerState *runnerState,
 
   int globalNodeIdx = 0;
 
+  /* reduce-scatter phase (nranks - 1 steps)
+   * slice = s, step = i
+   * p2pNodeIdx = s * nodesPerSlice + i * 2
+   * redNodeIdx = s * nodesPerSlice + i * 2 + 1
+   * all-gather phase (nranks - 1 steps)
+   * slice = s, step = i
+   * p2pNodeIdx = s * nodesPerSlice + (nranks - 1) * 2 + i
+   */
   for (int s = 0; s < numSlices; s++) {
     int sliceNodeBaseIdx = globalNodeIdx;
     size_t sliceOffsetInChunk = s * sliceCount * typeSize;
@@ -132,8 +148,8 @@ static flagcxResult_t initUniRunnerState(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[redNodeIdx].nodeData.red.input1 =
           static_cast<void *>(static_cast<char *>(recvbuff) + rx_offset);
       runnerState->dagNodes[redNodeIdx].nodeData.red.input2 =
-          static_cast<void *>(static_cast<char *>(const_cast<void *>(sendbuff)) +
-                              rx_offset);
+          static_cast<void *>(
+              static_cast<char *>(const_cast<void *>(sendbuff)) + rx_offset);
       runnerState->dagNodes[redNodeIdx].nodeData.red.output =
           static_cast<void *>(static_cast<char *>(recvbuff) + rx_offset);
       runnerState->dagNodes[redNodeIdx].nodeData.red.count = sliceCount;
@@ -221,12 +237,13 @@ static flagcxResult_t initUniRunnerState(flagcxUniRunnerState *runnerState,
   // TRACE(FLAGCX_KERNEL, "initUniRunnerState bp14 (P2P events created)");
   memset(runnerState->p2pEventMap.bits, 0,
          (P2P_EVENT_POOL_SIZE + 63) / 64 * sizeof(uint64_t));
-  // TRACE(FLAGCX_KERNEL, "initUniRunnerState bp15 (P2P event map initialized)");
+  // TRACE(FLAGCX_KERNEL, "initUniRunnerState bp15 (P2P event map
+  // initialized)");
 
-  INFO(FLAGCX_INIT,
-       "DAG scheduler initialized with %d-rank Ring AllReduce topology (%d "
-       "slices)",
-       nranks, numSlices);
+  TRACE(FLAGCX_INIT,
+        "DAG scheduler initialized with %d-rank Ring AllReduce topology (%d "
+        "slices)",
+        nranks, numSlices);
 
   return flagcxSuccess;
 }
@@ -386,22 +403,22 @@ static flagcxResult_t processInflightQueue(flagcxUniRunnerState *runnerState) {
       uint64_t curr_state = current->nodeData.red.trigger->pollState();
       isComplete = (curr_state == flagcxReduceTriggerComplete);
       // debug
-      uint64_t curr_c = *(runnerState->fifo->buffer + 1);
-      uint64_t curr_p = *(runnerState->fifo->buffer + 2);
-      if (counter > 1e5) {
-        TRACE(FLAGCX_KERNEL, "processInflightQueue: timeout c=%lu, p=%lu",
-              curr_c, curr_p);
-        TRACE(FLAGCX_KERNEL, "value[3]: 0x%016lx",
-              current->nodeData.red.trigger->value[3]);
-        isComplete = 1;
-      }
+      // uint64_t curr_c = *(runnerState->fifo->buffer + 1);
+      // uint64_t curr_p = *(runnerState->fifo->buffer + 2);
+      // if (counter > 1e5) {
+      //   TRACE(FLAGCX_KERNEL, "processInflightQueue: timeout c=%lu, p=%lu",
+      //         curr_c, curr_p);
+      //   TRACE(FLAGCX_KERNEL, "value[3]: 0x%016lx",
+      //         current->nodeData.red.trigger->value[3]);
+      //   isComplete = 1;
+      // }
     }
 
     if (isComplete) {
       // Mark trigger as available
       // TRACE(FLAGCX_KERNEL, "processInflightQueue bp (node complete)");
       if (current->nodeType == uniRunnerDagNodeTypeP2p) {
-        runnerState->setAvail(current->nodeData.p2p.eventIdx);
+        runnerState->resetEvent(current->nodeData.p2p.eventIdx);
         current->nodeData.p2p.eventIdx = -1;
         current->nodeData.p2p.event = NULL;
         // TRACE(FLAGCX_KERNEL, "processInflightQueue bp3 (p2p marked
@@ -491,15 +508,17 @@ int flagcxUniRunnerState::getEvent() {
   return idx;
 }
 
-void flagcxUniRunnerState::setAvail(int idx) { p2pEventMap.markAvailable(idx); }
+void flagcxUniRunnerState::resetEvent(int idx) {
+  p2pEventMap.markAvailable(idx);
+}
 
 flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
                             flagcxDataType_t datatype, flagcxRedOp_t op,
-                            flagcxComm_t comm, flagcxStream_t stream) {
+                            flagcxComm_t comm, flagcxStream_t stream,
+                            flagcxCommOp_t commOp) {
   flagcxFifo_t fifo = NULL;
   flagcxResult_t res = flagcxSuccess;
   flagcxHeteroComm_t hcomm = comm->hetero_comm;
-  size_t loop_counter = 0;
 
   // Set device context
   FLAGCXCHECKGOTO(deviceAdaptor->setDevice(hcomm->cudaDev), res, out);
@@ -515,6 +534,17 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
                       (void *)hcomm->proxyState->uniRunnerState.fifo->buffer),
                   res, out);
 
+  // Initialize DAG scheduler
+  if (commOp == flagcxCommOpAllReduce) {
+    FLAGCXCHECKGOTO(initUniRunnerStateRingAR(&hcomm->proxyState->uniRunnerState,
+                                             sendbuff, recvbuff, count,
+                                             datatype, op, comm),
+                    res, out);
+  } else {
+    FLAGCXCHECKGOTO(initUniRunnerStateDummy(&hcomm->proxyState->uniRunnerState),
+                    res, out);
+  }
+
   // Create a dedicated stream
   flagcxStream_t red_stream;
   FLAGCXCHECKGOTO(deviceAdaptor->streamCreate(&red_stream), res, out);
@@ -524,19 +554,13 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
   flagcxLaunchCollectiveKernel(hcomm->uniRunnerFifoBuffer, UNIRUNNER_NTHREADS,
                                UNIRUNNER_NBLOCKS, red_stream);
 
-  // Initialize DAG scheduler
-  FLAGCXCHECKGOTO(initUniRunnerState(&hcomm->proxyState->uniRunnerState,
-                                     sendbuff, recvbuff, count, datatype, op,
-                                     comm),
-                  res, out);
-
   // Main scheduling loop using DAG-based three-queue scheduling
   while (true) {
-    if (loop_counter > 1e5) {
-      res = flagcxSystemError;
-      TRACE(FLAGCX_KERNEL, "runUniRunner error: loop counter exceeded limit");
-      break;
-    }
+    // if (loop_counter > 1e5) {
+    //   res = flagcxSystemError;
+    //   TRACE(FLAGCX_KERNEL, "runUniRunner error: loop counter exceeded
+    //   limit"); break;
+    // }
 
     // Check stop flag and all queues empty condition
     if (hcomm->proxyState->uniRunnerState.readyQueue.head == NULL &&
@@ -544,9 +568,8 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
         hcomm->proxyState->uniRunnerState.pendingQueue.head == NULL) {
       TRACE(FLAGCX_KERNEL,
             "runUniRunner: all queues empty, terminating runner loop");
-      fifo->buffer[3] = 1; // set terminate flag
-      __atomic_store_n(fifo->buffer + 1, 1, __ATOMIC_RELEASE);
-      __sync_synchronize();
+      // set terminate flag
+      __atomic_store_n(fifo->buffer + 3, 1, __ATOMIC_RELEASE);
       break;
     }
 
@@ -555,22 +578,15 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
 
     // Step 2: Process inflight queue - check completion and update dependencies
     FLAGCXCHECK(processInflightQueue(&hcomm->proxyState->uniRunnerState));
-    loop_counter++;
   }
-  TRACE(FLAGCX_KERNEL, "rank %d runUniRunner bp (before sync stream)",
-        hcomm->rank);
   deviceAdaptor->streamSynchronize(red_stream);
-  TRACE(FLAGCX_KERNEL, "rank %d runUniRunner bp (after sync stream)",
-        hcomm->rank);
 
   // Clean up DAG scheduler
   cleanupDagScheduler(&hcomm->proxyState->uniRunnerState);
-  // TRACE(FLAGCX_KERNEL, "rank %d runUniRunner bp (DAG scheduler cleaned up)",
-  //       hcomm->rank);
 
   // destroy stream
-  FLAGCXCHECKGOTO(deviceAdaptor->streamSynchronize(red_stream), res, out);
-  FLAGCXCHECKGOTO(deviceAdaptor->streamDestroy(red_stream), res, out);
+  FLAGCXCHECK(deviceAdaptor->streamSynchronize(red_stream));
+  FLAGCXCHECK(deviceAdaptor->streamDestroy(red_stream));
 
 out:
   // destroy fifo

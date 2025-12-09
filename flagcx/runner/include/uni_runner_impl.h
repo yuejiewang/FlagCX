@@ -2,6 +2,7 @@
 #define FLAGCX_UNIRUNNER_IMPL_H_
 
 #include "device.h"
+#include "flagcx.h"
 #include "flagcx_kernel.h"
 #include "flagcx_net.h"
 #include "group.h"
@@ -137,10 +138,11 @@ typedef struct {
 
   // get an available event
   int getEvent();
-  void setAvail(int idx);
+  void resetEvent(int idx);
 } flagcxUniRunnerState;
 
 flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
                             flagcxDataType_t datatype, flagcxRedOp_t op,
-                            flagcxComm_t comm, flagcxStream_t stream);
+                            flagcxComm_t comm, flagcxStream_t stream,
+                            flagcxCommOp_t commOp);
 #endif // FLAGCX_UNIRUNNER_IMPL_H_
