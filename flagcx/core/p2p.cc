@@ -8,8 +8,9 @@
 #include <map>
 #include <string.h> // for memcpy
 
-int64_t flagcxP2PBufferSize;
-int64_t flagcxP2PChunkSize;
+int64_t flagcxP2pBufferSize;
+int64_t flagcxP2pChunkSize;
+int64_t flagcxP2pChunks;
 
 struct p2pIpcExpInfo {
   flagcxP2pIpcDesc ipcDesc;
@@ -75,7 +76,7 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
     slotPtr->done = 0;
     slotPtr->peerDone = 0;
     slotPtr->sendHead = 0;
-    slotPtr->recvTail = FLAGCX_P2P_MAX_STEPS;
+    slotPtr->recvTail = flagcxP2pChunks;
     // Reset reg info for new operation
     regInfoPtr->copyStarted = 0;
     regInfoPtr->copyDone = 0;
@@ -123,15 +124,7 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
           if (slotPtr->peerDone == 1) {
             __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELAXED);
             __atomic_store_n(&slotPtr->done, 1, __ATOMIC_RELEASE);
-            args->semaphore->signalCounter(1);
-            if (deviceAsyncLoad && deviceAsyncStore) {
-              if (args->deviceFuncRelaxedOrdering == 1) {
-                FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-                    args->dlArgs, (void *)&args->hlArgs, sizeof(bool),
-                    flagcxMemcpyHostToDevice, resources->proxyInfo.stream,
-                    NULL));
-              }
-            }
+            args->semaphore->subCounter(1);
             args->done = 1;
           }
         }
@@ -143,7 +136,7 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
   // Non-zero-copy mode: use FIFO buffer
   if (args->transmitted < args->chunkSteps) {
     if (args->copied < args->chunkSteps &&
-        args->copied - args->transmitted < FLAGCX_P2P_MAX_STEPS) {
+        args->copied - args->transmitted < flagcxP2pChunks) {
       int step = args->copied & args->sendStepMask;
 
       volatile uint64_t *recvTail = &peerSlotPtr->recvTail;
@@ -152,7 +145,7 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
         args->subs[step].stepSize =
             std::min(args->chunkSize, size - args->totalCopySize);
         args->subs[step].stepBuff =
-            resources->proxyInfo.recvFifo + (flagcxP2PChunkSize * step);
+            resources->proxyInfo.recvFifo + (flagcxP2pChunkSize * step);
 
         FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
             args->subs[step].stepBuff, (char *)data + args->totalCopySize,
@@ -189,14 +182,7 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
         if (slotPtr->peerDone == 1) {
           __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELAXED);
           __atomic_store_n(&slotPtr->done, 1, __ATOMIC_RELEASE);
-          args->semaphore->signalCounter(1);
-          if (deviceAsyncLoad && deviceAsyncStore) {
-            if (args->deviceFuncRelaxedOrdering == 1) {
-              FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-                  args->dlArgs, (void *)&args->hlArgs, sizeof(bool),
-                  flagcxMemcpyHostToDevice, resources->proxyInfo.stream, NULL));
-            }
-          }
+          args->semaphore->subCounter(1);
           args->done = 1;
         }
       }
@@ -230,7 +216,7 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
     slotPtr->done = 0;
     slotPtr->peerDone = 0;
     slotPtr->sendHead = 0;
-    slotPtr->recvTail = FLAGCX_P2P_MAX_STEPS;
+    slotPtr->recvTail = flagcxP2pChunks;
   }
 
   // Return and retry later since the slot is still in use
@@ -260,15 +246,7 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
           if (slotPtr->peerDone == 1) {
             __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELAXED);
             __atomic_store_n(&slotPtr->done, 1, __ATOMIC_RELEASE);
-            args->semaphore->signalCounter(1);
-            if (deviceAsyncLoad && deviceAsyncStore) {
-              if (args->deviceFuncRelaxedOrdering == 1) {
-                FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-                    args->dlArgs, (void *)&args->hlArgs, sizeof(bool),
-                    flagcxMemcpyHostToDevice, resources->proxyInfo.stream,
-                    NULL));
-              }
-            }
+            args->semaphore->subCounter(1);
             args->done = 1;
           }
         }
@@ -280,7 +258,7 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
   // Non-zero-copy mode: use FIFO buffer
   if (args->transmitted < args->chunkSteps) {
     if (args->copied < args->chunkSteps &&
-        args->copied - args->transmitted < FLAGCX_P2P_MAX_STEPS) {
+        args->copied - args->transmitted < flagcxP2pChunks) {
       int step = args->copied & args->sendStepMask;
       volatile uint64_t *sendHead = &peerSlotPtr->sendHead;
 
@@ -288,7 +266,7 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
         args->subs[step].stepSize =
             std::min(args->chunkSize, size - args->totalCopySize);
         args->subs[step].stepBuff =
-            resources->proxyInfo.recvFifo + (flagcxP2PChunkSize * step);
+            resources->proxyInfo.recvFifo + (flagcxP2pChunkSize * step);
 
         FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
             (char *)data + args->totalCopySize, args->subs[step].stepBuff,
@@ -311,7 +289,7 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
         args->transmitted++;
         // Update recvTail in the shared slot
         volatile uint64_t *recvTail = &slotPtr->recvTail;
-        *recvTail = args->transmitted + FLAGCX_P2P_MAX_STEPS;
+        *recvTail = args->transmitted + flagcxP2pChunks;
       }
     }
   } else {
@@ -326,14 +304,7 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
         if (slotPtr->peerDone == 1) {
           __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELAXED);
           __atomic_store_n(&slotPtr->done, 1, __ATOMIC_RELEASE);
-          args->semaphore->signalCounter(1);
-          if (deviceAsyncLoad && deviceAsyncStore) {
-            if (args->deviceFuncRelaxedOrdering == 1) {
-              FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-                  args->dlArgs, (void *)&args->hlArgs, sizeof(bool),
-                  flagcxMemcpyHostToDevice, resources->proxyInfo.stream, NULL));
-            }
-          }
+          args->semaphore->subCounter(1);
           args->done = 1;
         }
       }
@@ -372,15 +343,7 @@ flagcxResult_t flagcxP2pProxySelfCopy(struct flagcxP2pResources *resources,
     }
   } else {
     if (args->done != 1) {
-      args->semaphore->signalCounter(1);
-      // Deprecated device func handling
-      if (deviceAsyncLoad && deviceAsyncStore) {
-        if (args->deviceFuncRelaxedOrdering == 1) {
-          FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-              args->dlArgs, (void *)&args->hlArgs, sizeof(bool),
-              flagcxMemcpyHostToDevice, resources->proxyInfo.stream, NULL));
-        }
-      }
+      args->semaphore->subCounter(1);
       args->done = 1;
     }
   }
@@ -414,7 +377,7 @@ flagcxResult_t flagcxP2pSendProxySetup(struct flagcxProxyConnection *connection,
   // Initialize all synchronization slots
   for (int i = 0; i < FLAGCX_P2P_MAX_OPS; i++) {
     resources->proxyInfo.shm->slots[i].sendHead = 0;
-    resources->proxyInfo.shm->slots[i].recvTail = FLAGCX_P2P_MAX_STEPS;
+    resources->proxyInfo.shm->slots[i].recvTail = flagcxP2pChunks;
     resources->proxyInfo.shm->slots[i].opHash = -1;
     resources->proxyInfo.shm->slots[i].done = 1;     // 1 = slot is free
     resources->proxyInfo.shm->slots[i].peerDone = 1; // 1 = slot is free
@@ -484,7 +447,7 @@ flagcxP2pSendProxyConnect(struct flagcxProxyConnection *connection,
 
   // Create stream and events for data transfers
   FLAGCXCHECK(deviceAdaptor->streamCreate(&resources->proxyInfo.stream));
-  for (int i = 0; i < FLAGCX_P2P_MAX_STEPS; i++) {
+  for (int i = 0; i < flagcxP2pChunks; i++) {
     FLAGCXCHECK(deviceAdaptor->eventCreate(&resources->proxyInfo.events[i],
                                            flagcxEventDisableTiming));
   }
@@ -511,7 +474,7 @@ flagcxP2pRecvProxyConnect(struct flagcxProxyConnection *connection,
 
   // Create stream and events for data transfers
   FLAGCXCHECK(deviceAdaptor->streamCreate(&resources->proxyInfo.stream));
-  for (int i = 0; i < FLAGCX_P2P_MAX_STEPS; i++) {
+  for (int i = 0; i < flagcxP2pChunks; i++) {
     FLAGCXCHECK(deviceAdaptor->eventCreate(&resources->proxyInfo.events[i],
                                            flagcxEventDisableTiming));
   }
@@ -1050,7 +1013,7 @@ flagcxResult_t flagcxP2pSendProxyFree(struct flagcxP2pResources *resources) {
   if (resources == NULL)
     return flagcxSuccess;
 
-  for (int s = 0; s < FLAGCX_P2P_MAX_STEPS; s++) {
+  for (int s = 0; s < flagcxP2pChunks; s++) {
     if (resources->proxyInfo.events[s] != NULL) {
       FLAGCXCHECK(deviceAdaptor->eventDestroy(resources->proxyInfo.events[s]));
     }
@@ -1071,7 +1034,7 @@ flagcxResult_t flagcxP2pRecvProxyFree(struct flagcxP2pResources *resources) {
     return flagcxSuccess;
 
   // Destroy events
-  for (int s = 0; s < FLAGCX_P2P_MAX_STEPS; s++) {
+  for (int s = 0; s < flagcxP2pChunks; s++) {
     if (resources->proxyInfo.events[s] != NULL) {
       FLAGCXCHECK(deviceAdaptor->eventDestroy(resources->proxyInfo.events[s]));
     }
