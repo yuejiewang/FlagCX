@@ -233,9 +233,9 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                                  .proxyConn.connection;
             op->stream = p2p->stream;
             if (op->connection->transport == TRANSPORT_P2P) {
-              op->args.chunkSize = flagcxP2pChunkSize;
+              op->args.chunkSize = computeP2pChunkSize(p2p->bytes);
               op->args.chunkSteps =
-                  (p2p->bytes + flagcxP2pChunkSize - 1) / (flagcxP2pChunkSize);
+                  (p2p->bytes + op->args.chunkSize - 1) / (op->args.chunkSize);
               op->args.sendStepMask = flagcxP2pChunks - 1;
               setP2pSlotInfo(comm->rank, peer, p2p->bytes, p2p->dtype, 1,
                              &op->args.p2pOpHash, &op->args.p2pSlotIdx);
@@ -312,9 +312,9 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                                  .proxyConn.connection;
             op->stream = p2p->stream;
             if (op->connection->transport == TRANSPORT_P2P) {
-              op->args.chunkSize = flagcxP2pChunkSize;
+              op->args.chunkSize = computeP2pChunkSize(p2p->bytes);
               op->args.chunkSteps =
-                  (p2p->bytes + flagcxP2pChunkSize - 1) / (flagcxP2pChunkSize);
+                  (p2p->bytes + op->args.chunkSize - 1) / (op->args.chunkSize);
               op->args.sendStepMask = flagcxP2pChunks - 1;
               setP2pSlotInfo(comm->rank, peer, p2p->bytes, p2p->dtype, 0,
                              &op->args.p2pOpHash, &op->args.p2pSlotIdx);
