@@ -10,7 +10,13 @@
 #define ENABLE_TIMER 0
 #include "timer.h"
 
+FLAGCX_PARAM(P2pDisable, "P2P_DISABLE", 0);
+
 static inline bool isSameNode(struct flagcxHeteroComm *comm, int peer) {
+  // force use net transport for unirunner allreduce
+  if (flagcxParamP2pDisable()) {
+    return false;
+  }
   if (comm->peerInfo == NULL) {
     // peerInfo not initialized - assume different nodes (use network transport)
     return false;
