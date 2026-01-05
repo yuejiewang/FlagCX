@@ -702,7 +702,7 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
                                  runnerState->dagNodes[redNodeIdx].numChildren *
                                      sizeof(int)));
         runnerState->dagNodes[redNodeIdx].children[0] =
-            redSliceStartIdx + numRedSlices + 1;
+            redSliceStartIdx + numRedSlices;
         TRACE(FLAGCX_INIT, "rank %d redNode %d child 0: %d", rank, redNodeIdx,
               runnerState->dagNodes[redNodeIdx].children[0]);
       }
