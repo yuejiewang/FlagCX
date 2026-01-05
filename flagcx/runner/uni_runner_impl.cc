@@ -703,6 +703,8 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
                                      sizeof(int)));
         runnerState->dagNodes[redNodeIdx].children[0] =
             redSliceStartIdx + numRedSlices + 1;
+        TRACE(FLAGCX_INIT, "rank %d redNode %d child 0: %d", rank, redNodeIdx,
+              runnerState->dagNodes[redNodeIdx].children[0]);
       }
     }
 
@@ -778,6 +780,22 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
         "DAG scheduler initialized with %d-rank Sliced AllReduce topology (%d "
         "slices, %d redSlices)",
         nranks, numSlices, numRedSlices);
+  // print dependency graph
+  for (int i = 0; i < runnerState->numDagNodes; i++) {
+    TRACE(FLAGCX_INIT, "Node %d: type=%s, numParents=%d, numChildren=%d", i,
+          (runnerState->dagNodes[i].nodeType == uniRunnerDagNodeTypeP2p)
+              ? "P2P"
+              : "RED",
+          runnerState->dagNodes[i].numParents,
+          runnerState->dagNodes[i].numChildren);
+    if (runnerState->dagNodes[i].numChildren > 0) {
+      std::string childStr = "  Children: ";
+      for (int c = 0; c < runnerState->dagNodes[i].numChildren; c++) {
+        childStr += std::to_string(runnerState->dagNodes[i].children[c]) + " ";
+      }
+      TRACE(FLAGCX_INIT, "%s", childStr.c_str());
+    }
+  }
 
   return flagcxSuccess;
 }
