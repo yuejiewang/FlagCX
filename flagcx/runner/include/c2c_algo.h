@@ -15,7 +15,8 @@
 typedef enum {
   flagcxAlgoSequential = 0,
   flagcxAlgoPipeline = 1,
-  flagcxAlgoInput = 2
+  flagcxAlgoSliced = 2,
+  flagcxAlgoInput = 3
 } flagcxAlgorithm_t;
 
 size_t getC2cCommPatternHash(size_t count, size_t rootClusterId,
@@ -232,6 +233,7 @@ private:
   int nPipePostSteps_;
   int nSeqPostSteps_;
   size_t nchunks_;
+  size_t nslices_;
   size_t sendCount_;
   size_t recvCount_;
   int rootRank_; // used for gather, scatter
