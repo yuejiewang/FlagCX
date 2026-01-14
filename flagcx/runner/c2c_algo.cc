@@ -732,7 +732,7 @@ flagcxC2cPlanner::flagcxC2cPlanner(size_t sendCount, size_t recvCount,
       }
     }
   } else if (algorithm != 0 && (strcmp(algorithm, "SLICED") == 0 ||
-                               strcmp(algorithm, "Sliced") == 0)) {
+                                strcmp(algorithm, "Sliced") == 0)) {
     // sliced optimizations for AllReduce
     if (commOp_ == flagcxCommOpAllReduce && eachNicPerRank_) {
       algorithm_ = flagcxAlgoSliced;
@@ -1233,6 +1233,25 @@ flagcxResult_t flagcxC2cPlanner::refresh(int isSendRecv) {
                   (isScheduled || i == z), -1, -1);
             }
             clusterdataoffset += comm_->cluster_sizes[z];
+          } else if (algorithm_ == flagcxAlgoSliced) {
+            size_t sliceCount = totalCount_ / nslices_;
+            size_t rankCount = sliceCount / comm_->nranks;
+            myCount = rankCount * comm_->cluster_sizes[z] / nClusterInterRanks;
+            myRes = rankCount * comm_->cluster_sizes[z] % nClusterInterRanks;
+            minCount = rankCount * comm_->cluster_sizes[z] / lcm;
+            for (int k = 0; k < myCount / minCount; ++k) {
+              interRankBufferInfoManager_.pushBackBufferInfo(
+                  i, clusterInterRankList_[i][j],
+                  clusterdataoffset * rankCount + myCount * j + minCount * k,
+                  minCount, z, 0, (isScheduled || i == z), -1, -1);
+            }
+            if (j == nClusterInterRanks - 1 && myRes > 0) {
+              interRankBufferInfoManager_.pushBackBufferInfo(
+                  i, clusterInterRankList_[i][j],
+                  clusterdataoffset * rankCount + myCount * j, myRes, z, 0,
+                  (isScheduled || i == z), -1, -1);
+            }
+            clusterdataoffset += comm_->cluster_sizes[z];
           } else if (i != z) {
             if (isUseless == 0) {
               for (int k = 0; k < myCount / minCount; ++k) {
@@ -1506,9 +1525,8 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
           count = it->count_ / nslices_;
           totalCount = totalCount_ / nslices_;
           offset -= clusterOffset_ * totalCount_ / comm_->nranks / nslices_;
-          totalCount =
-              comm_->cluster_sizes[clusterId_] * totalCount_ / comm_->nranks /
-              nslices_;
+          totalCount = comm_->cluster_sizes[clusterId_] * totalCount_ /
+                       comm_->nranks / nslices_;
         }
         break;
       }
@@ -2041,13 +2059,13 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
               continue;
             }
             size_t sliceCount = totalCount_ / nslices_;
-            size_t rankCount = sliceCount_ / comm_->nranks;
+            size_t rankCount = sliceCount / comm_->nranks;
             size_t recvoffset =
                 clusterOffset_ * rankCount + homoMyRank_ * rankCount;
             int recvFlag = algorithm_ == flagcxAlgoPipeline &&
                            commOp_ == flagcxCommOpReduceScatter &&
                            eachNicPerRank_ && step == comm_->nclusters - 2;
-            for (int slice = 0; slice < nslices_; ++slices) {
+            for (int slice = 0; slice < nslices_; ++slice) {
               homoInterFuncSteps_[step + slice].emplace_back(
                   -1, sendType, recvFlag ? 1 : recvType,
                   clusterOffset_ * rankCount + slice * sliceCount,
@@ -2466,14 +2484,13 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
         homoInterFuncSteps_[s][i].run(
             sendbuff, recvbuff, scratchBuffer_, datatype, redOp_,
             comm_->globalrank2homorank[root], comm_, het_stream);
-        size_t sliceOffset = algorithm_ == flagcxAlgoSliced ?
-                                 slice * (totalCount_ / nslices_) :
-                                 0;
-        refreshFunc_.run(static_cast<void *>(static_cast<char *>(recvbuff) + 
-                                             sliceOffset),
-                         static_cast<void *>(static_cast<char *>(scratchBuffer_) +
-                                             sliceOffset),
-                         datatype, het_stream);
+        size_t sliceOffset =
+            algorithm_ == flagcxAlgoSliced ? s * (totalCount_ / nslices_) : 0;
+        refreshFunc_.run(
+            static_cast<void *>(static_cast<char *>(recvbuff) + sliceOffset),
+            static_cast<void *>(static_cast<char *>(scratchBuffer_) +
+                                sliceOffset),
+            datatype, het_stream);
       }
     }
     flagcxHeteroGroupEnd();
