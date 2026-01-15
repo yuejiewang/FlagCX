@@ -2433,17 +2433,18 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
   deviceAdaptor->streamCreate(&het_stream);
 
   // execute sequential preHomoFunc steps
-  cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
   for (int s = 0; s < nSeqPreSteps_; ++s) {
+    TRACE_CALL("preHomoFunc step %d", s);
+    cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
     for (int i = 0; i < preHomoFuncSteps_[s].size(); ++i) {
       preHomoFuncSteps_[s][i].run(sendbuff, recvbuff, scratchBuffer_, datatype,
                                   redOp_, comm_->globalrank2homorank[root],
                                   comm_, stream, sendCounts_, sDispls_,
                                   recvCounts_, rDispls_);
     }
+    cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
+    deviceAdaptor->streamSynchronize(stream);
   }
-  cclAdaptors[flagcxCCLAdaptorDevice]->groupEnd();
-  deviceAdaptor->streamSynchronize(stream);
 
   // execute pipelined preHomoFunc and heteroFunc steps
   // execute refreshFunc
@@ -2459,6 +2460,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
     }
   }
   for (int slice = 0; slice < nslices_; ++slice) {
+    TRACE_CALL("refreshFunc slice %d", slice);
     refreshFunc_.run(static_cast<void *>(static_cast<char *>(recvbuff) +
                                          slice * (totalCount_ / nslices_)),
                      static_cast<void *>(static_cast<char *>(scratchBuffer_) +
@@ -2467,6 +2469,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
   }
   deviceAdaptor->streamSynchronize(stream);
   for (int s = 0; s < nPipePreSteps_; ++s) {
+    TRACE_CALL("PipePreStep %d", s);
     cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
     for (int i = 0; i < preHomoFuncSteps_[nSeqPreSteps_ + s].size(); ++i) {
       preHomoFuncSteps_[nSeqPreSteps_ + s][i].run(
@@ -2544,6 +2547,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
 
   // execute pipelined heteroFunc and postHomoFunc steps
   for (int s = 0; s < nPipePostSteps_; ++s) {
+    TRACE_CALL("PipePostStep %d", s);
     cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
     // execute postHomoFunc
     for (int i = 0; i < postHomoFuncSteps_[s].size(); ++i) {
@@ -2594,6 +2598,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
   // execute sequential postHomoFunc steps
   cclAdaptors[flagcxCCLAdaptorDevice]->groupStart();
   for (int s = 0; s < nSeqPostSteps_; ++s) {
+    TRACE_CALL("postHomoFunc step %d", s);
     for (int i = 0; i < postHomoFuncSteps_[nPipePostSteps_ + s].size(); ++i) {
       // execute refresh func
       if (algorithm_ == flagcxAlgoSequential ||
