@@ -2461,9 +2461,11 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
   for (int slice = 0; slice < nslices_; ++slice) {
     TRACE_CALL("refreshFunc slice %d", slice);
     refreshFunc_.run(static_cast<void *>(static_cast<char *>(recvbuff) +
-                                         slice * (totalCount_ / nslices_)),
+                                         slice * (totalCount_ / nslices_) *
+                                             getFlagcxDataTypeSize(datatype)),
                      static_cast<void *>(static_cast<char *>(scratchBuffer_) +
-                                         slice * (totalCount_ / nslices_)),
+                                         slice * (totalCount_ / nslices_) *
+                                             getFlagcxDataTypeSize(datatype)),
                      datatype, stream);
   }
   deviceAdaptor->streamSynchronize(stream);
@@ -2494,10 +2496,7 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
         homoInterFuncSteps_[s][i].run(
             sendbuff, recvbuff, scratchBuffer_, datatype, redOp_,
             comm_->globalrank2homorank[root], comm_, het_stream);
-        size_t sliceOffset =
-            algorithm_ == flagcxAlgoSliced
-                ? (s / (2 * comm_->nclusters - 2)) * (totalCount_ / nslices_)
-                : 0;
+        size_t sliceOffset = 0;
         refreshFunc_.run(
             static_cast<void *>(static_cast<char *>(recvbuff) + sliceOffset),
             static_cast<void *>(static_cast<char *>(scratchBuffer_) +
@@ -2576,11 +2575,10 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
         homoInterFuncSteps_[nPipePreSteps_ + nSeqInterSteps_ + s][i].run(
             sendbuff, recvbuff, scratchBuffer_, datatype, redOp_,
             comm_->globalrank2homorank[root], comm_, het_stream);
-        size_t sliceOffset = algorithm_ == flagcxAlgoSliced
-                                 ? (nPipePreSteps_ + nSeqInterSteps_ +
-                                    s / (2 * comm_->nclusters - 2)) *
-                                       (totalCount_ / nslices_)
-                                 : 0;
+        size_t sliceOffset =
+            algorithm_ == flagcxAlgoSliced
+                ? (totalCount_ / nslices_) * getFlagcxDataTypeSize(datatype)
+                : 0;
         refreshFunc_.run(
             static_cast<void *>(static_cast<char *>(recvbuff) + sliceOffset),
             static_cast<void *>(static_cast<char *>(scratchBuffer_) +
