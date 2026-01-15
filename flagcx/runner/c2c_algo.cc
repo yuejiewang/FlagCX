@@ -1611,20 +1611,19 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
               size_t preHomoFuncCount = rankCount;
               size_t preHomoFuncRes =
                   clusterdata % clusterInterRankList_[clusterId_].size();
-              int step =
-                  (clusterId_ + comm_->nclusters - c) % comm_->nclusters;
+              int step = (clusterId_ + comm_->nclusters - c) % comm_->nclusters;
               preHomoFuncSteps_[step + s * comm_->nclusters].emplace_back(
-                  -1, 0, recvType, dataoffset,
-                  dataoffset + preHomoFuncCount * homoMyRank_, preHomoFuncCount,
-                  0, preHomoFuncCommOp);
+                  -1, 0, recvType, sliceoffset + dataoffset,
+                  sliceoffset + dataoffset + preHomoFuncCount * homoMyRank_,
+                  preHomoFuncCount, 0, preHomoFuncCommOp);
               if (preHomoFuncRes > 0) {
-                preHomoFuncSteps_[step + s * comm_->nclusters - 1]
-                    .emplace_back(
-                        comm_->globalrank2homorank
-                            [clusterInterRankList_[clusterId_].back()],
-                        0, recvType, dataoffset + clusterdata - preHomoFuncRes,
-                        dataoffset + clusterdata - preHomoFuncRes,
-                        preHomoFuncRes, 0, flagcxCommOpReduce);
+                preHomoFuncSteps_[step + s * comm_->nclusters - 1].emplace_back(
+                    comm_->globalrank2homorank[clusterInterRankList_[clusterId_]
+                                                   .back()],
+                    0, recvType,
+                    sliceoffset + dataoffset + clusterdata - preHomoFuncRes,
+                    sliceoffset + dataoffset + clusterdata - preHomoFuncRes,
+                    preHomoFuncRes, 0, flagcxCommOpReduce);
               }
               dataoffset += clusterdata;
             }
@@ -2582,11 +2581,11 @@ flagcxResult_t flagcxC2cPlanner::execute(const void *sendbuff, void *recvbuff,
                                     s / (2 * comm_->nclusters - 2)) *
                                        (totalCount_ / nslices_)
                                  : 0;
-        refreshFunc_.run(static_cast<void *>(
-                             static_cast<char *>(recvbuff) + sliceOffset),
-                         static_cast<void *>(
-                             static_cast<char *>(scratchBuffer_) + sliceOffset),
-                         datatype, het_stream);
+        refreshFunc_.run(
+            static_cast<void *>(static_cast<char *>(recvbuff) + sliceOffset),
+            static_cast<void *>(static_cast<char *>(scratchBuffer_) +
+                                sliceOffset),
+            datatype, het_stream);
       }
     }
     flagcxHeteroGroupEnd();
