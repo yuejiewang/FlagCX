@@ -738,11 +738,11 @@ flagcxC2cPlanner::flagcxC2cPlanner(size_t sendCount, size_t recvCount,
       algorithm_ = flagcxAlgoSliced;
       nslices_ = 2;
       nchunks_ *= nslices_;
-      nSeqPreSteps_ = 1;
-      nPipePreSteps_ = (nslices_ - 1) * comm_->nclusters_;
+      nSeqPreSteps_ = 2;
+      nPipePreSteps_ = nslices_ * comm_->nclusters - 2;
       nSeqInterSteps_ = 0;
-      nPipePostSteps_ = (nslices_ - 1) * comm_->nclusters_;
-      nSeqPostSteps_ = nslices_;
+      nPipePostSteps_ = nslices_ * comm_->nclusters - 2;
+      nSeqPostSteps_ = 2;
     }
   }
   // initialize an empty func queue for each step
@@ -1612,11 +1612,8 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
               size_t preHomoFuncRes =
                   clusterdata % clusterInterRankList_[clusterId_].size();
               int step =
-                  (clusterId_ + comm_->nclusters - 1 - c) % comm_->nclusters;
-              if (step == comm_->nclusters - 1) {
-                step = 0;
-              }
-              preHomoFuncSteps_[step + s * comm_->nclusters - 1].emplace_back(
+                  (clusterId_ + comm_->nclusters - c) % comm_->nclusters;
+              preHomoFuncSteps_[step + s * comm_->nclusters].emplace_back(
                   -1, 0, recvType, dataoffset,
                   dataoffset + preHomoFuncCount * homoMyRank_, preHomoFuncCount,
                   0, preHomoFuncCommOp);
@@ -1977,13 +1974,11 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                   // broadcast local cluster data at post step 0
                   if (i == clusterId_) {
                     for (int slice = 0; slice < nslices_; ++slice) {
-                      postHomoFuncSteps_[slice * comm_->nclusters]
-                          .emplace_back(clusterInterRankList_[i][j] -
-                                            (rank_ - homoMyRank_),
-                                        1, 1,
-                                        it->offset_ + totalCount_ / nslices_,
-                                        it->offset_ + totalCount_ / nslices_,
-                                        it->count_, 2, flagcxCommOpBroadcast);
+                      postHomoFuncSteps_[slice * comm_->nclusters].emplace_back(
+                          clusterInterRankList_[i][j] - (rank_ - homoMyRank_),
+                          1, 1, it->offset_ + slice * totalCount_ / nslices_,
+                          it->offset_ + slice * totalCount_ / nslices_,
+                          it->count_, 2, flagcxCommOpBroadcast);
                     }
                   }
                   // refresh buffer info for the allgather phase
