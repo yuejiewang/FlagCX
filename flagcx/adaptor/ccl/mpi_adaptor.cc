@@ -27,6 +27,11 @@ flagcxResult_t mpiAdaptorGetUniqueId(flagcxUniqueId_t *uniqueId) {
   return flagcxSuccess;
 }
 
+flagcxResult_t mpiAdaptorGetStagedBuffer(const flagcxInnerComm_t comm,
+                                         void **buff, size_t size, int isRecv) {
+  return flagcxNotSupported;
+}
+
 const char *mpiAdaptorGetErrorString(flagcxResult_t result) {
   switch (result) {
     case flagcxSuccess:
@@ -152,6 +157,17 @@ flagcxResult_t mpiAdaptorCommRegister(flagcxInnerComm_t comm, void *buff,
 
 // TODO: unsupported
 flagcxResult_t mpiAdaptorCommDeregister(flagcxInnerComm_t comm, void *handle) {
+  return flagcxNotSupported;
+}
+
+flagcxResult_t mpiAdaptorCommWindowRegister(flagcxInnerComm_t comm, void *buff,
+                                            size_t size, flagcxWindow_t *win,
+                                            int winFlags) {
+  return flagcxNotSupported;
+}
+
+flagcxResult_t mpiAdaptorCommWindowDeregister(flagcxInnerComm_t comm,
+                                              flagcxWindow_t win) {
   return flagcxNotSupported;
 }
 
@@ -335,13 +351,15 @@ struct flagcxCCLAdaptor mpiAdaptor = {
     "MPI",
     // Basic functions
     mpiAdaptorGetVersion, mpiAdaptorGetUniqueId, mpiAdaptorGetErrorString,
-    mpiAdaptorGetLastError,
+    mpiAdaptorGetLastError, mpiAdaptorGetStagedBuffer,
     // Communicator functions
     mpiAdaptorCommInitRank, mpiAdaptorCommFinalize, mpiAdaptorCommDestroy,
     mpiAdaptorCommAbort, mpiAdaptorCommResume, mpiAdaptorCommSuspend,
     mpiAdaptorCommCount, mpiAdaptorCommCuDevice, mpiAdaptorCommUserRank,
     mpiAdaptorCommGetAsyncError, mpiAdaptorMemAlloc, mpiAdaptorMemFree,
     mpiAdaptorCommRegister, mpiAdaptorCommDeregister,
+    // Symmetric functions
+    mpiAdaptorCommWindowRegister, mpiAdaptorCommWindowDeregister,
     // Communication functions
     mpiAdaptorReduce, mpiAdaptorGather, mpiAdaptorScatter, mpiAdaptorBroadcast,
     mpiAdaptorAllReduce, mpiAdaptorReduceScatter, mpiAdaptorAllGather,

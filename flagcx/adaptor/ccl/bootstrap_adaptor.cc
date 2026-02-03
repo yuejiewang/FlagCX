@@ -13,6 +13,12 @@ flagcxResult_t bootstrapAdaptorGetUniqueId(flagcxUniqueId_t *uniqueId) {
   return flagcxNotSupported;
 }
 
+flagcxResult_t bootstrapAdaptorGetStagedBuffer(const flagcxInnerComm_t comm,
+                                               void **buff, size_t size,
+                                               int isRecv) {
+  return flagcxNotSupported;
+}
+
 // TODO: unsupported
 const char *bootstrapAdaptorGetErrorString(flagcxResult_t result) {
   return "Not Implemented";
@@ -101,6 +107,18 @@ flagcxResult_t bootstrapAdaptorCommRegister(flagcxInnerComm_t comm, void *buff,
 // TODO: unsupported
 flagcxResult_t bootstrapAdaptorCommDeregister(flagcxInnerComm_t comm,
                                               void *handle) {
+  return flagcxNotSupported;
+}
+
+flagcxResult_t bootstrapAdaptorCommWindowRegister(flagcxInnerComm_t comm,
+                                                  void *buff, size_t size,
+                                                  flagcxWindow_t *win,
+                                                  int winFlags) {
+  return flagcxNotSupported;
+}
+
+flagcxResult_t bootstrapAdaptorCommWindowDeregister(flagcxInnerComm_t comm,
+                                                    flagcxWindow_t win) {
   return flagcxNotSupported;
 }
 
@@ -226,6 +244,7 @@ struct flagcxCCLAdaptor bootstrapAdaptor = {
     // Basic functions
     bootstrapAdaptorGetVersion, bootstrapAdaptorGetUniqueId,
     bootstrapAdaptorGetErrorString, bootstrapAdaptorGetLastError,
+    bootstrapAdaptorGetStagedBuffer,
     // Communicator functions
     bootstrapAdaptorCommInitRank, bootstrapAdaptorCommFinalize,
     bootstrapAdaptorCommDestroy, bootstrapAdaptorCommAbort,
@@ -234,6 +253,8 @@ struct flagcxCCLAdaptor bootstrapAdaptor = {
     bootstrapAdaptorCommUserRank, bootstrapAdaptorCommGetAsyncError,
     bootstrapAdaptorMemAlloc, bootstrapAdaptorMemFree,
     bootstrapAdaptorCommRegister, bootstrapAdaptorCommDeregister,
+    // Symmetric functions
+    bootstrapAdaptorCommWindowRegister, bootstrapAdaptorCommWindowDeregister,
     // Communication functions
     bootstrapAdaptorReduce, bootstrapAdaptorGather, bootstrapAdaptorScatter,
     bootstrapAdaptorBroadcast, bootstrapAdaptorAllReduce,

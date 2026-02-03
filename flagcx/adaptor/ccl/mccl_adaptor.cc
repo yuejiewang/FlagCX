@@ -18,6 +18,12 @@ flagcxResult_t mcclAdaptorGetUniqueId(flagcxUniqueId_t *uniqueId) {
   return (flagcxResult_t)mcclGetUniqueId((mcclUniqueId *)(*uniqueId));
 }
 
+flagcxResult_t mcclAdaptorGetStagedBuffer(const flagcxInnerComm_t comm,
+                                          void **buff, size_t size,
+                                          int isRecv) {
+  return flagcxNotSupported;
+}
+
 const char *mcclAdaptorGetErrorString(flagcxResult_t result) {
   return mcclGetErrorString((mcclResult_t)result);
 }
@@ -92,6 +98,17 @@ flagcxResult_t mcclAdaptorCommRegister(flagcxInnerComm_t comm, void *buff,
 
 // TODO: unsupported
 flagcxResult_t mcclAdaptorCommDeregister(flagcxInnerComm_t comm, void *handle) {
+  return flagcxNotSupported;
+}
+
+flagcxResult_t mcclAdaptorCommWindowRegister(flagcxInnerComm_t comm, void *buff,
+                                             size_t size, flagcxWindow_t *win,
+                                             int winFlags) {
+  return flagcxNotSupported;
+}
+
+flagcxResult_t mcclAdaptorCommWindowDeregister(flagcxInnerComm_t comm,
+                                               flagcxWindow_t win) {
   return flagcxNotSupported;
 }
 
@@ -272,13 +289,15 @@ struct flagcxCCLAdaptor mcclAdaptor = {
     "MCCL",
     // Basic functions
     mcclAdaptorGetVersion, mcclAdaptorGetUniqueId, mcclAdaptorGetErrorString,
-    mcclAdaptorGetLastError,
+    mcclAdaptorGetLastError, mcclAdaptorGetStagedBuffer,
     // Communicator functions
     mcclAdaptorCommInitRank, mcclAdaptorCommFinalize, mcclAdaptorCommDestroy,
     mcclAdaptorCommAbort, mcclAdaptorCommResume, mcclAdaptorCommSuspend,
     mcclAdaptorCommCount, mcclAdaptorCommMcDevice, mcclAdaptorCommUserRank,
     mcclAdaptorCommGetAsyncError, mcclAdaptorMemAlloc, mcclAdaptorMemFree,
     mcclAdaptorCommRegister, mcclAdaptorCommDeregister,
+    // Symmetric functions
+    mcclAdaptorCommWindowRegister, mcclAdaptorCommWindowDeregister,
     // Communication functions
     mcclAdaptorReduce, mcclAdaptorGather, mcclAdaptorScatter,
     mcclAdaptorBroadcast, mcclAdaptorAllReduce, mcclAdaptorReduceScatter,

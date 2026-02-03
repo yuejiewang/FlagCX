@@ -13,6 +13,12 @@ flagcxResult_t glooAdaptorGetUniqueId(flagcxUniqueId_t *uniqueId) {
   return flagcxNotSupported;
 }
 
+flagcxResult_t glooAdaptorGetStagedBuffer(const flagcxInnerComm_t comm,
+                                          void **buff, size_t size,
+                                          int isRecv) {
+  return flagcxNotSupported;
+}
+
 // TODO: unsupported
 const char *glooAdaptorGetErrorString(flagcxResult_t result) {
   return "Not Implemented";
@@ -131,6 +137,17 @@ flagcxResult_t glooAdaptorCommRegister(flagcxInnerComm_t comm, void *buff,
 
 // TODO: unsupported
 flagcxResult_t glooAdaptorCommDeregister(flagcxInnerComm_t comm, void *handle) {
+  return flagcxNotSupported;
+}
+
+flagcxResult_t glooAdaptorCommWindowRegister(flagcxInnerComm_t comm, void *buff,
+                                             size_t size, flagcxWindow_t *win,
+                                             int winFlags) {
+  return flagcxNotSupported;
+}
+
+flagcxResult_t glooAdaptorCommWindowDeregister(flagcxInnerComm_t comm,
+                                               flagcxWindow_t win) {
   return flagcxNotSupported;
 }
 
@@ -319,13 +336,15 @@ struct flagcxCCLAdaptor glooAdaptor = {
     "GLOO",
     // Basic functions
     glooAdaptorGetVersion, glooAdaptorGetUniqueId, glooAdaptorGetErrorString,
-    glooAdaptorGetLastError,
+    glooAdaptorGetLastError, glooAdaptorGetStagedBuffer,
     // Communicator functions
     glooAdaptorCommInitRank, glooAdaptorCommFinalize, glooAdaptorCommDestroy,
     glooAdaptorCommAbort, glooAdaptorCommResume, glooAdaptorCommSuspend,
     glooAdaptorCommCount, glooAdaptorCommCuDevice, glooAdaptorCommUserRank,
     glooAdaptorCommGetAsyncError, glooAdaptorMemAlloc, glooAdaptorMemFree,
     glooAdaptorCommRegister, glooAdaptorCommDeregister,
+    // Symmetric functions
+    glooAdaptorCommWindowRegister, glooAdaptorCommWindowDeregister,
     // Communication functions
     glooAdaptorReduce, glooAdaptorGather, glooAdaptorScatter,
     glooAdaptorBroadcast, glooAdaptorAllReduce, glooAdaptorReduceScatter,

@@ -2,6 +2,43 @@
 
 #ifdef USE_NVIDIA_ADAPTOR
 
+#if NCCL_VERSION_CODE > NCCL_VERSION(2, 28, 0)
+#include "nccl_device.h"
+
+#define NCCL_ADAPTOR_DEVICE_CTA_COUNT 36
+#define NCCL_ADAPTOR_MAX_STAGED_BUFFER_SIZE (8 * 1024 * 1024)
+
+// Try to load custom ops once
+#define MAX_NUM_COMM_OPS 16
+static bool customOpLoaded[MAX_NUM_COMM_OPS] = {false};
+
+using customAllReduce_t =
+    flagcxCustomOpFunc_t<ncclWindow_t, ncclWindow_t, void *, size_t,
+                         flagcxDataType_t, int, ncclDevComm &, cudaStream_t>;
+static customAllReduce_t localAllReduce = NULL;
+static customAllReduce_t interleavedAllReduce = NULL;
+
+template <typename T>
+flagcxResult_t loadCommOpFuncSymbol(const char *path, const char *name, T *fn) {
+  void *handle = flagcxOpenLib(
+      path, RTLD_LAZY, [](const char *p, int err, const char *msg) {
+        fprintf(stderr, "dlopen failed: %s\n", dlerror());
+      });
+  if (!handle)
+    return flagcxSystemError;
+
+  void *sym = dlsym(handle, name);
+  if (!sym) {
+    fprintf(stderr, "dlsym failed: %s\n", dlerror());
+    dlclose(handle);
+    return flagcxSystemError;
+  }
+
+  *fn = (T)sym;
+  return flagcxSuccess;
+}
+#endif // NCCL_VERSION_CODE > NCCL_VERSION(2, 28, 0)
+
 flagcxResult_t ncclAdaptorGetVersion(int *version) {
   return (flagcxResult_t)ncclGetVersion(version);
 }
@@ -11,6 +48,61 @@ flagcxResult_t ncclAdaptorGetUniqueId(flagcxUniqueId_t *uniqueId) {
     flagcxCalloc(uniqueId, 1);
   }
   return (flagcxResult_t)ncclGetUniqueId((ncclUniqueId *)(*uniqueId));
+}
+
+flagcxResult_t ncclAdaptorGetStagedBuffer(const flagcxInnerComm_t comm,
+                                          void **buff, size_t /*size*/,
+                                          int isRecv) {
+  flagcxResult_t res = flagcxSuccess;
+#if NCCL_VERSION_CODE > NCCL_VERSION(2, 28, 0)
+  if (isRecv && comm->recvStagedBuff == NULL) {
+    FLAGCXCHECK(flagcxCalloc(&comm->recvStagedBuff, 1));
+    res = (flagcxResult_t)ncclMemAlloc(&comm->recvStagedBuff->buff,
+                                       NCCL_ADAPTOR_MAX_STAGED_BUFFER_SIZE);
+    if (res != flagcxSuccess) {
+      free(comm->recvStagedBuff);
+      comm->recvStagedBuff = NULL;
+      return res;
+    }
+    res = (flagcxResult_t)ncclCommWindowRegister(
+        comm->base, comm->recvStagedBuff->buff,
+        NCCL_ADAPTOR_MAX_STAGED_BUFFER_SIZE, &comm->recvStagedBuff->win,
+        NCCL_WIN_COLL_SYMMETRIC);
+    if (res != flagcxSuccess) {
+      (void)ncclMemFree(comm->recvStagedBuff->buff);
+      free(comm->recvStagedBuff);
+      comm->recvStagedBuff = NULL;
+      return res;
+    }
+  } else if (!isRecv && comm->sendStagedBuff == NULL) {
+    FLAGCXCHECK(flagcxCalloc(&comm->sendStagedBuff, 1));
+    res = (flagcxResult_t)ncclMemAlloc(&comm->sendStagedBuff->buff,
+                                       NCCL_ADAPTOR_MAX_STAGED_BUFFER_SIZE);
+    if (res != flagcxSuccess) {
+      free(comm->sendStagedBuff);
+      comm->sendStagedBuff = NULL;
+      return res;
+    }
+    res = (flagcxResult_t)ncclCommWindowRegister(
+        comm->base, comm->sendStagedBuff->buff,
+        NCCL_ADAPTOR_MAX_STAGED_BUFFER_SIZE, &comm->sendStagedBuff->win,
+        NCCL_WIN_COLL_SYMMETRIC);
+    if (res != flagcxSuccess) {
+      (void)ncclMemFree(comm->sendStagedBuff->buff);
+      free(comm->sendStagedBuff);
+      comm->sendStagedBuff = NULL;
+      return res;
+    }
+  }
+  if (buff) {
+    if (isRecv) {
+      *buff = comm->recvStagedBuff->buff;
+    } else {
+      *buff = comm->sendStagedBuff->buff;
+    }
+  }
+#endif // NCCL_VERSION_CODE > NCCL_VERSION(2, 28, 0)
+  return res;
 }
 
 const char *ncclAdaptorGetErrorString(flagcxResult_t result) {
@@ -25,22 +117,110 @@ flagcxResult_t ncclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
                                        flagcxUniqueId_t commId, int rank,
                                        bootstrapState * /*bootstrap*/) {
   if (*comm == NULL) {
-    flagcxCalloc(comm, 1);
+    void *p = malloc(sizeof(struct flagcxInnerComm));
+    memset(p, 0, sizeof(struct flagcxInnerComm));
+    (*comm) = (struct flagcxInnerComm *)p;
   }
-  return (flagcxResult_t)ncclCommInitRank(&(*comm)->base, nranks,
-                                          *(ncclUniqueId *)commId, rank);
+  FLAGCXCHECK((flagcxResult_t)ncclCommInitRank(&(*comm)->base, nranks,
+                                               *(ncclUniqueId *)commId, rank));
+
+#if NCCL_VERSION_CODE > NCCL_VERSION(2, 28, 0)
+  if ((*comm)->devBase == NULL) {
+    // TODO(MC952-arch): auto-detect symmetric support
+    // Create device communicator
+    FLAGCXCHECK(flagcxCalloc(&(*comm)->devBase, 1));
+    ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    reqs.lsaBarrierCount = NCCL_ADAPTOR_DEVICE_CTA_COUNT;
+    // TODO(MC952-arch): auto-detect multimem support
+    reqs.lsaMultimem = true;
+    using pncclDevCommCreate_t = ncclResult_t (*)(
+        ncclComm_t comm, ncclDevCommRequirements *, ncclDevComm *);
+    void *handle = dlopen("libnccl.so", RTLD_NOW | RTLD_GLOBAL);
+    if (handle) {
+      auto fn = reinterpret_cast<pncclDevCommCreate_t>(
+          dlsym(handle, "pncclDevCommCreate"));
+      if (fn) {
+        FLAGCXCHECK((flagcxResult_t)fn((*comm)->base, &reqs, (*comm)->devBase));
+      }
+      dlclose(handle);
+    }
+    if ((*comm)->devBase == NULL) {
+      WARN("ncclDevComm is not initialized succefully");
+    }
+  }
+#endif
+  FLAGCXCHECK(ncclAdaptorGetStagedBuffer(*comm, NULL, 0, 1));
+  FLAGCXCHECK(ncclAdaptorGetStagedBuffer(*comm, NULL, 0, 0));
+  return flagcxSuccess;
 }
 
 flagcxResult_t ncclAdaptorCommFinalize(flagcxInnerComm_t comm) {
-  return (flagcxResult_t)ncclCommFinalize(comm->base);
+#if NCCL_VERSION_CODE > NCCL_VERSION(2, 28, 0)
+  if (comm->sendStagedBuff != NULL) {
+    FLAGCXCHECK((flagcxResult_t)ncclCommWindowDeregister(
+        comm->base, comm->sendStagedBuff->win));
+    FLAGCXCHECK((flagcxResult_t)ncclMemFree(comm->sendStagedBuff->buff));
+    free(comm->sendStagedBuff);
+  }
+  if (comm->recvStagedBuff != NULL) {
+    FLAGCXCHECK((flagcxResult_t)ncclCommWindowDeregister(
+        comm->base, comm->recvStagedBuff->win));
+    FLAGCXCHECK((flagcxResult_t)ncclMemFree(comm->recvStagedBuff->buff));
+    free(comm->recvStagedBuff);
+  }
+  if (comm->devBase != NULL) {
+    free(comm->devBase);
+  }
+#endif
+  FLAGCXCHECK((flagcxResult_t)ncclCommFinalize(comm->base));
+  free(comm);
+  return flagcxSuccess;
 }
 
 flagcxResult_t ncclAdaptorCommDestroy(flagcxInnerComm_t comm) {
-  return (flagcxResult_t)ncclCommDestroy(comm->base);
+#if NCCL_VERSION_CODE > NCCL_VERSION(2, 28, 0)
+  if (comm->sendStagedBuff != NULL) {
+    FLAGCXCHECK((flagcxResult_t)ncclCommWindowDeregister(
+        comm->base, comm->sendStagedBuff->win));
+    FLAGCXCHECK((flagcxResult_t)ncclMemFree(comm->sendStagedBuff->buff));
+    free(comm->sendStagedBuff);
+  }
+  if (comm->recvStagedBuff != NULL) {
+    FLAGCXCHECK((flagcxResult_t)ncclCommWindowDeregister(
+        comm->base, comm->recvStagedBuff->win));
+    FLAGCXCHECK((flagcxResult_t)ncclMemFree(comm->recvStagedBuff->buff));
+    free(comm->recvStagedBuff);
+  }
+  if (comm->devBase != NULL) {
+    free(comm->devBase);
+  }
+#endif
+  FLAGCXCHECK((flagcxResult_t)ncclCommDestroy(comm->base));
+  free(comm);
+  return flagcxSuccess;
 }
 
 flagcxResult_t ncclAdaptorCommAbort(flagcxInnerComm_t comm) {
-  return (flagcxResult_t)ncclCommAbort(comm->base);
+#if NCCL_VERSION_CODE > NCCL_VERSION(2, 28, 0)
+  if (comm->sendStagedBuff != NULL) {
+    FLAGCXCHECK((flagcxResult_t)ncclCommWindowDeregister(
+        comm->base, comm->sendStagedBuff->win));
+    FLAGCXCHECK((flagcxResult_t)ncclMemFree(comm->sendStagedBuff->buff));
+    free(comm->sendStagedBuff);
+  }
+  if (comm->recvStagedBuff != NULL) {
+    FLAGCXCHECK((flagcxResult_t)ncclCommWindowDeregister(
+        comm->base, comm->recvStagedBuff->win));
+    FLAGCXCHECK((flagcxResult_t)ncclMemFree(comm->recvStagedBuff->buff));
+    free(comm->recvStagedBuff);
+  }
+  if (comm->devBase != NULL) {
+    free(comm->devBase);
+  }
+#endif
+  FLAGCXCHECK((flagcxResult_t)ncclCommAbort(comm->base));
+  free(comm);
+  return flagcxSuccess;
 }
 
 flagcxResult_t ncclAdaptorCommResume(flagcxInnerComm_t comm) {
@@ -87,6 +267,32 @@ flagcxResult_t ncclAdaptorCommRegister(const flagcxInnerComm_t comm, void *buff,
 flagcxResult_t ncclAdaptorCommDeregister(const flagcxInnerComm_t comm,
                                          void *handle) {
   return (flagcxResult_t)ncclCommDeregister(comm->base, handle);
+}
+
+flagcxResult_t ncclAdaptorCommWindowRegister(flagcxInnerComm_t comm, void *buff,
+                                             size_t size, flagcxWindow_t *win,
+                                             int winFlags) {
+#if NCCL_VERSION_CODE > NCCL_VERSION(2, 27, 0)
+  if (*win == NULL) {
+    FLAGCXCHECK(flagcxCalloc(win, 1));
+  }
+  return (flagcxResult_t)ncclCommWindowRegister(comm->base, buff, size,
+                                                &(*win)->base, winFlags);
+#else
+  return flagcxNotSupported;
+#endif
+}
+
+flagcxResult_t ncclAdaptorCommWindowDeregister(flagcxInnerComm_t comm,
+                                               flagcxWindow_t win) {
+#if NCCL_VERSION_CODE > NCCL_VERSION(2, 27, 0)
+  flagcxResult_t res = flagcxSuccess;
+  res = (flagcxResult_t)ncclCommWindowDeregister(comm->base, win->base);
+  free(win);
+  return res;
+#else
+  return flagcxNotSupported;
+#endif
 }
 
 flagcxResult_t ncclAdaptorReduce(const void *sendbuff, void *recvbuff,
@@ -162,9 +368,51 @@ flagcxResult_t ncclAdaptorAllReduce(const void *sendbuff, void *recvbuff,
                                     size_t count, flagcxDataType_t datatype,
                                     flagcxRedOp_t op, flagcxInnerComm_t comm,
                                     flagcxStream_t stream) {
+#if NCCL_VERSION_CODE > NCCL_VERSION(2, 28, 0)
+  // TODO(MC952-arch): use a mutex to avoid race condition in multi-thread
+  // scenario
+  if (!customOpLoaded[flagcxCommOpAllReduce]) {
+    const char *customAllreducePathEnv =
+        flagcxGetEnv("FLAGCX_CUSTOM_ALLREDUCE_PATH");
+    if (customAllreducePathEnv) {
+      FLAGCXCHECK(loadCommOpFuncSymbol<customAllReduce_t>(
+          customAllreducePathEnv, "flagcxLocalAllReduce", &localAllReduce));
+      FLAGCXCHECK(loadCommOpFuncSymbol<customAllReduce_t>(
+          customAllreducePathEnv, "flagcxInterleavedAllReduce",
+          &interleavedAllReduce));
+    }
+    customOpLoaded[flagcxCommOpAllReduce] = true;
+  }
+  size_t size = count * getFlagcxDataTypeSize(datatype);
+  int nranks;
+  FLAGCXCHECK((flagcxResult_t)ncclCommCount(comm->base, &nranks));
+  if (localAllReduce == NULL || interleavedAllReduce == NULL ||
+      size >= NCCL_ADAPTOR_MAX_STAGED_BUFFER_SIZE) {
+    return (flagcxResult_t)ncclAllReduce(
+        sendbuff, recvbuff, count, (ncclDataType_t)datatype, (ncclRedOp_t)op,
+        comm->base, stream->base);
+  } else {
+    DEVCHECK(cudaMemcpyAsync(comm->sendStagedBuff->buff, sendbuff, size,
+                             cudaMemcpyDeviceToDevice, stream->base));
+    if ((nranks <= 4 && size < 512 * 1024) ||
+        (nranks <= 8 && size < 256 * 1024)) {
+      localAllReduce(comm->sendStagedBuff->win, comm->recvStagedBuff->win,
+                     recvbuff, count, datatype, nranks, *comm->devBase,
+                     stream->base);
+    } else {
+      interleavedAllReduce(comm->sendStagedBuff->win, comm->recvStagedBuff->win,
+                           recvbuff, count, datatype, nranks, *comm->devBase,
+                           stream->base);
+      DEVCHECK(cudaMemcpyAsync(recvbuff, comm->recvStagedBuff->buff, size,
+                               cudaMemcpyDeviceToDevice, stream->base));
+    }
+  }
+  return flagcxSuccess;
+#else
   return (flagcxResult_t)ncclAllReduce(
       sendbuff, recvbuff, count, (ncclDataType_t)datatype, (ncclRedOp_t)op,
       comm->base, stream->base);
+#endif
 }
 
 flagcxResult_t
@@ -265,13 +513,15 @@ struct flagcxCCLAdaptor ncclAdaptor = {
     "NCCL",
     // Basic functions
     ncclAdaptorGetVersion, ncclAdaptorGetUniqueId, ncclAdaptorGetErrorString,
-    ncclAdaptorGetLastError,
+    ncclAdaptorGetLastError, ncclAdaptorGetStagedBuffer,
     // Communicator functions
     ncclAdaptorCommInitRank, ncclAdaptorCommFinalize, ncclAdaptorCommDestroy,
     ncclAdaptorCommAbort, ncclAdaptorCommResume, ncclAdaptorCommSuspend,
     ncclAdaptorCommCount, ncclAdaptorCommCuDevice, ncclAdaptorCommUserRank,
     ncclAdaptorCommGetAsyncError, ncclAdaptorMemAlloc, ncclAdaptorMemFree,
     ncclAdaptorCommRegister, ncclAdaptorCommDeregister,
+    // Symmetric functions
+    ncclAdaptorCommWindowRegister, ncclAdaptorCommWindowDeregister,
     // Communication functions
     ncclAdaptorReduce, ncclAdaptorGather, ncclAdaptorScatter,
     ncclAdaptorBroadcast, ncclAdaptorAllReduce, ncclAdaptorReduceScatter,
