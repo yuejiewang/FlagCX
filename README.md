@@ -89,9 +89,9 @@ Note that PyTorch support is enabled via the FlagCX Torch plugin, which provides
 This plugin has undergone comprehensive validation across diverse communication backends and hardware platforms,
 ensuring robust functionality, consistent performance, and compatibility in multi-chip heterogeneous environments.
 
-| FlagCX Backend  | NCCL | IXCCL | CNCL | MCCL | XCCL | DUCCL | HCCL | MUSACCL | RCCL | ECCL |
-| :-------------- | :--- | :---- | :--- | :--- | :--- | :---- | :--- | :------ | :--- | :--- |
-| PyTorch Support | ✓    | ✓     | ✓    | ✓    | ✓    | ✓     | ✓    | ✓       | ✓    |✓    |
+| FlagCX Backend  | NCCL | IXCCL | CNCL | MCCL | XCCL | DUCCL | HCCL | MUSACCL | RCCL | TCCL | ECCL |
+| :-------------- | :--- | :---- | :--- | :--- | :--- | :---- | :--- | :------ | :--- | :--- | :--- |
+| PyTorch Support | ✓    | ✓     | ✓    | ✓    | ✓    | ✓     | ✓    | ✓       | ✓    | ✓    |✓    |
 
 > [!TIP]
 > To enable heterogeneous cross-chip communication using the PyTorch DDP FlagCX backend,

@@ -37,6 +37,7 @@ adaptor_map = {
     "klx": "-DUSE_KUNLUNXIN_ADAPTOR",
     "ascend": "-DUSE_ASCEND_ADAPTOR",
     "amd": "-DUSE_AMD_ADAPTOR",
+    "tsm": "-DUSE_TSM_ADAPTOR",
     "enflame": "-DUSE_ENFLAME_ADAPTOR"
 }
 adaptor_flag = adaptor_map[adaptor]
@@ -113,6 +114,13 @@ elif adaptor_flag == "-DUSE_AMD_ADAPTOR":
     include_dirs += ["/opt/rocm/include"]
     library_dirs += ["/opt/rocm/lib"]
     libs += ["hiprtc", "c10_hip", "torch_hip"]
+elif adaptor_flag == "-DUSE_TSM_ADAPTOR":
+    import torch_txda
+    txda_install_path = os.path.dirname(os.path.abspath(torch_txda.__file__))
+    txda_library_path = os.path.join(txda_install_path, "lib")
+    include_dirs += ["/usr/local/kuiper/include", os.path.join(txda_install_path, "include")]
+    library_dirs += ["/usr/local/kuiper/lib",txda_library_path]
+    libs += ["torch_txda", "hpgr"]
 elif adaptor_flag == "-DUSE_ENFLAME_ADAPTOR":
     import torch_gcu
     pytorch_gcu_install_path = os.path.dirname(os.path.abspath(torch_gcu.__file__))

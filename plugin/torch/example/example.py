@@ -17,7 +17,12 @@ except:
             import transfer_to_musa
             dev_name = "musa"
         except:
-            dev_name = "cuda"
+            try:
+                import torch_txda
+                from torch_txda import transfer_to_txda
+                dev_name = "txda"
+            except:
+                dev_name = "cuda"
 
 import flagcx
 import torch.distributed as dist
