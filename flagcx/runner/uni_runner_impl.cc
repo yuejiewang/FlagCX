@@ -573,14 +573,22 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
     return flagcxSystemError;
   }
 
-  int next_rank = (rank + 1) % nranks;
-  int prev_rank = (rank - 1 + nranks) % nranks;
+  int nextRank = (rank + 1) % nranks;
+  int prevRank = (rank - 1 + nranks) % nranks;
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
   // Pipeline configuration
-  size_t rankChunkCount = count / nranks;
-  size_t sliceCount = rankChunkCount / numSlices;
-  size_t redSliceCount = sliceCount / numRedSlices;
+  // Assume that count >> nranks * numSlices * numRedSlices
+  size_t redSliceCount = (count + nranks * numSlices * numRedSlices - 1) /
+                         (nranks * numSlices * numRedSlices);
+  size_t sliceCount = redSliceCount * numRedSlices;
+  size_t rankChunkCount = sliceCount * numSlices;
+  size_t lastChunkCount = count % rankChunkCount;
+  size_t lastNumSlices = (lastChunkCount + sliceCount - 1) / sliceCount;
+  size_t lastSliceCount = lastChunkCount % sliceCount;
+  size_t lastNumRedSlices =
+      (lastSliceCount + redSliceCount - 1) / redSliceCount;
+  size_t lastRedSliceCount = lastSliceCount % redSliceCount;
 
   // Nodes per slice chain:
   // Scatter-Reduce: (P2P + Reduce * numRedSlices) * (nranks - 1)
@@ -619,35 +627,55 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
           flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
                        2 * sizeof(struct uniRunnerP2pOpData)));
 
-      int tx_chunk = (rank - i + nranks) % nranks;
-      int rx_chunk = (rank - i - 1 + nranks) % nranks;
+      int txChunk = (rank - i + nranks) % nranks;
+      int rxChunk = (rank - i - 1 + nranks) % nranks;
 
-      size_t tx_offset =
-          (tx_chunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
-      size_t rx_offset =
-          (rx_chunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
+      size_t txOffset =
+          (txChunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
+      size_t rxOffset =
+          (rxChunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
+
+      size_t txSliceCount = sliceCount;
+      size_t rxSliceCount = sliceCount;
+      // Adjust for the last chunk
+      if (txChunk == nranks - 1) {
+        if (s == lastNumSlices - 1) {
+          txSliceCount = lastSliceCount;
+        } else if (s > lastNumSlices - 1) {
+          txSliceCount = 0;
+          txOffset = 0;
+        }
+      }
+      if (rxChunk == nranks - 1) {
+        if (s == lastNumSlices - 1) {
+          rxSliceCount = lastSliceCount;
+        } else if (s > lastNumSlices - 1) {
+          rxSliceCount = 0;
+          rxOffset = 0;
+        }
+      }
 
       // Op 0: Send
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimSend;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank =
-          next_rank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank = nextRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count =
+          txSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
       // First step sends from sendbuff, others from recvbuff
       void *srcBase = (i == 0) ? const_cast<void *>(sendbuff) : recvbuff;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].addr =
-          static_cast<void *>(static_cast<char *>(srcBase) + tx_offset);
+          static_cast<void *>(static_cast<char *>(srcBase) + txOffset);
 
       // Op 1: Recv
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
           flagcxDevicePrimRecv;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank =
-          prev_rank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank = prevRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count =
+          rxSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
-          static_cast<void *>(static_cast<char *>(recvbuff) + rx_offset);
+          static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
 
       // Set up p2p node dependency
       if (p2pNodeIdx == 0) {
@@ -688,10 +716,19 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
       for (int r = 0; r < numRedSlices; r++) {
         int redNodeIdx = globalNodeIdx++;
         runnerState->dagNodes[redNodeIdx].nodeType = uniRunnerDagNodeTypeRed;
-        size_t redOffset = rx_offset + r * redSliceCount * typeSize;
-        size_t redCount = (r == numRedSlices - 1)
-                              ? (sliceCount - r * redSliceCount)
-                              : redSliceCount;
+        size_t redOffset = rxOffset + r * redSliceCount * typeSize;
+        size_t redCount = redSliceCount;
+        if (rxSliceCount == 0) {
+          redOffset = 0;
+          redCount = 0;
+        } else if (rxChunk == nranks - 1) {
+          if (r == lastNumRedSlices - 1) {
+            redCount = lastRedSliceCount;
+          } else if (r > lastNumRedSlices - 1) {
+            redOffset = 0;
+            redCount = 0;
+          }
+        }
         runnerState->dagNodes[redNodeIdx].nodeData.red.input1 =
             static_cast<void *>(static_cast<char *>(recvbuff) + redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.input2 =
@@ -728,33 +765,53 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
           flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
                        2 * sizeof(struct uniRunnerP2pOpData)));
 
-      int tx_chunk = (rank - i + 1 + nranks) % nranks;
-      int rx_chunk = (rank - i + nranks) % nranks;
+      int txChunk = (rank - i + 1 + nranks) % nranks;
+      int rxChunk = (rank - i + nranks) % nranks;
 
-      size_t tx_offset =
-          (tx_chunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
-      size_t rx_offset =
-          (rx_chunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
+      size_t txOffset =
+          (txChunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
+      size_t rxOffset =
+          (rxChunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
+
+      size_t txSliceCount = sliceCount;
+      size_t rxSliceCount = sliceCount;
+      // Adjust for the last chunk
+      if (txChunk == nranks - 1) {
+        if (s == lastNumSlices - 1) {
+          txSliceCount = lastSliceCount;
+        } else if (s > lastNumSlices - 1) {
+          txSliceCount = 0;
+          txOffset = 0;
+        }
+      }
+      if (rxChunk == nranks - 1) {
+        if (s == lastNumSlices - 1) {
+          rxSliceCount = lastSliceCount;
+        } else if (s > lastNumSlices - 1) {
+          rxSliceCount = 0;
+          rxOffset = 0;
+        }
+      }
 
       // Op 0: Send
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimSend;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank =
-          next_rank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank = nextRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count =
+          txSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].addr =
-          static_cast<void *>(static_cast<char *>(recvbuff) + tx_offset);
+          static_cast<void *>(static_cast<char *>(recvbuff) + txOffset);
 
       // Op 1: Recv
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
           flagcxDevicePrimRecv;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank =
-          prev_rank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank = prevRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count =
+          rxSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
-          static_cast<void *>(static_cast<char *>(recvbuff) + rx_offset);
+          static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
 
       // Set up all-gather phase p2p node dependency
       runnerState->numPendingNodes++;
@@ -874,6 +931,9 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
     FLAGCXCHECK(flagcxHeteroGroupStart());
     for (int i = 0; i < current->nodeData.p2p.numOps; i++) {
       struct uniRunnerP2pOpData *op = &ops[i];
+      if (op->count == 0) {
+        continue; // Skip zero-count ops
+      }
       if (op->type == flagcxDevicePrimSend) {
         FLAGCXCHECK(flagcxHeteroSend(op->addr, op->count, op->datatype,
                                      op->peerRank, comm,

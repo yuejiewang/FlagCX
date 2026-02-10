@@ -65,6 +65,9 @@ FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
 FLAGCX_DEVICE_DECORATOR void
 flagcxReduceKernel(uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
                    uint64_t nthreads, uint64_t datatype, uint64_t redOp) {
+  if (count == 0) {
+    return;
+  }
   // to be implemented by vendors
   int tid = threadIdx.x;
   float *fstPtr = (float *)fst;
