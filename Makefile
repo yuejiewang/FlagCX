@@ -136,7 +136,7 @@ ifeq ($(USE_NVIDIA), 1)
 	DEVICE_RUNTIME = CUDA
 	DEVICE_COMPILER = $(DEVICE_HOME)/bin/nvcc
 	DEVICE_LINKER = $(DEVICE_HOME)/bin/nvcc -dlink
-	DEVICE_COMPILE_FLAG = -c --cudart=shared -Xcompiler -fPIC -MMD -MP -rdc=true -g
+	DEVICE_COMPILE_FLAG = -c --cudart=shared -Xcompiler -fPIC -Xcompiler -fno-omit-frame-pointer -Xcompiler -fno-optimize-sibling-calls -MMD -MP -rdc=true -g
 	DEVICE_LINK_FLAG = --cudart=shared -Xcompiler -fPIC
 	DEVICE_FILE_EXTENSION = cu
 	CCL_LIB = $(CCL_HOME)/lib
@@ -353,12 +353,12 @@ endif
 $(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJS)
 	@mkdir -p `dirname $@`
 	@echo "Linking   $@"
-	@g++ $^ -o $@ -L$(CCL_LIB) -L$(DEVICE_LIB) -L$(HOST_CCL_LIB) -L$(UCX_LIB) -shared -fvisibility=default -Wl,--no-as-needed -Wl,-rpath,$(LIBDIR) -Wl,-rpath,$(CCL_LIB) -Wl,-rpath,$(HOST_CCL_LIB) -Wl,-rpath,$(UCX_LIB) -lpthread -lrt -ldl $(CCL_LINK) $(DEVICE_LINK) $(HOST_CCL_LINK) $(UCX_LINK) -g
+	@g++ $^ -o $@ -L$(CCL_LIB) -L$(DEVICE_LIB) -L$(HOST_CCL_LIB) -L$(UCX_LIB) -shared -fvisibility=default -Wl,--no-as-needed -Wl,-rpath,$(LIBDIR) -Wl,-rpath,$(CCL_LIB) -Wl,-rpath,$(HOST_CCL_LIB) -Wl,-rpath,$(UCX_LIB) -lpthread -lrt -ldl $(CCL_LINK) $(DEVICE_LINK) $(HOST_CCL_LINK) $(UCX_LINK) -g -fno-omit-frame-pointer
 
 $(OBJDIR)/%.o: %.cc
 	@mkdir -p `dirname $@`
 	@echo "Compiling $@"
-	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(COMPILE_KERNEL_HOST_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
+	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(COMPILE_KERNEL_HOST_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g -fno-omit-frame-pointer
 
 ifeq ($(COMPILE_KERNEL), 1)
 $(OBJDIR)/kernel_dlink.o: $(DEVOBJ)
