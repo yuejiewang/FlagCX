@@ -47,7 +47,7 @@ test-sendrecv: test_sendrecv.cpp
 
 test-allreduce: test_allreduce.cpp
 	@echo "Compiling $@"
-	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_allreduce test_allreduce.cpp $(LIBSRCFILES) -I../../flagcx/include -I$(INCLUDEDIR) -I$(JSON_INCLUDE) -I$(MPI_INCLUDE) -L../../build/lib -L$(MPI_LIB) -lflagcx $(MPI_LINK)
+	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_allreduce test_allreduce.cpp $(LIBSRCFILES) -I../../flagcx/include -I$(INCLUDEDIR) -I$(JSON_INCLUDE) -I$(MPI_INCLUDE) -L../../build/lib -L$(MPI_LIB) -lflagcx $(MPI_LINK) -g -fno-omit-frame-pointer
 
 test-allgather: test_allgather.cpp
 	@echo "Compiling $@"
@@ -150,7 +150,7 @@ run-put:
 print_var:
 	@echo "INCLUDEDIR: $(INCLUDEDIR)"
 	@echo "USE_NVIDIA: $(USE_NVIDIA)"
-    @echo "USE_ASCEND: $(USE_ASCEND)"
+	@echo "USE_ASCEND: $(USE_ASCEND)"
 	@echo "USE_ILUVATAR_COREX: $(USE_ILUVATAR_COREX)"
 	@echo "USE_CAMBRICON: $(USE_CAMBRICON)"
 	@echo "USE_DU: $(USE_DU)"
