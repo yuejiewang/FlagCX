@@ -8,13 +8,13 @@
 #define FLAGCX_UTILS_H_
 
 #include "check.h"
+#include "dlsymbols.h"
 #include "global_comm.h"
 #include "pthread.h"
 #include "type.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <dlfcn.h>
 #include <new>
 #include <nlohmann/json.hpp>
 #include <sched.h>
@@ -758,9 +758,6 @@ inline Int pow2Up(Int x) {
   return Int(1) << log2Up(x);
 }
 
-void *flagcxOpenLib(const char *path, int flags,
-                    void (*error_handler)(const char *, int, const char *));
-
 ////////////////////////////////////////////////////////////////////////////////
 // FlagScale configuration structures and functions
 
@@ -790,4 +787,13 @@ inline std::string getTuneObjectCommOp(const TuneObject &obj) {
   return obj.commOp;
 }
 
+// Function pointer types for custom operations
+template <typename T, typename... Args>
+using flagcxCustomOpFunc_t = T (*)(Args...);
+using flagcxLaunchFunc_t = flagcxCustomOpFunc_t<void, flagcxStream_t, void *>;
+
+template <typename T>
+flagcxResult_t loadCustomOpSymbol(const char *path, const char *name, T *fn);
+flagcxResult_t loadKernelSymbol(const char *path, const char *name,
+                                flagcxLaunchFunc_t *fn);
 #endif
