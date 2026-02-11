@@ -137,7 +137,12 @@ ifeq ($(USE_NVIDIA), 1)
 	DEVICE_LINK = -lcudart -lcuda
 	DEVICE_PLATFORM = CUDA
 	DEVICE_COMPILER = $(DEVICE_HOME)/bin/nvcc
+<<<<<<< HEAD
 	DEVICE_COMPILE_FLAG = -c --cudart=shared -Xcompiler -fPIC -MMD -MP -rdc=true -g $(DEVICE_COMPILER_GENCODE)
+=======
+	DEVICE_LINKER = $(DEVICE_HOME)/bin/nvcc -dlink
+	DEVICE_COMPILE_FLAG = -c --cudart=shared -Xcompiler -fPIC -Xcompiler -fno-omit-frame-pointer -Xcompiler -fno-optimize-sibling-calls -MMD -MP -rdc=true -g $(DEVICE_COMPILER_GENCODE)
+>>>>>>> 98c60aa (profile)
 	DEVICE_LINK_FLAG = --cudart=shared -Xcompiler -fPIC $(DEVICE_COMPILER_GENCODE)
 	DEVICE_FILE_EXTENSION = cu
 	CCL_LIB = $(CCL_HOME)/lib

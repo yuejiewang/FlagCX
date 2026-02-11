@@ -25,7 +25,7 @@ all: $(BINS)
 $(BINDIR)/perf_%: test_%.cpp $(COMMON_SRCS)
 	@mkdir -p $(BINDIR)
 	@echo "Compiling $@"
-	@$(CXX) $(CXXFLAGS) -o $@ $< $(COMMON_SRCS) $(ALL_INCLUDES) $(ALL_LINK)
+	@$(CXX) $(CXXFLAGS) -o $@ $< $(COMMON_SRCS) $(ALL_INCLUDES) $(ALL_LINK) -g -fno-omit-frame-pointer
 
 clean:
 	@rm -rf $(BUILDDIR)
