@@ -114,9 +114,11 @@ initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
 
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
-  // Pipeline configuration
-  size_t rankChunkCount = count / nranks;
-  size_t sliceCount = rankChunkCount / numSlices;
+  // Pipeline configuration - handle uneven distribution
+  size_t baseRankChunkCount = count / nranks;
+  size_t rankChunkRemainder = count % nranks;
+  size_t rankChunkCount =
+      baseRankChunkCount + (rank < (int)rankChunkRemainder ? 1 : 0);
 
   const int numNodes = numSlices;
 
@@ -128,8 +130,22 @@ initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
   }
 
   for (int s = 0; s < numSlices; s++) {
-    size_t sliceOffsetInChunk = s * sliceCount * typeSize;
-    size_t rxOffset = (rank * rankChunkCount * typeSize) + sliceOffsetInChunk;
+    size_t baseSliceCount = rankChunkCount / numSlices;
+    size_t sliceRemainder = rankChunkCount % numSlices;
+    // Calculate slice count with uneven distribution
+    size_t sliceCount = baseSliceCount;
+    if (s < sliceRemainder) {
+      sliceCount++;
+    }
+    size_t sliceOffsetInChunk = s * baseSliceCount * typeSize;
+    // Add offset for all previous slices that got the remainder
+    sliceOffsetInChunk += std::min(s, (int)sliceRemainder) * typeSize;
+    // Calculate offset accounting for rankChunkRemainder
+    // First rankChunkRemainder ranks each have one extra element
+    size_t rxOffset =
+        (rank * rankChunkCount + std::min(rank, (int)rankChunkRemainder)) *
+            typeSize +
+        sliceOffsetInChunk;
 
     // Reduce Node
     int redNodeIdx = s;
@@ -184,9 +200,9 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
   int prevRank = (rank - 1 + nranks) % nranks;
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
-  // Pipeline configuration
-  size_t rankChunkCount = count / nranks;
-  size_t sliceCount = rankChunkCount / numSlices;
+  // Pipeline configuration - handle uneven distribution
+  size_t baseRankChunkCount = count / nranks;
+  size_t rankChunkRemainder = count % nranks;
 
   // Nodes per slice chain:
   // All-Gather: P2P * (nranks - 1)
@@ -208,14 +224,8 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
    * p2pNodeIdx = i
    */
   for (int s = 0; s < numSlices; s++) {
-    int sliceNodeBaseIdx = globalNodeIdx;
-    size_t sliceOffsetInChunk = s * sliceCount * typeSize;
-    TRACE(FLAGCX_INIT,
-          "Initializing rank %d slice %d, baseIdx %d, rankCount %lu, "
-          "sliceCount %lu",
-          rank, s, sliceNodeBaseIdx, rankChunkCount, sliceCount);
-
     // All-Gather
+    int sliceNodeBaseIdx = globalNodeIdx;
     for (int i = 0; i < nranks - 1; i++) {
       int p2pNodeIdx = globalNodeIdx++;
       runnerState->dagNodes[p2pNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
@@ -227,20 +237,48 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
       int txChunk = (rank - i + nranks) % nranks;
       int rxChunk = (rank - i - 1 + nranks) % nranks;
 
-      size_t txOffset =
-          (txChunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
-      size_t rxOffset =
-          (rxChunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
-      TRACE(
-          FLAGCX_INIT,
-          "rank %d slice %d step %d, tx chunk %d off %lu, rx chunk %d off %lu",
-          rank, s, i, txChunk, txOffset, rxChunk, rxOffset);
+      // Calculate slice count with uneven distribution (last slice gets
+      // remainder)
+      size_t txRankChunkCount =
+          baseRankChunkCount + (txChunk < (int)rankChunkRemainder ? 1 : 0);
+      size_t rxRankChunkCount =
+          baseRankChunkCount + (rxChunk < (int)rankChunkRemainder ? 1 : 0);
+      size_t txBaseSliceCount = txRankChunkCount / numSlices;
+      size_t rxBaseSliceCount = rxRankChunkCount / numSlices;
+      size_t txSliceRemainder = txRankChunkCount % numSlices;
+      size_t rxSliceRemainder = rxRankChunkCount % numSlices;
+      size_t txSliceCount = txBaseSliceCount + (s < txSliceRemainder ? 1 : 0);
+      size_t rxSliceCount = rxBaseSliceCount + (s < rxSliceRemainder ? 1 : 0);
+      size_t txSliceOffsetInChunk = s * txBaseSliceCount * typeSize;
+      txSliceOffsetInChunk += std::min(s, (int)txSliceRemainder) * typeSize;
+      size_t rxSliceOffsetInChunk = s * rxBaseSliceCount * typeSize;
+      rxSliceOffsetInChunk += std::min(s, (int)rxSliceRemainder) * typeSize;
+
+      // Calculate offsets accounting for rankChunkRemainder
+      // First rankChunkRemainder ranks each have one extra element
+      size_t txOffset = (txChunk * txRankChunkCount +
+                         std::min(txChunk, (int)rankChunkRemainder)) *
+                            typeSize +
+                        txSliceOffsetInChunk;
+      size_t rxOffset = (rxChunk * rxRankChunkCount +
+                         std::min(rxChunk, (int)rankChunkRemainder)) *
+                            typeSize +
+                        rxSliceOffsetInChunk;
+
+      TRACE(FLAGCX_INIT,
+            "Initializing rank %d slice %d, step %d, baseIdx %d, txRankCount "
+            "%lu, txSliceCount %lu, rxRankCount %lu, rxSliceCount %lu, tx "
+            "chunk %d off %lu, rx chunk %d off %lu",
+            rank, s, i, sliceNodeBaseIdx, txRankChunkCount, txSliceCount,
+            rxRankChunkCount, rxSliceCount, txChunk, txOffset, rxChunk,
+            rxOffset);
 
       // Op 0: Send
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimSend;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank = nextRank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count =
+          txSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
       // First step sends from sendbuff, others from recvbuff
       void *srcBase = (i == 0) ? const_cast<void *>(sendbuff) : recvbuff;
@@ -251,7 +289,8 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
           flagcxDevicePrimRecv;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank = prevRank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count =
+          rxSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
           static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
@@ -284,14 +323,20 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
     }
   }
   // Copy local chunk from sendbuff to recvbuff before starting AG
-  size_t localChunkOffset = rank * rankChunkCount * typeSize;
+  // Calculate offset accounting for rankChunkRemainder
+  // First rankChunkRemainder ranks each have one extra element
+  size_t localRankChunkCount =
+      baseRankChunkCount + (rank < (int)rankChunkRemainder ? 1 : 0);
+  size_t localChunkOffset =
+      (rank * baseRankChunkCount + std::min(rank, (int)rankChunkRemainder)) *
+      typeSize;
   int cpyNodeIdx = globalNodeIdx++;
   runnerState->dagNodes[cpyNodeIdx].nodeType = uniRunnerDagNodeTypeCpy;
   runnerState->dagNodes[cpyNodeIdx].nodeData.cpy.src = static_cast<void *>(
       static_cast<char *>(const_cast<void *>(sendbuff)) + localChunkOffset);
   runnerState->dagNodes[cpyNodeIdx].nodeData.cpy.dst =
       static_cast<void *>(static_cast<char *>(recvbuff) + localChunkOffset);
-  runnerState->dagNodes[cpyNodeIdx].nodeData.cpy.count = rankChunkCount;
+  runnerState->dagNodes[cpyNodeIdx].nodeData.cpy.count = localRankChunkCount;
   runnerState->dagNodes[cpyNodeIdx].nodeData.cpy.datatype = datatype;
   runnerState->dagNodes[cpyNodeIdx].numParents = 0;
   runnerState->dagNodes[cpyNodeIdx].numChildren = 0;
@@ -332,9 +377,9 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
   int prevRank = (rank - 1 + nranks) % nranks;
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
-  // Pipeline configuration
-  size_t rankChunkCount = count / nranks;
-  size_t sliceCount = rankChunkCount / numSlices;
+  // Pipeline configuration - handle uneven distribution
+  size_t baseRankChunkCount = count / nranks;
+  size_t rankChunkRemainder = count % nranks;
 
   // Nodes per slice chain:
   // Scatter-Reduce: (P2P + Reduce) * (nranks - 1)
@@ -361,9 +406,6 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
    * p2pNodeIdx = s * nodesPerSlice + (nranks - 1) * 2 + i
    */
   for (int s = 0; s < numSlices; s++) {
-    // int sliceNodeBaseIdx = globalNodeIdx;
-    size_t sliceOffsetInChunk = s * sliceCount * typeSize;
-
     // Phase 1: Scatter-Reduce
     for (int i = 0; i < nranks - 1; i++) {
       // P2P Node
@@ -377,16 +419,47 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
       int txChunk = (rank - i + nranks) % nranks;
       int rxChunk = (rank - i - 1 + nranks) % nranks;
 
-      size_t txOffset =
-          (txChunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
-      size_t rxOffset =
-          (rxChunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
+      // Calculate slice count with uneven distribution (last slice gets
+      // remainder)
+      size_t txRankChunkCount =
+          baseRankChunkCount + (txChunk < (int)rankChunkRemainder ? 1 : 0);
+      size_t rxRankChunkCount =
+          baseRankChunkCount + (rxChunk < (int)rankChunkRemainder ? 1 : 0);
+      size_t txBaseSliceCount = txRankChunkCount / numSlices;
+      size_t rxBaseSliceCount = rxRankChunkCount / numSlices;
+      size_t txSliceRemainder = txRankChunkCount % numSlices;
+      size_t rxSliceRemainder = rxRankChunkCount % numSlices;
+      size_t txSliceCount = txBaseSliceCount + (s < txSliceRemainder ? 1 : 0);
+      size_t rxSliceCount = rxBaseSliceCount + (s < rxSliceRemainder ? 1 : 0);
+      size_t txSliceOffsetInChunk = s * txBaseSliceCount * typeSize;
+      txSliceOffsetInChunk += std::min(s, (int)txSliceRemainder) * typeSize;
+      size_t rxSliceOffsetInChunk = s * rxBaseSliceCount * typeSize;
+      rxSliceOffsetInChunk += std::min(s, (int)rxSliceRemainder) * typeSize;
+
+      // Calculate offsets accounting for rankChunkRemainder
+      // First rankChunkRemainder ranks each have one extra element
+      size_t txOffset = (txChunk * txRankChunkCount +
+                         std::min(txChunk, (int)rankChunkRemainder)) *
+                            typeSize +
+                        txSliceOffsetInChunk;
+      size_t rxOffset = (rxChunk * rxRankChunkCount +
+                         std::min(rxChunk, (int)rankChunkRemainder)) *
+                            typeSize +
+                        rxSliceOffsetInChunk;
+
+      TRACE(FLAGCX_INIT,
+            "Initializing rank %d slice %d, step %d, txRankCount "
+            "%lu, txSliceCount %lu, rxRankCount %lu, rxSliceCount %lu, tx "
+            "chunk %d off %lu, rx chunk %d off %lu",
+            rank, s, i, txRankChunkCount, txSliceCount, rxRankChunkCount,
+            rxSliceCount, txChunk, txOffset, rxChunk, rxOffset);
 
       // Op 0: Send
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimSend;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank = nextRank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count =
+          txSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
       // First step sends from sendbuff, others from recvbuff
       void *srcBase = (i == 0) ? const_cast<void *>(sendbuff) : recvbuff;
@@ -397,7 +470,8 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
           flagcxDevicePrimRecv;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank = prevRank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count =
+          rxSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
           static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
@@ -443,7 +517,7 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
               static_cast<char *>(const_cast<void *>(sendbuff)) + rxOffset);
       runnerState->dagNodes[redNodeIdx].nodeData.red.output =
           static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
-      runnerState->dagNodes[redNodeIdx].nodeData.red.count = sliceCount;
+      runnerState->dagNodes[redNodeIdx].nodeData.red.count = rxSliceCount;
       runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
           uniRunnerNThreads;
       runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
@@ -473,16 +547,40 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
       int txChunk = (rank - i + 1 + nranks) % nranks;
       int rxChunk = (rank - i + nranks) % nranks;
 
-      size_t txOffset =
-          (txChunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
-      size_t rxOffset =
-          (rxChunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
+      // Calculate slice count with uneven distribution (last slice gets
+      // remainder)
+      size_t txRankChunkCount =
+          baseRankChunkCount + (txChunk < (int)rankChunkRemainder ? 1 : 0);
+      size_t rxRankChunkCount =
+          baseRankChunkCount + (rxChunk < (int)rankChunkRemainder ? 1 : 0);
+      size_t txBaseSliceCount = txRankChunkCount / numSlices;
+      size_t rxBaseSliceCount = rxRankChunkCount / numSlices;
+      size_t txSliceRemainder = txRankChunkCount % numSlices;
+      size_t rxSliceRemainder = rxRankChunkCount % numSlices;
+      size_t txSliceCount = txBaseSliceCount + (s < txSliceRemainder ? 1 : 0);
+      size_t rxSliceCount = rxBaseSliceCount + (s < rxSliceRemainder ? 1 : 0);
+      size_t txSliceOffsetInChunk = s * txBaseSliceCount * typeSize;
+      txSliceOffsetInChunk += std::min(s, (int)txSliceRemainder) * typeSize;
+      size_t rxSliceOffsetInChunk = s * rxBaseSliceCount * typeSize;
+      rxSliceOffsetInChunk += std::min(s, (int)rxSliceRemainder) * typeSize;
+
+      // Calculate offsets accounting for rankChunkRemainder
+      // First rankChunkRemainder ranks each have one extra element
+      size_t txOffset = (txChunk * txRankChunkCount +
+                         std::min(txChunk, (int)rankChunkRemainder)) *
+                            typeSize +
+                        txSliceOffsetInChunk;
+      size_t rxOffset = (rxChunk * rxRankChunkCount +
+                         std::min(rxChunk, (int)rankChunkRemainder)) *
+                            typeSize +
+                        rxSliceOffsetInChunk;
 
       // Op 0: Send
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimSend;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank = nextRank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count =
+          txSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].addr =
           static_cast<void *>(static_cast<char *>(recvbuff) + txOffset);
@@ -491,7 +589,8 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
           flagcxDevicePrimRecv;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank = prevRank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count =
+          rxSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
           static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
@@ -573,14 +672,13 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
     return flagcxSystemError;
   }
 
-  int next_rank = (rank + 1) % nranks;
-  int prev_rank = (rank - 1 + nranks) % nranks;
+  int nextRank = (rank + 1) % nranks;
+  int prevRank = (rank - 1 + nranks) % nranks;
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
-  // Pipeline configuration
-  size_t rankChunkCount = count / nranks;
-  size_t sliceCount = rankChunkCount / numSlices;
-  size_t redSliceCount = sliceCount / numRedSlices;
+  // Pipeline configuration - handle uneven distribution
+  size_t baseRankChunkCount = count / nranks;
+  size_t rankChunkRemainder = count % nranks;
 
   // Nodes per slice chain:
   // Scatter-Reduce: (P2P + Reduce * numRedSlices) * (nranks - 1)
@@ -607,8 +705,6 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
    * p2pNodeIdx = s * nodesPerSlice + (nranks - 1) * (1 + numRedSlices) + i
    */
   for (int s = 0; s < numSlices; s++) {
-    size_t sliceOffsetInChunk = s * sliceCount * typeSize;
-
     // Phase 1: Scatter-Reduce
     for (int i = 0; i < nranks - 1; i++) {
       // P2P Node
@@ -619,35 +715,65 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
           flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
                        2 * sizeof(struct uniRunnerP2pOpData)));
 
-      int tx_chunk = (rank - i + nranks) % nranks;
-      int rx_chunk = (rank - i - 1 + nranks) % nranks;
+      int txChunk = (rank - i + nranks) % nranks;
+      int rxChunk = (rank - i - 1 + nranks) % nranks;
 
-      size_t tx_offset =
-          (tx_chunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
-      size_t rx_offset =
-          (rx_chunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
+      // Calculate slice count with uneven distribution (last slice gets
+      // remainder)
+      size_t txRankChunkCount =
+          baseRankChunkCount + (txChunk < (int)rankChunkRemainder ? 1 : 0);
+      size_t rxRankChunkCount =
+          baseRankChunkCount + (rxChunk < (int)rankChunkRemainder ? 1 : 0);
+      size_t txBaseSliceCount = txRankChunkCount / numSlices;
+      size_t rxBaseSliceCount = rxRankChunkCount / numSlices;
+      size_t txSliceRemainder = txRankChunkCount % numSlices;
+      size_t rxSliceRemainder = rxRankChunkCount % numSlices;
+      size_t txSliceCount = txBaseSliceCount + (s < txSliceRemainder ? 1 : 0);
+      size_t rxSliceCount = rxBaseSliceCount + (s < rxSliceRemainder ? 1 : 0);
+      size_t txSliceOffsetInChunk = s * txBaseSliceCount * typeSize;
+      txSliceOffsetInChunk += std::min(s, (int)txSliceRemainder) * typeSize;
+      size_t rxSliceOffsetInChunk = s * rxBaseSliceCount * typeSize;
+      rxSliceOffsetInChunk += std::min(s, (int)rxSliceRemainder) * typeSize;
+
+      // Calculate offsets accounting for rankChunkRemainder
+      // First rankChunkRemainder ranks each have one extra element
+      size_t txOffset = (txChunk * txRankChunkCount +
+                         std::min(txChunk, (int)rankChunkRemainder)) *
+                            typeSize +
+                        txSliceOffsetInChunk;
+      size_t rxOffset = (rxChunk * rxRankChunkCount +
+                         std::min(rxChunk, (int)rankChunkRemainder)) *
+                            typeSize +
+                        rxSliceOffsetInChunk;
+
+      TRACE(FLAGCX_INIT,
+            "Initializing rank %d slice %d, step %d, txRankCount "
+            "%lu, txSliceCount %lu, rxRankCount %lu, rxSliceCount %lu, tx "
+            "chunk %d off %lu, rx chunk %d off %lu",
+            rank, s, i, txRankChunkCount, txSliceCount, rxRankChunkCount,
+            rxSliceCount, txChunk, txOffset, rxChunk, rxOffset);
 
       // Op 0: Send
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimSend;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank =
-          next_rank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank = nextRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count =
+          txSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
       // First step sends from sendbuff, others from recvbuff
       void *srcBase = (i == 0) ? const_cast<void *>(sendbuff) : recvbuff;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].addr =
-          static_cast<void *>(static_cast<char *>(srcBase) + tx_offset);
+          static_cast<void *>(static_cast<char *>(srcBase) + txOffset);
 
       // Op 1: Recv
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
           flagcxDevicePrimRecv;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank =
-          prev_rank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank = prevRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count =
+          rxSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
-          static_cast<void *>(static_cast<char *>(recvbuff) + rx_offset);
+          static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
 
       // Set up p2p node dependency
       if (p2pNodeIdx == 0) {
@@ -685,13 +811,20 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
 
       // Reduce Node
       int redSliceStartIdx = globalNodeIdx;
+      // Calculate redSliceCount with uneven distribution
+      size_t baseRedSliceCount = rxSliceCount / numRedSlices;
+      size_t redSliceRemainder = rxSliceCount % numRedSlices;
       for (int r = 0; r < numRedSlices; r++) {
         int redNodeIdx = globalNodeIdx++;
         runnerState->dagNodes[redNodeIdx].nodeType = uniRunnerDagNodeTypeRed;
-        size_t redOffset = rx_offset + r * redSliceCount * typeSize;
-        size_t redCount = (r == numRedSlices - 1)
-                              ? (sliceCount - r * redSliceCount)
-                              : redSliceCount;
+        // Calculate redCount and offset with uneven distribution
+        size_t redCount = baseRedSliceCount;
+        if (r < redSliceRemainder) {
+          redCount++;
+        }
+        size_t redOffset = rxOffset + r * baseRedSliceCount * typeSize;
+        // Add offset for all previous redSlices that got the remainder
+        redOffset += std::min(r, (int)redSliceRemainder) * typeSize;
         runnerState->dagNodes[redNodeIdx].nodeData.red.input1 =
             static_cast<void *>(static_cast<char *>(recvbuff) + redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.input2 =
@@ -728,33 +861,56 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
           flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
                        2 * sizeof(struct uniRunnerP2pOpData)));
 
-      int tx_chunk = (rank - i + 1 + nranks) % nranks;
-      int rx_chunk = (rank - i + nranks) % nranks;
+      int txChunk = (rank - i + 1 + nranks) % nranks;
+      int rxChunk = (rank - i + nranks) % nranks;
 
-      size_t tx_offset =
-          (tx_chunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
-      size_t rx_offset =
-          (rx_chunk * rankChunkCount * typeSize) + sliceOffsetInChunk;
+      // Calculate slice count with uneven distribution (last slice gets
+      // remainder)
+      size_t txRankChunkCount =
+          baseRankChunkCount + (txChunk < (int)rankChunkRemainder ? 1 : 0);
+      size_t rxRankChunkCount =
+          baseRankChunkCount + (rxChunk < (int)rankChunkRemainder ? 1 : 0);
+      size_t txBaseSliceCount = txRankChunkCount / numSlices;
+      size_t rxBaseSliceCount = rxRankChunkCount / numSlices;
+      size_t txSliceRemainder = txRankChunkCount % numSlices;
+      size_t rxSliceRemainder = rxRankChunkCount % numSlices;
+      size_t txSliceCount = txBaseSliceCount + (s < txSliceRemainder ? 1 : 0);
+      size_t rxSliceCount = rxBaseSliceCount + (s < rxSliceRemainder ? 1 : 0);
+      size_t txSliceOffsetInChunk = s * txBaseSliceCount * typeSize;
+      txSliceOffsetInChunk += std::min(s, (int)txSliceRemainder) * typeSize;
+      size_t rxSliceOffsetInChunk = s * rxBaseSliceCount * typeSize;
+      rxSliceOffsetInChunk += std::min(s, (int)rxSliceRemainder) * typeSize;
+
+      // Calculate offsets accounting for rankChunkRemainder
+      // First rankChunkRemainder ranks each have one extra element
+      size_t txOffset = (txChunk * txRankChunkCount +
+                         std::min(txChunk, (int)rankChunkRemainder)) *
+                            typeSize +
+                        txSliceOffsetInChunk;
+      size_t rxOffset = (rxChunk * rxRankChunkCount +
+                         std::min(rxChunk, (int)rankChunkRemainder)) *
+                            typeSize +
+                        rxSliceOffsetInChunk;
 
       // Op 0: Send
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimSend;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank =
-          next_rank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank = nextRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count =
+          txSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].addr =
-          static_cast<void *>(static_cast<char *>(recvbuff) + tx_offset);
+          static_cast<void *>(static_cast<char *>(recvbuff) + txOffset);
 
       // Op 1: Recv
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
           flagcxDevicePrimRecv;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank =
-          prev_rank;
-      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count = sliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank = prevRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count =
+          rxSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
-          static_cast<void *>(static_cast<char *>(recvbuff) + rx_offset);
+          static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
 
       // Set up all-gather phase p2p node dependency
       runnerState->numPendingNodes++;
