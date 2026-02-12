@@ -143,7 +143,7 @@ initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
     // Calculate offset accounting for rankChunkRemainder
     // First rankChunkRemainder ranks each have one extra element
     size_t rxOffset =
-        (rank * rankChunkCount + std::min(rank, (int)rankChunkRemainder)) *
+        (rank * baseRankChunkCount + std::min(rank, (int)rankChunkRemainder)) *
             typeSize +
         sliceOffsetInChunk;
 
@@ -256,11 +256,11 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
 
       // Calculate offsets accounting for rankChunkRemainder
       // First rankChunkRemainder ranks each have one extra element
-      size_t txOffset = (txChunk * txRankChunkCount +
+      size_t txOffset = (txChunk * baseRankChunkCount +
                          std::min(txChunk, (int)rankChunkRemainder)) *
                             typeSize +
                         txSliceOffsetInChunk;
-      size_t rxOffset = (rxChunk * rxRankChunkCount +
+      size_t rxOffset = (rxChunk * baseRankChunkCount +
                          std::min(rxChunk, (int)rankChunkRemainder)) *
                             typeSize +
                         rxSliceOffsetInChunk;
@@ -438,11 +438,11 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
 
       // Calculate offsets accounting for rankChunkRemainder
       // First rankChunkRemainder ranks each have one extra element
-      size_t txOffset = (txChunk * txRankChunkCount +
+      size_t txOffset = (txChunk * baseRankChunkCount +
                          std::min(txChunk, (int)rankChunkRemainder)) *
                             typeSize +
                         txSliceOffsetInChunk;
-      size_t rxOffset = (rxChunk * rxRankChunkCount +
+      size_t rxOffset = (rxChunk * baseRankChunkCount +
                          std::min(rxChunk, (int)rankChunkRemainder)) *
                             typeSize +
                         rxSliceOffsetInChunk;
@@ -566,11 +566,11 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
 
       // Calculate offsets accounting for rankChunkRemainder
       // First rankChunkRemainder ranks each have one extra element
-      size_t txOffset = (txChunk * txRankChunkCount +
+      size_t txOffset = (txChunk * baseRankChunkCount +
                          std::min(txChunk, (int)rankChunkRemainder)) *
                             typeSize +
                         txSliceOffsetInChunk;
-      size_t rxOffset = (rxChunk * rxRankChunkCount +
+      size_t rxOffset = (rxChunk * baseRankChunkCount +
                          std::min(rxChunk, (int)rankChunkRemainder)) *
                             typeSize +
                         rxSliceOffsetInChunk;
@@ -737,11 +737,11 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
 
       // Calculate offsets accounting for rankChunkRemainder
       // First rankChunkRemainder ranks each have one extra element
-      size_t txOffset = (txChunk * txRankChunkCount +
+      size_t txOffset = (txChunk * baseRankChunkCount +
                          std::min(txChunk, (int)rankChunkRemainder)) *
                             typeSize +
                         txSliceOffsetInChunk;
-      size_t rxOffset = (rxChunk * rxRankChunkCount +
+      size_t rxOffset = (rxChunk * baseRankChunkCount +
                          std::min(rxChunk, (int)rankChunkRemainder)) *
                             typeSize +
                         rxSliceOffsetInChunk;
@@ -883,11 +883,11 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
 
       // Calculate offsets accounting for rankChunkRemainder
       // First rankChunkRemainder ranks each have one extra element
-      size_t txOffset = (txChunk * txRankChunkCount +
+      size_t txOffset = (txChunk * baseRankChunkCount +
                          std::min(txChunk, (int)rankChunkRemainder)) *
                             typeSize +
                         txSliceOffsetInChunk;
-      size_t rxOffset = (rxChunk * rxRankChunkCount +
+      size_t rxOffset = (rxChunk * baseRankChunkCount +
                          std::min(rxChunk, (int)rankChunkRemainder)) *
                             typeSize +
                         rxSliceOffsetInChunk;
@@ -1246,8 +1246,8 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
           res, out);
     } else if (flagcxParamUniRunnerUseSlicedAR()) {
       if (uniRunnerNRedSlices == 0) {
-        uniRunnerNRedSlices =
-            ceil((float)count / comm->nranks / uniRunnerNSlices / 65536);
+        uniRunnerNRedSlices = std::max((size_t)1,
+            ceil((float)count / comm->nranks / uniRunnerNSlices / 65536));
         TRACE(FLAGCX_INIT, "uniRunnerNRedSlices auto set to %lu",
               uniRunnerNRedSlices);
       }
