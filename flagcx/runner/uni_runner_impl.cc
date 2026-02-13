@@ -153,6 +153,229 @@ initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
 }
 
 static flagcxResult_t
+initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
+                            const void *sendbuff, void *recvbuff, size_t count,
+                            flagcxDataType_t datatype, flagcxRedOp_t op,
+                            flagcxComm_t comm, int groupSize = 8) {
+  TRACE(FLAGCX_INIT,
+        "rank %d initUniRunnerStateGroupedAG called, count=%lu, numSlices=%d",
+        comm->rank, count, numSlices);
+
+  // Initialize queues
+  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
+  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
+  runnerState->numPendingNodes = 0;
+
+  size_t nGroups = nranks / groupSize;
+  int rank = comm->rank;
+  int nranks = comm->nranks;
+  int groupIdx = rank / groupSize;
+  int locRank = rank % groupSize;
+
+  if (nranks < 2) {
+    return flagcxSystemError;
+  }
+
+  size_t typeSize = getFlagcxDataTypeSize(datatype);
+
+  // Assume count is divisible by nranks
+  // Assume symmetric server settings and nranks is divisible by groupSize
+  // Pipeline configuration
+  size_t rankChunkCount = count / nranks;
+  size_t groupChunkCount = rankChunkCount * groupSize;
+
+  // nGroups * intra-group-AllGather
+  // (nGroups - 1) * inter-group-Send/Recv
+  // 1 * local copy
+  size_t numNodes = 3 * nGroups - 1;
+
+  runnerState->numDagNodes = numNodes;
+  FLAGCXCHECK(
+      flagcxCalloc(&runnerState->dagNodes,
+                   runnerState->numDagNodes * sizeof(struct uniRunnerDagNode)));
+  if (runnerState->dagNodes == NULL) {
+    return flagcxSystemError;
+  }
+
+  int localBaseOffset = 0;
+  int nodeIdx = 0;
+  for (int step = 0; step < nGroups; step++) {
+    // intra-group
+    runnerState->dagNodes[nodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.numOps = 2 * (groupSize - 1);
+    FLAGCXCHECK(
+        flagcxCalloc(&runnerState->dagNodes[nodeIdx].nodeData.p2p.ops,
+                     runnerState->dagNodes[nodeIdx].nodeData.p2p.numOps *
+                         sizeof(struct uniRunnerP2pOpData)));
+    for (int i = 0; i < groupSize - 1; i++) {
+      int locSendPeer = (locRank + i + 1) % groupSize;
+      int locRecvPeer = (locRank - i - 1 + groupSize) % groupSize;
+      // Send
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i].type =
+          flagcxDevicePrimSend;
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i].peerRank =
+          groupIdx * groupSize + locSendPeer;
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i].count =
+          rankChunkCount;
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i].datatype =
+          datatype;
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i].addr =
+          static_cast<void *>(static_cast<char *>(recvbuff) + localBaseOffset +
+                              locSendPeer * rankChunkCount * typeSize);
+      // Recv
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].type =
+          flagcxDevicePrimRecv;
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].peerRank =
+          groupIdx * groupSize + locRecvPeer;
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].count =
+          rankChunkCount;
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].datatype =
+          datatype;
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].addr =
+          static_cast<void *>(static_cast<char *>(recvbuff) + localBaseOffset +
+                              locRecvPeer * rankChunkCount * typeSize);
+    }
+    nodeIdx++;
+
+    // inter-group
+    if (step == nGroups - 1) {
+      break;
+    }
+    size_t sendGroupIdx = (groupIdx + step + 1) % nGroups;
+    size_t recvGroupIdx = (groupIdx - step - 1 + nGroups) % nGroups;
+    size_t sendPeer = sendGroupIdx * groupSize + locRank;
+    size_t recvPeer = recvGroupIdx * groupSize + locRank;
+    size_t recvOffset = recvPeer * rankChunkCount * typeSize;
+    // Send
+    runnerState->dagNodes[nodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.numOps = 1;
+    FLAGCXCHECK(
+        flagcxCalloc(&runnerState->dagNodes[nodeIdx].nodeData.p2p.ops,
+                     runnerState->dagNodes[nodeIdx].nodeData.p2p.numOps *
+                         sizeof(struct uniRunnerP2pOpData)));
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].type =
+        flagcxDevicePrimSend;
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].peerRank = sendPeer;
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].count = rankChunkCount;
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].datatype = datatype;
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].addr =
+        const_cast<void *>(sendbuff);
+    nodeIdx++;
+    // Recv
+    runnerState->dagNodes[nodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.numOps = 1;
+    FLAGCXCHECK(
+        flagcxCalloc(&runnerState->dagNodes[nodeIdx].nodeData.p2p.ops,
+                     runnerState->dagNodes[nodeIdx].nodeData.p2p.numOps *
+                         sizeof(struct uniRunnerP2pOpData)));
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].type =
+        flagcxDevicePrimRecv;
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].peerRank = recvPeer;
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].count = rankChunkCount;
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].datatype = datatype;
+    runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].addr =
+        static_cast<void *>(static_cast<char *>(recvbuff) + recvOffset);
+    nodeIdx++;
+
+    localBaseOffset = recvGroupIdx * groupChunkCount * typeSize;
+  }
+
+  if (nodeIdx != numNodes - 1) {
+    return flagcxSystemError;
+  }
+
+  // local copy node
+  runnerState->dagNodes[nodeIdx].nodeType = uniRunnerDagNodeTypeCpy;
+  runnerState->dagNodes[nodeIdx].nodeData.cpy.src =
+      const_cast<void *>(sendbuff);
+  runnerState->dagNodes[nodeIdx].nodeData.cpy.dst = static_cast<void *>(
+      static_cast<char *>(recvbuff) + rank * rankChunkCount * typeSize);
+  runnerState->dagNodes[nodeIdx].nodeData.cpy.count = rankChunkCount;
+  runnerState->dagNodes[nodeIdx].nodeData.cpy.datatype = datatype;
+
+  /* Setup dependencies
+   * 1. intra-group nodes depend on previous intra-group node and previous
+   * inter-group recv node (except the first slice)
+   * 2. inter-group send node depends on previous inter-group send node
+   * 3. inter-group recv node depends on previous inter-group recv node
+   * 4. local copy node has no parent or child, can be enqueued at the beginning
+   */
+  for (int s = 0; s < nGroups; s++) {
+    int intraNodeIdx = s * 3;
+    int interSendNodeIdx = s * 3 + 1;
+    int interRecvNodeIdx = s * 3 + 2;
+
+    if (s == 0) {
+      runnerState->dagNodes[intraNodeIdx].numParents = 0;
+      flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
+                              &runnerState->dagNodes[intraNodeIdx]);
+    } else {
+      runnerState->dagNodes[intraNodeIdx].numParents = 2;
+      runnerState->numPendingNodes++;
+    }
+    if (s == nGroups - 1) {
+      runnerState->dagNodes[intraNodeIdx].numChildren = 0;
+    } else {
+      runnerState->dagNodes[intraNodeIdx].numChildren = 1;
+      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes[intraNodeIdx].children,
+                               runnerState->dagNodes[intraNodeIdx].numChildren *
+                                   sizeof(int)));
+      runnerState->dagNodes[intraNodeIdx].children[0] = intraNodeIdx + 3;
+    }
+    // inter-group send node depends on previous inter-group send node
+    if (s == 0) {
+      runnerState->dagNodes[interSendNodeIdx].numParents = 0;
+      flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
+                              &runnerState->dagNodes[interSendNodeIdx]);
+    } else {
+      runnerState->dagNodes[interSendNodeIdx].numParents = 1;
+      runnerState->numPendingNodes++;
+    }
+    if (s == nGroups - 2) {
+      runnerState->dagNodes[interSendNodeIdx].numChildren = 0;
+    } else {
+      runnerState->dagNodes[interSendNodeIdx].numChildren = 1;
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[interSendNodeIdx].children,
+          runnerState->dagNodes[interSendNodeIdx].numChildren * sizeof(int)));
+      runnerState->dagNodes[interSendNodeIdx].children[0] =
+          interSendNodeIdx + 3;
+    }
+    // inter-group recv node depends on previous inter-group recv node
+    if (s == 0) {
+      runnerState->dagNodes[interRecvNodeIdx].numParents = 0;
+      flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
+                              &runnerState->dagNodes[interRecvNodeIdx]);
+    } else {
+      runnerState->dagNodes[interRecvNodeIdx].numParents = 1;
+      runnerState->numPendingNodes++;
+    }
+    if (s == nGroups - 2) {
+      runnerState->dagNodes[interRecvNodeIdx].numChildren = 1;
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[interRecvNodeIdx].children,
+          runnerState->dagNodes[interRecvNodeIdx].numChildren * sizeof(int)));
+      runnerState->dagNodes[interRecvNodeIdx].children[0] = numNodes - 2;
+    } else {
+      runnerState->dagNodes[interRecvNodeIdx].numChildren = 2;
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[interRecvNodeIdx].children,
+          runnerState->dagNodes[interRecvNodeIdx].numChildren * sizeof(int)));
+      runnerState->dagNodes[interRecvNodeIdx].children[0] =
+          interRecvNodeIdx + 3;
+    }
+  }
+  runnerState->dagNodes[numNodes - 1].numParents = 0;
+  runnerState->dagNodes[numNodes - 1].numChildren = 0;
+  flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
+                          &runnerState->dagNodes[numNodes - 1]);
+
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
 initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
                          const void *sendbuff, void *recvbuff, size_t count,
                          flagcxDataType_t datatype, flagcxRedOp_t op,
