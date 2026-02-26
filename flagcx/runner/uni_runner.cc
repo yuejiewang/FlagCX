@@ -76,8 +76,31 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
                                   size_t count, flagcxDataType_t datatype,
                                   flagcxRedOp_t op, flagcxComm_t comm,
                                   flagcxStream_t stream) {
-  runUniRunner(sendbuff, recvbuff, count, datatype, op, comm, stream,
-               flagcxCommOpAllReduce);
+  FLAGCXCHECK(initUniRunner(comm, stream));
+
+  if (flagcxParamUniRunnerUseLocRed()) {
+    /* initialize uniRunnerState for reduce test */
+    FLAGCXCHECK(initUniRunnerStateLocRed(&hcomm->proxyState->uniRunnerState,
+                                         sendbuff, recvbuff, count, datatype,
+                                         op, comm, uniRunnerNSlices));
+  } else if (flagcxParamUniRunnerUseRingAG()) {
+    /* initialize uniRunnerState for p2p test */
+    FLAGCXCHECK(initUniRunnerStateRingAG(&hcomm->proxyState->uniRunnerState,
+                                         sendbuff, recvbuff, count, datatype,
+                                         op, comm, uniRunnerNSlices));
+  } else if (flagcxParamUniRunnerUseSlicedAR()) {
+    /* initialize uniRunnerState for sliced AllReduce */
+    FLAGCXCHECK(initUniRunnerStateSlicedAR(
+        &hcomm->proxyState->uniRunnerState, sendbuff, recvbuff, count, datatype,
+        op, comm, uniRunnerNSlices, uniRunnerNRedSlices));
+  } else {
+    /* initialize uniRunnerState for ring AllReduce */
+    FLAGCXCHECK(initUniRunnerStateRingAR(&hcomm->proxyState->uniRunnerState,
+                                         sendbuff, recvbuff, count, datatype,
+                                         op, comm, uniRunnerNSlices));
+  }
+
+  FLAGCXCHECK(runUniRunner(comm));
   return flagcxSuccess;
 }
 

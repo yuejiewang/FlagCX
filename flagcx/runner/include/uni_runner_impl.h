@@ -16,6 +16,24 @@
 #include <memory>
 #include <pthread.h>
 
+FLAGCX_PARAM(P2pEventPoolSize, "P2P_EVENT_POOL_SIZE", 1024);
+FLAGCX_PARAM(UniRunnerNSlices, "UNIRUNNER_NSLICES", 1);
+FLAGCX_PARAM(UniRunnerNThreads, "UNIRUNNER_NTHREADS", 32);
+FLAGCX_PARAM(UniRunnerNBlocks, "UNIRUNNER_NBLOCKS", 1);
+FLAGCX_PARAM(UniRunnerNRedSlices, "UNIRUNNER_NREDSLICES", 0);
+FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
+
+FLAGCX_PARAM(UniRunnerUseLocRed, "UNIRUNNER_USE_LOCRED", 0);
+FLAGCX_PARAM(UniRunnerUseRingAG, "UNIRUNNER_USE_RINGAG", 0);
+FLAGCX_PARAM(UniRunnerUseSlicedAR, "UNIRUNNER_USE_SLICEDAR", 0);
+
+uint64_t p2pEventPoolSize;
+uint64_t uniRunnerNSlices;
+uint64_t uniRunnerNThreads;
+uint64_t uniRunnerNBlocks;
+uint64_t uniRunnerNRedSlices;
+uint64_t uniRunnerRedSliceSize;
+
 // DAG node types
 typedef enum {
   uniRunnerDagNodeTypeP2p = 0,
@@ -131,8 +149,26 @@ typedef struct {
   void resetEvent(int idx);
 } flagcxUniRunnerState;
 
-flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
-                            flagcxDataType_t datatype, flagcxRedOp_t op,
-                            flagcxComm_t comm, flagcxStream_t stream,
-                            flagcxCommOp_t commOp);
+flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
+flagcxResult_t initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
+                                        const void *sendbuff, void *recvbuff,
+                                        size_t count, flagcxDataType_t datatype,
+                                        flagcxRedOp_t op, flagcxComm_t comm,
+                                        int numSlices = 1);
+flagcxResult_t initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
+                                        const void *sendbuff, void *recvbuff,
+                                        size_t count, flagcxDataType_t datatype,
+                                        flagcxRedOp_t op, flagcxComm_t comm,
+                                        int numSlices = 1);
+flagcxResult_t initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
+                                        const void *sendbuff, void *recvbuff,
+                                        size_t count, flagcxDataType_t datatype,
+                                        flagcxRedOp_t op, flagcxComm_t comm,
+                                        int numSlices = 1);
+flagcxResult_t initUniRunnerStateSlicedAR(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
+    flagcxComm_t comm, int numSlices = 1, int numRedSlices = 1);
+flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream);
+flagcxResult_t runUniRunner(flagcxComm_t comm);
 #endif // FLAGCX_UNIRUNNER_IMPL_H_
