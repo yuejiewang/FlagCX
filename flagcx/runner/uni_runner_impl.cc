@@ -22,7 +22,8 @@ FLAGCX_PARAM(P2pEventPoolSize, "P2P_EVENT_POOL_SIZE", 1024);
 FLAGCX_PARAM(UniRunnerNSlices, "UNIRUNNER_NSLICES", 1);
 FLAGCX_PARAM(UniRunnerNThreads, "UNIRUNNER_NTHREADS", 32);
 FLAGCX_PARAM(UniRunnerNBlocks, "UNIRUNNER_NBLOCKS", 1);
-FLAGCX_PARAM(UniRunnerNRedSlices, "UNIRUNNER_NREDSLICE", 0);
+FLAGCX_PARAM(UniRunnerNRedSlices, "UNIRUNNER_NREDSLICES", 0);
+FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
 FLAGCX_PARAM(UniRunnerUseLocRed, "UNIRUNNER_USE_LOCRED", 0);
 FLAGCX_PARAM(UniRunnerUseRingAG, "UNIRUNNER_USE_RINGAG", 0);
 FLAGCX_PARAM(UniRunnerUseSlicedAR, "UNIRUNNER_USE_SLICEDAR", 0);
@@ -32,6 +33,7 @@ static uint64_t uniRunnerNSlices;
 static uint64_t uniRunnerNThreads;
 static uint64_t uniRunnerNBlocks;
 static uint64_t uniRunnerNRedSlices;
+static uint64_t uniRunnerRedSliceSize;
 
 // Check if event at index is available
 bool uniRunnerP2pEventBitmap::isAvailable(int index) {
@@ -78,7 +80,7 @@ int flagcxUniRunnerState::getEvent() {
 
 void flagcxUniRunnerState::resetEvent(int idx) {
   p2pEventMap.markAvailable(idx);
-  TRACE(FLAGCX_KERNEL,
+  TRACE(FLAGCX_UNIRUNNER,
         "resetEvent: event %d marked available, event map = 0x%016lx", idx,
         p2pEventMap.bits[0]);
 }
@@ -93,7 +95,7 @@ initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
                          const void *sendbuff, void *recvbuff, size_t count,
                          flagcxDataType_t datatype, flagcxRedOp_t op,
                          flagcxComm_t comm, int numSlices = 1) {
-  TRACE(FLAGCX_INIT,
+  TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateLocRed called, count=%lu, numSlices=%d",
         comm->rank, count, numSlices);
 
@@ -103,7 +105,6 @@ initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
   flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
   flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
   runnerState->numPendingNodes = 0;
-  // TRACE(FLAGCX_KERNEL, "initUniRunnerState bp1 (queues initialized)");
 
   int rank = comm->rank;
   int nranks = comm->nranks;
@@ -177,7 +178,7 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
                          const void *sendbuff, void *recvbuff, size_t count,
                          flagcxDataType_t datatype, flagcxRedOp_t op,
                          flagcxComm_t comm, int numSlices = 1) {
-  TRACE(FLAGCX_INIT,
+  TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateP2p called, count=%lu, numSlices=%d",
         comm->rank, count, numSlices);
 
@@ -187,7 +188,6 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
   flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
   flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
   runnerState->numPendingNodes = 0;
-  // TRACE(FLAGCX_KERNEL, "initUniRunnerState bp1 (queues initialized)");
 
   int rank = comm->rank;
   int nranks = comm->nranks;
@@ -265,7 +265,7 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
                             typeSize +
                         rxSliceOffsetInChunk;
 
-      TRACE(FLAGCX_INIT,
+      TRACE(FLAGCX_UNIRUNNER,
             "Initializing rank %d slice %d, step %d, baseIdx %d, txRankCount "
             "%lu, txSliceCount %lu, rxRankCount %lu, rxSliceCount %lu, tx "
             "chunk %d off %lu, rx chunk %d off %lu",
@@ -354,7 +354,7 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
                          const void *sendbuff, void *recvbuff, size_t count,
                          flagcxDataType_t datatype, flagcxRedOp_t op,
                          flagcxComm_t comm, int numSlices = 1) {
-  TRACE(FLAGCX_INIT,
+  TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateRingAR called, count=%lu, numSlices=%d",
         comm->rank, count, numSlices);
 
@@ -364,7 +364,6 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
   flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
   flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
   runnerState->numPendingNodes = 0;
-  // TRACE(FLAGCX_KERNEL, "initUniRunnerState bp1 (queues initialized)");
 
   int rank = comm->rank;
   int nranks = comm->nranks;
@@ -393,7 +392,6 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
   if (runnerState->dagNodes == NULL) {
     return flagcxSystemError;
   }
-  // TRACE(FLAGCX_KERNEL, "initUniRunnerState bp2 (DAG nodes allocated)");
 
   int globalNodeIdx = 0;
 
@@ -447,7 +445,7 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
                             typeSize +
                         rxSliceOffsetInChunk;
 
-      TRACE(FLAGCX_INIT,
+      TRACE(FLAGCX_UNIRUNNER,
             "Initializing rank %d slice %d, step %d, txRankCount "
             "%lu, txSliceCount %lu, rxRankCount %lu, rxSliceCount %lu, tx "
             "chunk %d off %lu, rx chunk %d off %lu",
@@ -495,17 +493,17 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
                                    sizeof(int)));
       if (s == numSlices - 1) {
         runnerState->dagNodes[p2pNodeIdx].children[0] = 2 * (i + 1);
-        TRACE(FLAGCX_INIT, "rank %d p2pNode %d child 0: %d", rank, p2pNodeIdx,
-              2 * (i + 1));
+        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 0: %d", rank,
+              p2pNodeIdx, 2 * (i + 1));
       } else {
         runnerState->dagNodes[p2pNodeIdx].children[0] =
             p2pNodeIdx + nodesPerSlice;
-        TRACE(FLAGCX_INIT, "rank %d p2pNode %d child 0: %d", rank, p2pNodeIdx,
-              p2pNodeIdx + nodesPerSlice);
+        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 0: %d", rank,
+              p2pNodeIdx, p2pNodeIdx + nodesPerSlice);
       }
       runnerState->dagNodes[p2pNodeIdx].children[1] = p2pNodeIdx + 1;
-      TRACE(FLAGCX_INIT, "rank %d p2pNode %d child 1: %d", rank, p2pNodeIdx,
-            p2pNodeIdx + 1);
+      TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 1: %d", rank,
+            p2pNodeIdx, p2pNodeIdx + 1);
 
       // Reduce Node
       int redNodeIdx = globalNodeIdx++;
@@ -531,8 +529,8 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
                                runnerState->dagNodes[redNodeIdx].numChildren *
                                    sizeof(int)));
       runnerState->dagNodes[redNodeIdx].children[0] = redNodeIdx + 1;
-      TRACE(FLAGCX_INIT, "rank %d redNode %d child 0: %d", rank, redNodeIdx,
-            redNodeIdx + 1);
+      TRACE(FLAGCX_UNIRUNNER, "rank %d redNode %d child 0: %d", rank,
+            redNodeIdx, redNodeIdx + 1);
     }
 
     // Phase 2: All-Gather
@@ -613,36 +611,36 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
       if (s == numSlices - 1) {
         if (p2pNodeIdx != numNodes - 1) {
           runnerState->dagNodes[p2pNodeIdx].children[0] = 2 * nranks + i - 1;
-          TRACE(FLAGCX_INIT, "rank %d p2pNode %d child 1: %d", rank, p2pNodeIdx,
-                2 * nranks + i - 1);
+          TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 1: %d", rank,
+                p2pNodeIdx, 2 * nranks + i - 1);
         }
       } else {
         runnerState->dagNodes[p2pNodeIdx].children[0] =
             p2pNodeIdx + nodesPerSlice;
-        TRACE(FLAGCX_INIT, "rank %d p2pNode %d child 1: %d", rank, p2pNodeIdx,
-              p2pNodeIdx + nodesPerSlice);
+        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 1: %d", rank,
+              p2pNodeIdx, p2pNodeIdx + nodesPerSlice);
       }
     }
   }
 
-  TRACE(FLAGCX_INIT,
+  TRACE(FLAGCX_UNIRUNNER,
         "DAG scheduler initialized with %d-rank Ring AllReduce topology (%d "
         "slices)",
         nranks, numSlices);
   // print dependency graph
   for (int i = 0; i < runnerState->numDagNodes; i++) {
-    TRACE(FLAGCX_INIT, "Node %d: type=%s, numParents=%d, numChildren=%d", i,
-          (runnerState->dagNodes[i].nodeType == uniRunnerDagNodeTypeP2p)
-              ? "P2P"
-              : "RED",
-          runnerState->dagNodes[i].numParents,
-          runnerState->dagNodes[i].numChildren);
+    TRACE(
+        FLAGCX_UNIRUNNER, "Node %d: type=%s, numParents=%d, numChildren=%d", i,
+        (runnerState->dagNodes[i].nodeType == uniRunnerDagNodeTypeP2p) ? "P2P"
+                                                                       : "RED",
+        runnerState->dagNodes[i].numParents,
+        runnerState->dagNodes[i].numChildren);
     if (runnerState->dagNodes[i].numChildren > 0) {
       std::string childStr = "  Children: ";
       for (int c = 0; c < runnerState->dagNodes[i].numChildren; c++) {
         childStr += std::to_string(runnerState->dagNodes[i].children[c]) + " ";
       }
-      TRACE(FLAGCX_INIT, "%s", childStr.c_str());
+      TRACE(FLAGCX_UNIRUNNER, "%s", childStr.c_str());
     }
   }
 
@@ -653,7 +651,7 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
     flagcxComm_t comm, int numSlices = 1, int numRedSlices = 1) {
-  TRACE(FLAGCX_INIT,
+  TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateSlicedAR called, count=%lu, numSlices=%d, "
         "numRedSlices=%d",
         comm->rank, count, numSlices, numRedSlices);
@@ -746,7 +744,7 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
                             typeSize +
                         rxSliceOffsetInChunk;
 
-      TRACE(FLAGCX_INIT,
+      TRACE(FLAGCX_UNIRUNNER,
             "Initializing rank %d slice %d, step %d, txRankCount "
             "%lu, txSliceCount %lu, rxRankCount %lu, rxSliceCount %lu, tx "
             "chunk %d off %lu, rx chunk %d off %lu",
@@ -795,18 +793,19 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
       if (s == numSlices - 1) {
         runnerState->dagNodes[p2pNodeIdx].children[0] =
             (i + 1) * (1 + numRedSlices);
-        TRACE(FLAGCX_INIT, "rank %d p2pNode %d child 0: %d", rank, p2pNodeIdx,
-              runnerState->dagNodes[p2pNodeIdx].children[0]);
+        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 0: %d", rank,
+              p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
       } else {
         runnerState->dagNodes[p2pNodeIdx].children[0] =
             p2pNodeIdx + nodesPerSlice;
-        TRACE(FLAGCX_INIT, "rank %d p2pNode %d child 0: %d", rank, p2pNodeIdx,
-              runnerState->dagNodes[p2pNodeIdx].children[0]);
+        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 0: %d", rank,
+              p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
       }
       for (int r = 0; r < numRedSlices; r++) {
         runnerState->dagNodes[p2pNodeIdx].children[r + 1] = p2pNodeIdx + 1 + r;
-        TRACE(FLAGCX_INIT, "rank %d p2pNode %d child %d: %d", rank, p2pNodeIdx,
-              r + 1, runnerState->dagNodes[p2pNodeIdx].children[r + 1]);
+        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child %d: %d", rank,
+              p2pNodeIdx, r + 1,
+              runnerState->dagNodes[p2pNodeIdx].children[r + 1]);
       }
 
       // Reduce Node
@@ -847,8 +846,8 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
                                      sizeof(int)));
         runnerState->dagNodes[redNodeIdx].children[0] =
             redSliceStartIdx + numRedSlices;
-        TRACE(FLAGCX_INIT, "rank %d redNode %d child 0: %d", rank, redNodeIdx,
-              runnerState->dagNodes[redNodeIdx].children[0]);
+        TRACE(FLAGCX_UNIRUNNER, "rank %d redNode %d child 0: %d", rank,
+              redNodeIdx, runnerState->dagNodes[redNodeIdx].children[0]);
       }
     }
 
@@ -931,45 +930,47 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
         if (p2pNodeIdx != numNodes - 1) {
           runnerState->dagNodes[p2pNodeIdx].children[0] =
               (1 + numRedSlices) * (nranks - 1) + i + 1;
-          TRACE(FLAGCX_INIT, "rank %d p2pNode %d child 1: %d", rank, p2pNodeIdx,
-                runnerState->dagNodes[p2pNodeIdx].children[0]);
+          TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 1: %d", rank,
+                p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
         }
       } else {
         runnerState->dagNodes[p2pNodeIdx].children[0] =
             p2pNodeIdx + nodesPerSlice;
-        TRACE(FLAGCX_INIT, "rank %d p2pNode %d child 1: %d", rank, p2pNodeIdx,
-              runnerState->dagNodes[p2pNodeIdx].children[0]);
+        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 1: %d", rank,
+              p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
       }
     }
   }
 
-  TRACE(FLAGCX_INIT,
+  TRACE(FLAGCX_UNIRUNNER,
         "DAG scheduler initialized with %d-rank Sliced AllReduce topology (%d "
         "slices, %d redSlices)",
         nranks, numSlices, numRedSlices);
+#ifdef UNIRUNNER_PRINT_DAG
   // print dependency graph
   for (int i = 0; i < runnerState->numDagNodes; i++) {
-    TRACE(FLAGCX_INIT, "Node %d: type=%s, numParents=%d, numChildren=%d", i,
-          (runnerState->dagNodes[i].nodeType == uniRunnerDagNodeTypeP2p)
-              ? "P2P"
-              : "RED",
-          runnerState->dagNodes[i].numParents,
-          runnerState->dagNodes[i].numChildren);
+    TRACE(
+        FLAGCX_UNIRUNNER, "Node %d: type=%s, numParents=%d, numChildren=%d", i,
+        (runnerState->dagNodes[i].nodeType == uniRunnerDagNodeTypeP2p) ? "P2P"
+                                                                       : "RED",
+        runnerState->dagNodes[i].numParents,
+        runnerState->dagNodes[i].numChildren);
     if (runnerState->dagNodes[i].numChildren > 0) {
       std::string childStr = "  Children: ";
       for (int c = 0; c < runnerState->dagNodes[i].numChildren; c++) {
         childStr += std::to_string(runnerState->dagNodes[i].children[c]) + " ";
       }
-      TRACE(FLAGCX_INIT, "%s", childStr.c_str());
+      TRACE(FLAGCX_UNIRUNNER, "%s", childStr.c_str());
     }
   }
+#endif
 
   return flagcxSuccess;
 }
 
 // Clean up DAG nodes
 static flagcxResult_t cleanupDagScheduler(flagcxUniRunnerState *runnerState) {
-  TRACE(FLAGCX_KERNEL, "cleanupDagScheduler called");
+  TRACE(FLAGCX_UNIRUNNER, "cleanupDagScheduler called");
 
   if (runnerState->dagNodes != NULL) {
     for (int i = 0; i < runnerState->numDagNodes; i++) {
@@ -1019,8 +1020,6 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
 
   // Get event from pool (pop from stack)
   flagcxEvent_t event = runnerState->p2pEvents[eventIdx];
-  TRACE(FLAGCX_KERNEL, "rank %d processReadyQueue bp3 (dequeue %d confirmed)",
-        comm->rank, eventIdx);
 
   if (current->nodeType == uniRunnerDagNodeTypeP2p) {
     // Prepare ops list
@@ -1044,7 +1043,7 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
 
     // Record event
     FLAGCXCHECK(deviceAdaptor->eventRecord(event, runnerState->commStream));
-    TRACE(FLAGCX_KERNEL, "rank %d p2p event %d recorded on stream 0x%016lx",
+    TRACE(FLAGCX_UNIRUNNER, "rank %d p2p event %d recorded on stream 0x%016lx",
           comm->rank, eventIdx, (uintptr_t)runnerState->commStream);
 
     current->nodeData.p2p.eventIdx = eventIdx;
@@ -1058,7 +1057,7 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
 
     // Record event
     FLAGCXCHECK(deviceAdaptor->eventRecord(event, runnerState->cpyStream));
-    TRACE(FLAGCX_KERNEL, "rank %d cpy event %d recorded on stream 0x%016lx",
+    TRACE(FLAGCX_UNIRUNNER, "rank %d cpy event %d recorded on stream 0x%016lx",
           comm->rank, eventIdx, (uintptr_t)runnerState->cpyStream);
 
     current->nodeData.cpy.eventIdx = eventIdx;
@@ -1090,8 +1089,6 @@ static flagcxResult_t enqueueReadyQueue(flagcxUniRunnerState *runnerState,
 // Process ready queue: write triggers to FIFO and move to inflight
 static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
                                         flagcxHeteroComm_t comm) {
-  // TRACE(FLAGCX_KERNEL, "rank %d processReadyQueue called", comm->rank);
-
   // process p2pReadyQueue
   while (!flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue)) {
     int eventIdx = runnerState->getEvent();
@@ -1129,8 +1126,6 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
 
 // Process inflight queue: check completion and update pending nodes
 static flagcxResult_t processInflightQueue(flagcxUniRunnerState *runnerState) {
-  // TRACE(FLAGCX_KERNEL, "processInflightQueue called");
-
   // process p2pInflightQueue
   uniRunnerDagNode *prev = nullptr;
   uniRunnerDagNode *curr = flagcxIntruQueueHead(&runnerState->p2pInflightQueue);
@@ -1212,6 +1207,7 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
   uniRunnerNThreads = flagcxParamUniRunnerNThreads();
   uniRunnerNBlocks = flagcxParamUniRunnerNBlocks();
   uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
+  uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
 
   // Set device context
   FLAGCXCHECKGOTO(deviceAdaptor->setDevice(hcomm->cudaDev), res, out);
@@ -1246,12 +1242,13 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
           res, out);
     } else if (flagcxParamUniRunnerUseSlicedAR()) {
       if (uniRunnerNRedSlices == 0) {
-        uniRunnerNRedSlices =
-            ceil((float)count / comm->nranks / uniRunnerNSlices / 65536);
-        if (uniRunnerNRedSlices == 0) {
+        if (count <= 0 || uniRunnerRedSliceSize == 0) {
           uniRunnerNRedSlices = 1;
+        } else {
+          uniRunnerNRedSlices = ceil((float)count / comm->nranks /
+                                     uniRunnerNSlices / uniRunnerRedSliceSize);
         }
-        TRACE(FLAGCX_INIT, "uniRunnerNRedSlices auto set to %lu",
+        TRACE(FLAGCX_UNIRUNNER, "uniRunnerNRedSlices auto set to %lu",
               uniRunnerNRedSlices);
       }
       /* initialize uniRunnerState for sliced AllReduce */
@@ -1300,7 +1297,7 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
         flagcxIntruQueueEmpty(
             &hcomm->proxyState->uniRunnerState.redInflightQueue) &&
         hcomm->proxyState->uniRunnerState.numPendingNodes == 0) {
-      TRACE(FLAGCX_KERNEL,
+      TRACE(FLAGCX_UNIRUNNER,
             "runUniRunner: all queues empty, terminating runner loop");
       // set terminate flag
       __atomic_store_n(fifo->buffer + 3, 1, __ATOMIC_RELEASE);
