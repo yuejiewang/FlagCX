@@ -154,21 +154,23 @@ flagcxResult_t initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         size_t count, flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm,
-                                        int numSlices = 1);
+                                        int numSlices);
 flagcxResult_t initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         size_t count, flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm,
-                                        int numSlices = 1);
+                                        int numSlices);
 flagcxResult_t initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         size_t count, flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm,
-                                        int numSlices = 1);
-flagcxResult_t initUniRunnerStateSlicedAR(
-    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
-    size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
-    flagcxComm_t comm, int numSlices = 1, int numRedSlices = 1);
+                                        int numSlices);
+flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
+                                          const void *sendbuff, void *recvbuff,
+                                          size_t count,
+                                          flagcxDataType_t datatype,
+                                          flagcxRedOp_t op, flagcxComm_t comm,
+                                          int numSlices, int numRedSlices);
 flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream);
 flagcxResult_t runUniRunner(flagcxComm_t comm);
 #endif // FLAGCX_UNIRUNNER_IMPL_H_

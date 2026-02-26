@@ -80,24 +80,24 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
 
   if (flagcxParamUniRunnerUseLocRed()) {
     /* initialize uniRunnerState for reduce test */
-    FLAGCXCHECK(initUniRunnerStateLocRed(&hcomm->proxyState->uniRunnerState,
-                                         sendbuff, recvbuff, count, datatype,
-                                         op, comm, uniRunnerNSlices));
+    FLAGCXCHECK(initUniRunnerStateLocRed(
+        &comm->heteroComm->proxyState->uniRunnerState, sendbuff, recvbuff,
+        count, datatype, op, comm, uniRunnerNSlices));
   } else if (flagcxParamUniRunnerUseRingAG()) {
     /* initialize uniRunnerState for p2p test */
-    FLAGCXCHECK(initUniRunnerStateRingAG(&hcomm->proxyState->uniRunnerState,
-                                         sendbuff, recvbuff, count, datatype,
-                                         op, comm, uniRunnerNSlices));
+    FLAGCXCHECK(initUniRunnerStateRingAG(
+        &comm->heteroComm->proxyState->uniRunnerState, sendbuff, recvbuff,
+        count, datatype, op, comm, uniRunnerNSlices));
   } else if (flagcxParamUniRunnerUseSlicedAR()) {
     /* initialize uniRunnerState for sliced AllReduce */
     FLAGCXCHECK(initUniRunnerStateSlicedAR(
-        &hcomm->proxyState->uniRunnerState, sendbuff, recvbuff, count, datatype,
-        op, comm, uniRunnerNSlices, uniRunnerNRedSlices));
+        &comm->heteroComm->proxyState->uniRunnerState, sendbuff, recvbuff,
+        count, datatype, op, comm, uniRunnerNSlices, uniRunnerNRedSlices));
   } else {
     /* initialize uniRunnerState for ring AllReduce */
-    FLAGCXCHECK(initUniRunnerStateRingAR(&hcomm->proxyState->uniRunnerState,
-                                         sendbuff, recvbuff, count, datatype,
-                                         op, comm, uniRunnerNSlices));
+    FLAGCXCHECK(initUniRunnerStateRingAR(
+        &comm->heteroComm->proxyState->uniRunnerState, sendbuff, recvbuff,
+        count, datatype, op, comm, uniRunnerNSlices));
   }
 
   FLAGCXCHECK(runUniRunner(comm));

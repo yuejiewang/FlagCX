@@ -645,8 +645,7 @@ flagcxResult_t initUniRunnerStateSlicedAR(
       numRedSlices = ceil((float)count / comm->nranks / uniRunnerNSlices /
                           uniRunnerRedSliceSize);
     }
-    TRACE(FLAGCX_UNIRUNNER, "uniRunnerNRedSlices auto set to %lu",
-          numRedSlices);
+    TRACE(FLAGCX_UNIRUNNER, "uniRunnerNRedSlices auto set to %d", numRedSlices);
   }
   // Initialize queues
   // flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
