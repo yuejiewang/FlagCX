@@ -16,13 +16,6 @@
 #include <memory>
 #include <pthread.h>
 
-uint64_t p2pEventPoolSize;
-uint64_t uniRunnerNSlices;
-uint64_t uniRunnerNThreads;
-uint64_t uniRunnerNBlocks;
-uint64_t uniRunnerNRedSlices;
-uint64_t uniRunnerRedSliceSize;
-
 // DAG node types
 typedef enum {
   uniRunnerDagNodeTypeP2p = 0,
@@ -102,7 +95,7 @@ typedef struct {
   // Check if event at index is available
   bool isAvailable(int index);
   // Get first available event index, or -1 if none
-  int getAvailable();
+  int getAvailable(int maxIndex);
   // Mark event at index as in use
   void markInUse(int index);
   // Mark event at index as available
@@ -115,6 +108,13 @@ typedef struct {
   flagcxStream_t commStream;
   flagcxStream_t redStream;
   flagcxStream_t cpyStream;
+
+  uint64_t p2pEventPoolSize;
+  uint64_t nSlices;
+  uint64_t nThreads;
+  uint64_t nBlocks;
+  uint64_t nRedSlices;
+  uint64_t redSliceSize;
 
   // new: DAG and scheduling queues
   struct uniRunnerDagNode *dagNodes; // Array of all DAG nodes

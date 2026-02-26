@@ -33,15 +33,15 @@ bool uniRunnerP2pEventBitmap::isAvailable(int index) {
 }
 
 // Get first available event index, or -1 if none
-int uniRunnerP2pEventBitmap::getAvailable() {
+int uniRunnerP2pEventBitmap::getAvailable(int maxIndex) {
   int ret = -1;
-  for (int i = 0; i < p2pEventPoolSize; i++) {
+  for (int i = 0; i < maxIndex; i++) {
     if (isAvailable(nextIdx)) {
       ret = nextIdx;
-      nextIdx = (nextIdx + 1) % p2pEventPoolSize;
+      nextIdx = (nextIdx + 1) % maxIndex;
       break;
     }
-    nextIdx = (nextIdx + 1) % p2pEventPoolSize;
+    nextIdx = (nextIdx + 1) % maxIndex;
   }
   return ret;
 }
@@ -148,7 +148,8 @@ flagcxResult_t initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
     runnerState->dagNodes[redNodeIdx].nodeData.red.output =
         static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
     runnerState->dagNodes[redNodeIdx].nodeData.red.count = sliceCount;
-    runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads = uniRunnerNThreads;
+    runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
+        runnerState->nThreads;
     runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
     runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
 
@@ -507,7 +508,7 @@ flagcxResult_t initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
           static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
       runnerState->dagNodes[redNodeIdx].nodeData.red.count = rxSliceCount;
       runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
-          uniRunnerNThreads;
+          runnerState->nThreads;
       runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
       runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
 
@@ -646,11 +647,11 @@ flagcxResult_t initUniRunnerStateSlicedAR(
         "numRedSlices=%d",
         comm->rank, count, numSlices, numRedSlices);
   if (numRedSlices == 0) {
-    if (count <= 0 || uniRunnerRedSliceSize == 0) {
+    if (count <= 0 || runnerState->redSliceSize == 0) {
       numRedSlices = 1;
     } else {
-      numRedSlices = ceil((float)count / comm->nranks / uniRunnerNSlices /
-                          uniRunnerRedSliceSize);
+      numRedSlices = ceil((float)count / comm->nranks / runnerState->nSlices /
+                          runnerState->redSliceSize);
     }
     TRACE(FLAGCX_UNIRUNNER, "uniRunnerNRedSlices auto set to %d", numRedSlices);
   }
@@ -831,7 +832,7 @@ flagcxResult_t initUniRunnerStateSlicedAR(
             static_cast<void *>(static_cast<char *>(recvbuff) + redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.count = redCount;
         runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
-            uniRunnerNThreads;
+            runnerState->nThreads;
         runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
         runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
 
@@ -986,23 +987,25 @@ static flagcxResult_t cleanupDagScheduler(flagcxUniRunnerState *runnerState) {
 
 // Initialize P2P event pool
 static flagcxResult_t initP2pEvents(flagcxUniRunnerState *runnerState) {
-  FLAGCXCHECK(flagcxCalloc(&runnerState->p2pEvents,
-                           p2pEventPoolSize * sizeof(flagcxEvent_t)));
-  for (int i = 0; i < p2pEventPoolSize; i++) {
+  FLAGCXCHECK(
+      flagcxCalloc(&runnerState->p2pEvents,
+                   runnerState->p2pEventPoolSize * sizeof(flagcxEvent_t)));
+  for (int i = 0; i < runnerState->p2pEventPoolSize; i++) {
     FLAGCXCHECK(deviceAdaptor->eventCreate(&runnerState->p2pEvents[i],
                                            flagcxEventDisableTiming));
   }
   runnerState->p2pEventMap.nextIdx = 0;
   FLAGCXCHECK(flagcxCalloc(&runnerState->p2pEventMap.bits,
-                           ((p2pEventPoolSize + 63) / 64) * sizeof(uint64_t)));
+                           ((runnerState->p2pEventPoolSize + 63) / 64) *
+                               sizeof(uint64_t)));
   memset(runnerState->p2pEventMap.bits, 0,
-         ((p2pEventPoolSize + 63) / 64) * sizeof(uint64_t));
+         ((runnerState->p2pEventPoolSize + 63) / 64) * sizeof(uint64_t));
   return flagcxSuccess;
 }
 
 // Clean up P2P events
 static flagcxResult_t cleanupP2pEvents(flagcxUniRunnerState *runnerState) {
-  for (int i = 0; i < p2pEventPoolSize; i++) {
+  for (int i = 0; i < runnerState->p2pEventPoolSize; i++) {
     FLAGCXCHECK(deviceAdaptor->eventDestroy(runnerState->p2pEvents[i]));
   }
   free(runnerState->p2pEvents);
@@ -1197,12 +1200,12 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
 
-  p2pEventPoolSize = flagcxParamP2pEventPoolSize();
-  uniRunnerNSlices = flagcxParamUniRunnerNSlices();
-  uniRunnerNThreads = flagcxParamUniRunnerNThreads();
-  uniRunnerNBlocks = flagcxParamUniRunnerNBlocks();
-  uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
-  uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
+  runnerState->p2pEventPoolSize = flagcxParamP2pEventPoolSize();
+  runnerState->nSlices = flagcxParamUniRunnerNSlices();
+  runnerState->nThreads = flagcxParamUniRunnerNThreads();
+  runnerState->nBlocks = flagcxParamUniRunnerNBlocks();
+  runnerState->nRedSlices = flagcxParamUniRunnerNRedSlices();
+  runnerState->redSliceSize = flagcxParamUniRunnerRedSliceSize();
 
   // Set device context
   FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
@@ -1328,8 +1331,9 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   // hcomm->proxyState->uniRunnerState.cpyStream = cpyStream;
 #ifdef COMPILE_KERNEL_HOST
   // Launch collective kernel
-  flagcxLaunchCollectiveKernel(hcomm->uniRunnerFifoBuffer, uniRunnerNThreads,
-                               uniRunnerNBlocks, runnerState->redStream);
+  flagcxLaunchCollectiveKernel(hcomm->uniRunnerFifoBuffer,
+                               runnerState->nThreads, runnerState->nBlocks,
+                               runnerState->redStream);
 #endif
 
   // Main scheduling loop using DAG-based three-queue scheduling

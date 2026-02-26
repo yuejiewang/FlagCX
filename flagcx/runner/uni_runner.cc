@@ -83,26 +83,29 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
                                   flagcxStream_t stream) {
   FLAGCXCHECK(initUniRunner(comm, stream));
 
+  /* Initialize uniRunnerState based on commOp and collective algorithm */
+  flagcxUniRunnerState *runnerState =
+      &comm->heteroComm->proxyState->uniRunnerState;
   if (flagcxParamUniRunnerUseLocRed()) {
     /* initialize uniRunnerState for reduce test */
-    FLAGCXCHECK(initUniRunnerStateLocRed(
-        &comm->heteroComm->proxyState->uniRunnerState, sendbuff, recvbuff,
-        count, datatype, op, comm, uniRunnerNSlices));
+    FLAGCXCHECK(initUniRunnerStateLocRed(runnerState, sendbuff, recvbuff, count,
+                                         datatype, op, comm,
+                                         runnerState->nSlices));
   } else if (flagcxParamUniRunnerUseRingAG()) {
     /* initialize uniRunnerState for p2p test */
-    FLAGCXCHECK(initUniRunnerStateRingAG(
-        &comm->heteroComm->proxyState->uniRunnerState, sendbuff, recvbuff,
-        count, datatype, op, comm, uniRunnerNSlices));
+    FLAGCXCHECK(initUniRunnerStateRingAG(runnerState, sendbuff, recvbuff, count,
+                                         datatype, op, comm,
+                                         runnerState->nSlices));
   } else if (flagcxParamUniRunnerUseSlicedAR()) {
     /* initialize uniRunnerState for sliced AllReduce */
     FLAGCXCHECK(initUniRunnerStateSlicedAR(
-        &comm->heteroComm->proxyState->uniRunnerState, sendbuff, recvbuff,
-        count, datatype, op, comm, uniRunnerNSlices, uniRunnerNRedSlices));
+        runnerState, sendbuff, recvbuff, count, datatype, op, comm,
+        runnerState->nSlices, runnerState->nRedSlices));
   } else {
     /* initialize uniRunnerState for ring AllReduce */
-    FLAGCXCHECK(initUniRunnerStateRingAR(
-        &comm->heteroComm->proxyState->uniRunnerState, sendbuff, recvbuff,
-        count, datatype, op, comm, uniRunnerNSlices));
+    FLAGCXCHECK(initUniRunnerStateRingAR(runnerState, sendbuff, recvbuff, count,
+                                         datatype, op, comm,
+                                         runnerState->nSlices));
   }
 
   FLAGCXCHECK(runUniRunner(comm));
