@@ -3,6 +3,7 @@
  ************************************************************************/
 
 #include "flagcx_hetero.h"
+#include "proxy.h"
 #include "runner.h"
 #include "uni_runner_impl.h"
 

@@ -10,7 +10,6 @@
 #include "ipcsocket.h"
 #include "launch_kernel.h"
 #include "net.h"
-#include "proxy.h"
 #include "reg_pool.h"
 #include "socket.h"
 #include "utils.h"

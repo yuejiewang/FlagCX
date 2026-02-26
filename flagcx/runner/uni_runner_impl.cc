@@ -5,6 +5,7 @@
 #include "info.h"
 #include "net.h"
 #include "p2p.h"
+#include "proxy.h"
 #include "socket.h"
 #include "transport.h"
 #define ENABLE_TIMER 0
