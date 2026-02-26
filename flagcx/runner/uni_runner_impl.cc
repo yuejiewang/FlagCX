@@ -5,7 +5,6 @@
 #include "info.h"
 #include "net.h"
 #include "p2p.h"
-#include "proxy.h"
 #include "socket.h"
 #include "transport.h"
 #define ENABLE_TIMER 0
@@ -1365,5 +1364,5 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   FLAGCXCHECK(fifo->flagcxRedFifoDestroy());
   delete fifo;
   hcomm->uniRunnerFifoBuffer = NULL;
-  return res;
+  return flagcxSuccess;
 }
