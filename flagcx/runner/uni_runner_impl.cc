@@ -61,7 +61,7 @@ void uniRunnerP2pEventBitmap::markAvailable(int index) {
 }
 
 int flagcxUniRunnerState::getEvent() {
-  int idx = p2pEventMap.getAvailable();
+  int idx = p2pEventMap.getAvailable(p2pEventPoolSize);
   if (idx != -1) {
     p2pEventMap.markInUse(idx);
   }
