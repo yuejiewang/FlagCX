@@ -18,6 +18,13 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+FLAGCX_PARAM(P2pEventPoolSize, "P2P_EVENT_POOL_SIZE", 1024);
+FLAGCX_PARAM(UniRunnerNSlices, "UNIRUNNER_NSLICES", 1);
+FLAGCX_PARAM(UniRunnerNThreads, "UNIRUNNER_NTHREADS", 32);
+FLAGCX_PARAM(UniRunnerNBlocks, "UNIRUNNER_NBLOCKS", 1);
+FLAGCX_PARAM(UniRunnerNRedSlices, "UNIRUNNER_NREDSLICES", 0);
+FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
+
 // Check if event at index is available
 bool uniRunnerP2pEventBitmap::isAvailable(int index) {
   int wordIdx = index / 64;
