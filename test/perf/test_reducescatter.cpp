@@ -141,6 +141,7 @@ int main(int argc, char *argv[]) {
     devHandle->deviceMemcpy(hello, recvbuff, recvsize, flagcxMemcpyDeviceToHost,
                             stream);
     devHandle->streamSynchronize(stream);
+
     if (color == 0 && print_buffer) {
       printf("proc %d recvbuff = ", proc);
       int correct = 1;
@@ -151,6 +152,9 @@ int main(int argc, char *argv[]) {
       for (size_t i = 0; i < recvcount; i++) {
         if (((float *)hello)[i] != (float)(proc)*totalProcs) {
           correct = 0;
+          printf("rank %d offset %lu wrong output %f\n", proc, i,
+                 ((float *)hello)[i]);
+          break;
         }
       }
       printf("rank %d correctness = %d\n", proc, correct);
