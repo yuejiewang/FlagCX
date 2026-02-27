@@ -1072,6 +1072,9 @@ flagcxResult_t flagcxReduceScatter(const void *sendbuff, void *recvbuff,
     }
     FLAGCXCHECK(flagcxRunners[flagcxHostRunner]->reduceScatter(
         sendbuff, recvbuff, recvcount, datatype, op, comm, stream));
+  } else if (useHeteroComm()) {
+    FLAGCXCHECK(flagcxRunners[flagcxUniRunner]->reduceScatter(
+        sendbuff, recvbuff, recvcount, datatype, op, comm, stream));
   } else {
     FLAGCXCHECK(flagcxRunners[flagcxHybridRunner]->reduceScatter(
         sendbuff, recvbuff, recvcount, datatype, op, comm, stream));
