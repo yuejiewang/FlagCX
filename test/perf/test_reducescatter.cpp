@@ -100,7 +100,8 @@ int main(int argc, char *argv[]) {
     }
 
     devHandle->deviceMemcpy(sendbuff, hello, size, flagcxMemcpyHostToDevice,
-                            NULL);
+                            stream);
+    devHandle->streamSynchronize(stream);
 
     if (color == 0 && print_buffer) {
       printf("proc %d sendbuff = ", proc);
@@ -138,7 +139,8 @@ int main(int argc, char *argv[]) {
 
     memset(hello, 0, size);
     devHandle->deviceMemcpy(hello, recvbuff, recvsize, flagcxMemcpyDeviceToHost,
-                            NULL);
+                            stream);
+    devHandle->streamSynchronize(stream);
     if (color == 0 && print_buffer) {
       printf("proc %d recvbuff = ", proc);
       int correct = 1;
@@ -151,7 +153,7 @@ int main(int argc, char *argv[]) {
           correct = 0;
         }
       }
-      printf("correct = %d\n", correct);
+      printf("rank %d correctness = %d\n", proc, correct);
     }
   }
 
