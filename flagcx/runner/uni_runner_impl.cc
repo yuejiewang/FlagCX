@@ -968,7 +968,7 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
   return flagcxSuccess;
 }
 
-static flagcxResult_t initUnirunnerStateRingRS(
+static flagcxResult_t initUniRunnerStateRingRS(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
     flagcxComm_t comm, int numSlices = 1, int numRedSlices = 1) {
