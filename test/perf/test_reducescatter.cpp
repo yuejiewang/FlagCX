@@ -147,7 +147,7 @@ int main(int argc, char *argv[]) {
       }
       printf("\n");
       for (size_t i = 0; i < recvcount; i++) {
-        if (((float *)hello)[i] != (float)(proc)) {
+        if (((float *)hello)[i] != (float)(proc) * totalProcs) {
           correct = 0;
         }
       }
