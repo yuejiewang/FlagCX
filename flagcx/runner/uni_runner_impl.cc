@@ -1139,9 +1139,13 @@ static flagcxResult_t initUniRunnerStateRingRS(
             static_cast<void *>(
                 static_cast<char *>(const_cast<void *>(sendbuff)) + redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.output =
-            i == nranks - 2 ? recvbuff
-                            : static_cast<void *>(
-                                  static_cast<char *>(scratchbuff) + redOffset);
+            i == nranks - 2
+                ? static_cast<void *>(
+                      static_cast<char *>(recvbuff) + rxSliceOffsetInChunk +
+                      r * baseRedSliceCount * typeSize +
+                      std::min(r, (int)redSliceRemainder) * typeSize)
+                : static_cast<void *>(static_cast<char *>(scratchbuff) +
+                                      redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.count = redCount;
         runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
             uniRunnerNThreads;
