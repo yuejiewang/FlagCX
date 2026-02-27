@@ -76,8 +76,8 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
                                   size_t count, flagcxDataType_t datatype,
                                   flagcxRedOp_t op, flagcxComm_t comm,
                                   flagcxStream_t stream) {
-  FLAGCXCHECK(runUniRunner(sendbuff, recvbuff, count, datatype, op, comm,
-                           stream, flagcxCommOpAllReduce));
+  FLAGCXCHECK(runUniRunner(sendbuff, recvbuff, nullptr, count, datatype, op,
+                           comm, stream, flagcxCommOpAllReduce));
   return flagcxSuccess;
 }
 
@@ -86,8 +86,12 @@ flagcxResult_t uniRunnerReduceScatter(const void *sendbuff, void *recvbuff,
                                       flagcxDataType_t datatype,
                                       flagcxRedOp_t op, flagcxComm_t comm,
                                       flagcxStream_t stream) {
-  FLAGCXCHECK(runUniRunner(sendbuff, recvbuff, recvcount, datatype, op, comm,
-                           stream, flagcxCommOpReduceScatter));
+  void *scratchbuff = nullptr;
+  FLAGCXCHECK(flagcxCalloc(&scratchbuff, recvcount * comm->nranks *
+                                             getFlagcxDataTypeSize(datatype)));
+  FLAGCXCHECK(runUniRunner(sendbuff, recvbuff, scratchbuff, recvcount, datatype,
+                           op, comm, stream, flagcxCommOpReduceScatter));
+  FLAGCXCHECK(flagcxFree(scratchbuff));
   return flagcxSuccess;
 }
 

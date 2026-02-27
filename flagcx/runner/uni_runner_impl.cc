@@ -970,8 +970,9 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
 
 static flagcxResult_t initUniRunnerStateRingRS(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
-    size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
-    flagcxComm_t comm, int numSlices = 1, int numRedSlices = 1) {
+    void *scratchbuff, size_t count, flagcxDataType_t datatype,
+    flagcxRedOp_t op, flagcxComm_t comm, int numSlices = 1,
+    int numRedSlices = 1) {
   TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateRingRS called, recvcount=%lu, numSlices=%d, "
         "numRedSlices=%d",
@@ -1061,8 +1062,8 @@ static flagcxResult_t initUniRunnerStateRingRS(
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count =
           txSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
-      // First step sends from sendbuff, others from recvbuff
-      void *srcBase = (i == 0) ? const_cast<void *>(sendbuff) : recvbuff;
+      // First step sends from sendbuff, others from scratchbuff
+      void *srcBase = (i == 0) ? const_cast<void *>(sendbuff) : scratchbuff;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].addr =
           static_cast<void *>(static_cast<char *>(srcBase) + txOffset);
 
@@ -1074,7 +1075,7 @@ static flagcxResult_t initUniRunnerStateRingRS(
           rxSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
-          static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
+          static_cast<void *>(static_cast<char *>(scratchbuff) + rxOffset);
 
       // Set up p2p node dependency
       if (p2pNodeIdx == 0) {
@@ -1133,12 +1134,14 @@ static flagcxResult_t initUniRunnerStateRingRS(
         // Add offset for all previous redSlices that got the remainder
         redOffset += std::min(r, (int)redSliceRemainder) * typeSize;
         runnerState->dagNodes[redNodeIdx].nodeData.red.input1 =
-            static_cast<void *>(static_cast<char *>(recvbuff) + redOffset);
+            static_cast<void *>(static_cast<char *>(scratchbuff) + redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.input2 =
             static_cast<void *>(
                 static_cast<char *>(const_cast<void *>(sendbuff)) + redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.output =
-            static_cast<void *>(static_cast<char *>(recvbuff) + redOffset);
+            i == nranks - 2 ? recvbuff
+                            : static_cast<void *>(
+                                  static_cast<char *>(scratchbuff) + redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.count = redCount;
         runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
             uniRunnerNThreads;
@@ -1419,7 +1422,8 @@ static flagcxResult_t processInflightQueue(flagcxUniRunnerState *runnerState) {
   return flagcxSuccess;
 }
 
-flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
+flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff,
+                            void *scratchbuff, size_t count,
                             flagcxDataType_t datatype, flagcxRedOp_t op,
                             flagcxComm_t comm, flagcxStream_t stream,
                             flagcxCommOp_t commOp) {
