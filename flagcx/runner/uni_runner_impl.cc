@@ -1497,8 +1497,8 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff,
   } else if (commOp == flagcxCommOpReduceScatter) {
     FLAGCXCHECKGOTO(
         initUniRunnerStateRingRS(&hcomm->proxyState->uniRunnerState, sendbuff,
-                                 recvbuff, count, datatype, op, comm,
-                                 uniRunnerNSlices, uniRunnerNRedSlices),
+                                 recvbuff, scratchbuff, count, datatype, op,
+                                 comm, uniRunnerNSlices, uniRunnerNRedSlices),
         res, out);
   } else {
     FLAGCXCHECKGOTO(initUniRunnerStateDummy(&hcomm->proxyState->uniRunnerState),

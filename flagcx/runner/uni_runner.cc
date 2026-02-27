@@ -87,11 +87,12 @@ flagcxResult_t uniRunnerReduceScatter(const void *sendbuff, void *recvbuff,
                                       flagcxRedOp_t op, flagcxComm_t comm,
                                       flagcxStream_t stream) {
   void *scratchbuff = nullptr;
-  FLAGCXCHECK(flagcxCalloc(&scratchbuff, recvcount * comm->nranks *
-                                             getFlagcxDataTypeSize(datatype)));
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+      &scratchbuff, recvcount * comm->nranks * getFlagcxDataTypeSize(datatype),
+      flagcxMemDevice, stream));
   FLAGCXCHECK(runUniRunner(sendbuff, recvbuff, scratchbuff, recvcount, datatype,
                            op, comm, stream, flagcxCommOpReduceScatter));
-  FLAGCXCHECK(flagcxFree(scratchbuff));
+  FLAGCXCHECK(deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream));
   return flagcxSuccess;
 }
 
