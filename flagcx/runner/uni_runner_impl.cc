@@ -946,7 +946,6 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
         "DAG scheduler initialized with %d-rank Sliced AllReduce topology (%d "
         "slices, %d redSlices)",
         nranks, numSlices, numRedSlices);
-#ifdef UNIRUNNER_PRINT_DAG
   // print dependency graph
   for (int i = 0; i < runnerState->numDagNodes; i++) {
     TRACE(
@@ -963,7 +962,6 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
       TRACE(FLAGCX_UNIRUNNER, "%s", childStr.c_str());
     }
   }
-#endif
 
   return flagcxSuccess;
 }
@@ -1178,7 +1176,6 @@ static flagcxResult_t initUniRunnerStateRingRS(
         "DAG scheduler initialized with %d-rank ReduceScatter topology (%d "
         "slices, %d redSlices)",
         nranks, numSlices, numRedSlices);
-#ifdef UNIRUNNER_PRINT_DAG
   // print dependency graph
   for (int i = 0; i < runnerState->numDagNodes; i++) {
     TRACE(
@@ -1195,7 +1192,6 @@ static flagcxResult_t initUniRunnerStateRingRS(
       TRACE(FLAGCX_UNIRUNNER, "%s", childStr.c_str());
     }
   }
-#endif
 
   return flagcxSuccess;
 }
