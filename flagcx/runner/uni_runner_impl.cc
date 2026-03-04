@@ -95,6 +95,13 @@ initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
                          const void *sendbuff, void *recvbuff, size_t count,
                          flagcxDataType_t datatype, flagcxRedOp_t op,
                          flagcxComm_t comm, int numSlices = 1) {
+  int rank = comm->rank;
+  int nranks = comm->nranks;
+
+  if (nranks < 2) {
+    return flagcxSuccess;
+  }
+
   TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateLocRed called, count=%lu, numSlices=%d",
         comm->rank, count, numSlices);
@@ -105,13 +112,6 @@ initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
   flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
   flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
   runnerState->numPendingNodes = 0;
-
-  int rank = comm->rank;
-  int nranks = comm->nranks;
-
-  if (nranks < 2) {
-    return flagcxSystemError;
-  }
 
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
@@ -178,6 +178,13 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
                          const void *sendbuff, void *recvbuff, size_t count,
                          flagcxDataType_t datatype, flagcxRedOp_t op,
                          flagcxComm_t comm, int numSlices = 1) {
+  int rank = comm->rank;
+  int nranks = comm->nranks;
+
+  if (nranks < 2) {
+    return flagcxSuccess;
+  }
+
   TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateP2p called, count=%lu, numSlices=%d",
         comm->rank, count, numSlices);
@@ -188,13 +195,6 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
   flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
   flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
   runnerState->numPendingNodes = 0;
-
-  int rank = comm->rank;
-  int nranks = comm->nranks;
-
-  if (nranks < 2) {
-    return flagcxSystemError;
-  }
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
@@ -354,6 +354,13 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
                          const void *sendbuff, void *recvbuff, size_t count,
                          flagcxDataType_t datatype, flagcxRedOp_t op,
                          flagcxComm_t comm, int numSlices = 1) {
+  int rank = comm->rank;
+  int nranks = comm->nranks;
+
+  if (nranks < 2) {
+    return flagcxSuccess;
+  }
+
   TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateRingAR called, count=%lu, numSlices=%d",
         comm->rank, count, numSlices);
@@ -364,13 +371,6 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
   flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
   flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
   runnerState->numPendingNodes = 0;
-
-  int rank = comm->rank;
-  int nranks = comm->nranks;
-
-  if (nranks < 2) {
-    return flagcxSystemError;
-  }
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
@@ -651,6 +651,13 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
     flagcxComm_t comm, int numSlices = 1, int numRedSlices = 1) {
+  int rank = comm->rank;
+  int nranks = comm->nranks;
+
+  if (nranks < 2) {
+    return flagcxSuccess;
+  }
+
   TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateSlicedAR called, count=%lu, numSlices=%d, "
         "numRedSlices=%d",
@@ -662,13 +669,6 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
   flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
   flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
   runnerState->numPendingNodes = 0;
-
-  int rank = comm->rank;
-  int nranks = comm->nranks;
-
-  if (nranks < 2) {
-    return flagcxSystemError;
-  }
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
@@ -973,6 +973,13 @@ static flagcxResult_t initUniRunnerStateRingRS(
     void *scratchbuff, size_t count, flagcxDataType_t datatype,
     flagcxRedOp_t op, flagcxComm_t comm, int numSlices = 1,
     int numRedSlices = 1) {
+  int rank = comm->rank;
+  int nranks = comm->nranks;
+
+  if (nranks < 2) {
+    return flagcxSuccess;
+  }
+
   TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateRingRS called, recvcount=%lu, numSlices=%d, "
         "numRedSlices=%d",
@@ -984,13 +991,6 @@ static flagcxResult_t initUniRunnerStateRingRS(
   flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
   flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
   runnerState->numPendingNodes = 0;
-
-  int rank = comm->rank;
-  int nranks = comm->nranks;
-
-  if (nranks < 2) {
-    return flagcxSystemError;
-  }
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
