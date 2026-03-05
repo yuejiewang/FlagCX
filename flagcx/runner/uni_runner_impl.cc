@@ -95,13 +95,6 @@ flagcxResult_t initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
         "rank %d initUniRunnerStateLocRed called, count=%lu, numSlices=%d",
         comm->rank, count, numSlices);
 
-  // Initialize queues
-  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
-  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
-  runnerState->numPendingNodes = 0;
-
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
   // Pipeline configuration - handle uneven distribution
@@ -178,13 +171,6 @@ flagcxResult_t initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
   TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateP2p called, count=%lu, numSlices=%d",
         comm->rank, count, numSlices);
-
-  // Initialize queues
-  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
-  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
-  runnerState->numPendingNodes = 0;
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
@@ -354,13 +340,6 @@ flagcxResult_t initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
   TRACE(FLAGCX_UNIRUNNER,
         "rank %d initUniRunnerStateRingAR called, count=%lu, numSlices=%d",
         comm->rank, count, numSlices);
-
-  // Initialize queues
-  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
-  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
-  runnerState->numPendingNodes = 0;
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
@@ -652,13 +631,6 @@ flagcxResult_t initUniRunnerStateSlicedAR(
         "rank %d initUniRunnerStateSlicedAR called, count=%lu, numSlices=%d, "
         "numRedSlices=%d",
         comm->rank, count, numSlices, numRedSlices);
-
-  // Initialize queues
-  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
-  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
-  runnerState->numPendingNodes = 0;
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
@@ -974,13 +946,6 @@ flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
         "rank %d initUniRunnerStateRingRS called, recvcount=%lu, numSlices=%d, "
         "numRedSlices=%d",
         comm->rank, count, numSlices, numRedSlices);
-
-  // Initialize queues
-  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
-  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
-  runnerState->numPendingNodes = 0;
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
@@ -1439,7 +1404,16 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
       &hcomm->uniRunnerFifoBuffer, (void *)runnerState->fifo->buffer));
 
+  // Initialize queues
+  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
+  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
+  runnerState->numPendingNodes = 0;
+
+  // Initialize P2P event pool
   FLAGCXCHECK(initP2pEvents(runnerState));
+
   // Create dedicated reduce and copy streams
   flagcxStream_t redStream;
   FLAGCXCHECK(deviceAdaptor->streamCreate(&redStream));
