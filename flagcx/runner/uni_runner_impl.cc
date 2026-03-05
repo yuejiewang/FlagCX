@@ -1370,7 +1370,7 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
       }
       runnerState->dagNodes[sendNodeIdx].numChildren = 0;
 
-      TRACE(FLAGCX_UNIRUNNER, "rank %d recvNode %d", rank, recvNodeIdx);
+      TRACE(FLAGCX_UNIRUNNER, "rank %d sendNode %d", rank, sendNodeIdx);
     }
   }
 
