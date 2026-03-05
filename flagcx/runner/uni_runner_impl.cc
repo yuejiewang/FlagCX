@@ -1175,7 +1175,7 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
   // Nodes per slice chain:
-  const int nTotalSteps = 8 * sizeof(int) - 1 - __builtin_clz(nranks - 1);
+  const int nTotalSteps = 8 * sizeof(int) - __builtin_clz(nranks - 1);
   const int recvNodesPerSlice =
       algoRank ? __builtin_ctz(algoRank) : nTotalSteps;
   const int sendNodesPerSlice = algoRank ? 1 : 0;
@@ -1344,11 +1344,6 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
       size_t txSliceOffset = s * txBaseSliceCount * typeSize;
       txSliceOffset += std::min(s, (int)txSliceRemainder) * typeSize;
 
-      TRACE(FLAGCX_UNIRUNNER,
-            "Initializing rank %d slice %d send node, step %d, txSliceCount "
-            "%lu, txSliceOffset %lu",
-            rank, s, recvNodesPerSlice, txSliceCount, txSliceOffset);
-
       // Op 0: Send
       runnerState->dagNodes[sendNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimSend;
@@ -1365,15 +1360,17 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
                                       : scratchbuff) +
               txSliceOffset);
       // Set up p2p node dependency
-      runnerState->dagNodes[sendNodeIdx].numParents =
-          recvNodesPerSlice * numRedSlices;
       if (recvNodesPerSlice == 0) {
+        runnerState->dagNodes[sendNodeIdx].numParents = 0;
         flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
                                 &runnerState->dagNodes[sendNodeIdx]);
       } else {
+        runnerState->dagNodes[sendNodeIdx].numParents = numRedSlices;
         runnerState->numPendingNodes++;
       }
       runnerState->dagNodes[sendNodeIdx].numChildren = 0;
+
+      TRACE(FLAGCX_UNIRUNNER, "rank %d recvNode %d", rank, recvNodeIdx);
     }
   }
 
