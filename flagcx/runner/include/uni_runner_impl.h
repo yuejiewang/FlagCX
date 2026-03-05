@@ -167,6 +167,13 @@ flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm,
                                         int numSlices, int numRedSlices);
+flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
+                                         const void *sendbuff, void *recvbuff,
+                                         void *scratchbuff, size_t count,
+                                         flagcxDataType_t datatype,
+                                         flagcxRedOp_t op, int root,
+                                         flagcxComm_t comm, int numSlices,
+                                         int numRedSlices);
 flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream);
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm);
 flagcxResult_t runUniRunner(flagcxComm_t comm);
