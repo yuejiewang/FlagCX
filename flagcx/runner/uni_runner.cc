@@ -15,7 +15,24 @@ flagcxResult_t uniRunnerReduce(const void *sendbuff, void *recvbuff,
                                size_t count, flagcxDataType_t datatype,
                                flagcxRedOp_t op, int root, flagcxComm_t comm,
                                flagcxStream_t stream) {
-  return flagcxNotSupported;
+  flagcxResult_t res = flagcxSuccess;
+  flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  void *scratchbuff = nullptr;
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+      &scratchbuff, 2 * count * getFlagcxDataTypeSize(datatype),
+      flagcxMemDevice, stream));
+  FLAGCXCHECK(initUniRunner(comm, stream));
+  FLAGCXCHECKGOTO(initUniRunnerStateTreeRed(
+                      runnerState, sendbuff, recvbuff, scratchbuff, count,
+                      datatype, op, root, comm, runnerState->uniRunnerNSlices,
+                      runnerState->uniRunnerNRedSlices),
+                  res, out);
+  FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
+out:
+  FLAGCXCHECK(deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream));
+  FLAGCXCHECK(cleanupUniRunner(comm));
+  return res;
 }
 
 flagcxResult_t uniRunnerGather(const void *sendbuff, void *recvbuff,
