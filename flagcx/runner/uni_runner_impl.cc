@@ -1303,11 +1303,16 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
             static_cast<void *>(static_cast<char *>(scratchbuff) + redOffset);
         void *redInput2Base =
             (i == 0) ? const_cast<void *>(sendbuff) : scratchbuff;
+        void *redOutput =
+            (i == nTotalSteps - 1)
+                ? static_cast<void *>(static_cast<char *>(recvbuff) +
+                                      redOffset - count * typeSize)
+                : static_cast<void *>(static_cast<char *>(scratchbuff) +
+                                      redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.input2 =
             static_cast<void *>(static_cast<char *>(redInput2Base) + redOffset -
                                 count * typeSize);
-        runnerState->dagNodes[redNodeIdx].nodeData.red.output =
-            static_cast<void *>(static_cast<char *>(scratchbuff) + redOffset);
+        runnerState->dagNodes[redNodeIdx].nodeData.red.output = redOutput;
         runnerState->dagNodes[redNodeIdx].nodeData.red.count = redCount;
         runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
             runnerState->uniRunnerNThreads;
