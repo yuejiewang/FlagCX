@@ -1174,7 +1174,13 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
   int recvNodesPerSlice = algoRank ? __builtin_ctz(algoRank) : nTotalSteps;
   if (algoRank && recvNodesPerSlice &&
       nranks - algoRank <= (1 << (recvNodesPerSlice - 1))) {
-    recvNodesPerSlice = 8 * sizeof(int) - __builtin_clz(nranks - algoRank - 1);
+    recvNodesPerSlice =
+        nranks - algoRank - 1
+            ? 8 * sizeof(int) - __builtin_clz(nranks - algoRank - 1)
+            : 0;
+    TRACE(FLAGCX_UNIRUNNER,
+          "rank %d (algoRank %d) adjusted recvNodesPerSlice to %d from %d",
+          rank, algoRank, recvNodesPerSlice, __builtin_ctz(algoRank));
   }
   const int sendNodesPerSlice = algoRank ? 1 : 0;
   const int redNodesPerSlice = recvNodesPerSlice * numRedSlices;
@@ -1342,7 +1348,7 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
                        runnerState->dagNodes[sendNodeIdx].nodeData.p2p.numOps *
                            sizeof(struct uniRunnerP2pOpData)));
 
-      int peer = (rank - (1 << recvNodesPerSlice) + nranks) % nranks;
+      int peer = (rank - (1 << (__builtin_ctz(algoRank))) + nranks) % nranks;
 
       runnerState->dagNodes[sendNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimSend;
