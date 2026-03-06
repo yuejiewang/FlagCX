@@ -24,16 +24,6 @@ FLAGCX_PARAM(UniRunnerNThreads, "UNIRUNNER_NTHREADS", 32);
 FLAGCX_PARAM(UniRunnerNBlocks, "UNIRUNNER_NBLOCKS", 1);
 FLAGCX_PARAM(UniRunnerNRedSlices, "UNIRUNNER_NREDSLICES", 0);
 FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
-FLAGCX_PARAM(UniRunnerUseLocRed, "UNIRUNNER_USE_LOCRED", 0);
-FLAGCX_PARAM(UniRunnerUseRingAG, "UNIRUNNER_USE_RINGAG", 0);
-FLAGCX_PARAM(UniRunnerUseSlicedAR, "UNIRUNNER_USE_SLICEDAR", 0);
-
-static uint64_t p2pEventPoolSize;
-static uint64_t uniRunnerNSlices;
-static uint64_t uniRunnerNThreads;
-static uint64_t uniRunnerNBlocks;
-static uint64_t uniRunnerNRedSlices;
-static uint64_t uniRunnerRedSliceSize;
 
 // Check if event at index is available
 bool uniRunnerP2pEventBitmap::isAvailable(int index) {
@@ -45,13 +35,13 @@ bool uniRunnerP2pEventBitmap::isAvailable(int index) {
 // Get first available event index, or -1 if none
 int uniRunnerP2pEventBitmap::getAvailable() {
   int ret = -1;
-  for (int i = 0; i < p2pEventPoolSize; i++) {
+  for (int i = 0; i < size; i++) {
     if (isAvailable(nextIdx)) {
       ret = nextIdx;
-      nextIdx = (nextIdx + 1) % p2pEventPoolSize;
+      nextIdx = (nextIdx + 1) % size;
       break;
     }
-    nextIdx = (nextIdx + 1) % p2pEventPoolSize;
+    nextIdx = (nextIdx + 1) % size;
   }
   return ret;
 }
@@ -85,33 +75,25 @@ void flagcxUniRunnerState::resetEvent(int idx) {
         p2pEventMap.bits[0]);
 }
 
-static flagcxResult_t
-initUniRunnerStateDummy(flagcxUniRunnerState *runnerState) {
+flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState) {
   return flagcxNotSupported;
 }
 
-static flagcxResult_t
-initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
-                         const void *sendbuff, void *recvbuff, size_t count,
-                         flagcxDataType_t datatype, flagcxRedOp_t op,
-                         flagcxComm_t comm, int numSlices = 1) {
-  TRACE(FLAGCX_UNIRUNNER,
-        "rank %d initUniRunnerStateLocRed called, count=%lu, numSlices=%d",
-        comm->rank, count, numSlices);
-
-  // Initialize queues
-  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
-  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
-  runnerState->numPendingNodes = 0;
-
+flagcxResult_t initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
+                                        const void *sendbuff, void *recvbuff,
+                                        size_t count, flagcxDataType_t datatype,
+                                        flagcxRedOp_t op, flagcxComm_t comm,
+                                        int numSlices = 1) {
   int rank = comm->rank;
   int nranks = comm->nranks;
 
   if (nranks < 2) {
-    return flagcxSystemError;
+    return flagcxSuccess;
   }
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initUniRunnerStateLocRed called, count=%lu, numSlices=%d",
+        comm->rank, count, numSlices);
 
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
@@ -158,7 +140,8 @@ initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
     runnerState->dagNodes[redNodeIdx].nodeData.red.output =
         static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
     runnerState->dagNodes[redNodeIdx].nodeData.red.count = sliceCount;
-    runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads = uniRunnerNThreads;
+    runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
+        runnerState->uniRunnerNThreads;
     runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
     runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
 
@@ -173,28 +156,21 @@ initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
   return flagcxSuccess;
 }
 
-static flagcxResult_t
-initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
-                         const void *sendbuff, void *recvbuff, size_t count,
-                         flagcxDataType_t datatype, flagcxRedOp_t op,
-                         flagcxComm_t comm, int numSlices = 1) {
-  TRACE(FLAGCX_UNIRUNNER,
-        "rank %d initUniRunnerStateP2p called, count=%lu, numSlices=%d",
-        comm->rank, count, numSlices);
-
-  // Initialize queues
-  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
-  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
-  runnerState->numPendingNodes = 0;
-
+flagcxResult_t initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
+                                        const void *sendbuff, void *recvbuff,
+                                        size_t count, flagcxDataType_t datatype,
+                                        flagcxRedOp_t op, flagcxComm_t comm,
+                                        int numSlices = 1) {
   int rank = comm->rank;
   int nranks = comm->nranks;
 
   if (nranks < 2) {
-    return flagcxSystemError;
+    return flagcxSuccess;
   }
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initUniRunnerStateP2p called, count=%lu, numSlices=%d",
+        comm->rank, count, numSlices);
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
@@ -349,28 +325,21 @@ initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
   return flagcxSuccess;
 }
 
-static flagcxResult_t
-initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
-                         const void *sendbuff, void *recvbuff, size_t count,
-                         flagcxDataType_t datatype, flagcxRedOp_t op,
-                         flagcxComm_t comm, int numSlices = 1) {
-  TRACE(FLAGCX_UNIRUNNER,
-        "rank %d initUniRunnerStateRingAR called, count=%lu, numSlices=%d",
-        comm->rank, count, numSlices);
-
-  // Initialize queues
-  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
-  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
-  runnerState->numPendingNodes = 0;
-
+flagcxResult_t initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
+                                        const void *sendbuff, void *recvbuff,
+                                        size_t count, flagcxDataType_t datatype,
+                                        flagcxRedOp_t op, flagcxComm_t comm,
+                                        int numSlices = 1) {
   int rank = comm->rank;
   int nranks = comm->nranks;
 
   if (nranks < 2) {
-    return flagcxSystemError;
+    return flagcxSuccess;
   }
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initUniRunnerStateRingAR called, count=%lu, numSlices=%d",
+        comm->rank, count, numSlices);
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
@@ -517,7 +486,7 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
           static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
       runnerState->dagNodes[redNodeIdx].nodeData.red.count = rxSliceCount;
       runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
-          uniRunnerNThreads;
+          runnerState->uniRunnerNThreads;
       runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
       runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
 
@@ -647,28 +616,21 @@ initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
   return flagcxSuccess;
 }
 
-static flagcxResult_t initUniRunnerStateSlicedAR(
+flagcxResult_t initUniRunnerStateSlicedAR(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
     flagcxComm_t comm, int numSlices = 1, int numRedSlices = 1) {
-  TRACE(FLAGCX_UNIRUNNER,
-        "rank %d initUniRunnerStateSlicedAR called, count=%lu, numSlices=%d, "
-        "numRedSlices=%d",
-        comm->rank, count, numSlices, numRedSlices);
-
-  // Initialize queues
-  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
-  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
-  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
-  runnerState->numPendingNodes = 0;
-
   int rank = comm->rank;
   int nranks = comm->nranks;
 
   if (nranks < 2) {
-    return flagcxSystemError;
+    return flagcxSuccess;
   }
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initUniRunnerStateSlicedAR called, count=%lu, numSlices=%d, "
+        "numRedSlices=%d",
+        comm->rank, count, numSlices, numRedSlices);
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
@@ -833,7 +795,7 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
             static_cast<void *>(static_cast<char *>(recvbuff) + redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.count = redCount;
         runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
-            uniRunnerNThreads;
+            runnerState->uniRunnerNThreads;
         runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
         runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
 
@@ -946,7 +908,6 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
         "DAG scheduler initialized with %d-rank Sliced AllReduce topology (%d "
         "slices, %d redSlices)",
         nranks, numSlices, numRedSlices);
-#ifdef UNIRUNNER_PRINT_DAG
   // print dependency graph
   for (int i = 0; i < runnerState->numDagNodes; i++) {
     TRACE(
@@ -963,7 +924,231 @@ static flagcxResult_t initUniRunnerStateSlicedAR(
       TRACE(FLAGCX_UNIRUNNER, "%s", childStr.c_str());
     }
   }
-#endif
+
+  return flagcxSuccess;
+}
+
+flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
+                                        const void *sendbuff, void *recvbuff,
+                                        void *scratchbuff, size_t count,
+                                        flagcxDataType_t datatype,
+                                        flagcxRedOp_t op, flagcxComm_t comm,
+                                        int numSlices = 1,
+                                        int numRedSlices = 1) {
+  int rank = comm->rank;
+  int nranks = comm->nranks;
+
+  if (nranks < 2) {
+    return flagcxSuccess;
+  }
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initUniRunnerStateRingRS called, recvcount=%lu, numSlices=%d, "
+        "numRedSlices=%d",
+        comm->rank, count, numSlices, numRedSlices);
+
+  int nextRank = (rank + 1) % nranks;
+  int prevRank = (rank - 1 + nranks) % nranks;
+  size_t typeSize = getFlagcxDataTypeSize(datatype);
+  size_t baseRankChunkCount = count;
+
+  // Nodes per slice chain:
+  // (P2P + Reduce * numRedSlices) * (nranks - 1)
+  const int nodesPerSlice = (numRedSlices + 1) * (nranks - 1);
+  const int numNodes = numSlices * nodesPerSlice;
+
+  runnerState->numDagNodes = numNodes;
+  FLAGCXCHECK(
+      flagcxCalloc(&runnerState->dagNodes,
+                   runnerState->numDagNodes * sizeof(struct uniRunnerDagNode)));
+  if (runnerState->dagNodes == NULL) {
+    return flagcxSystemError;
+  }
+
+  int globalNodeIdx = 0;
+
+  /* reduce-scatter (nranks - 1 steps)
+   * slice = s, step = i
+   * p2pNodeIdx = s * nodesPerSlice + i * (1 + numRedSlices)
+   * redNodeIdx = s * nodesPerSlice + i * (1 + numRedSlices) + 1
+   */
+  for (int s = 0; s < numSlices; s++) {
+    for (int i = 0; i < nranks - 1; i++) {
+      // P2P Node
+      int p2pNodeIdx = globalNodeIdx++;
+      runnerState->dagNodes[p2pNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.numOps = 2;
+      FLAGCXCHECK(
+          flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
+                       2 * sizeof(struct uniRunnerP2pOpData)));
+
+      int txChunk = (rank - i - 1 + nranks) % nranks;
+      int rxChunk = (rank - i - 2 + nranks) % nranks;
+
+      size_t txRankChunkCount = baseRankChunkCount;
+      size_t rxRankChunkCount = baseRankChunkCount;
+      size_t txBaseSliceCount = txRankChunkCount / numSlices;
+      size_t rxBaseSliceCount = rxRankChunkCount / numSlices;
+      size_t txSliceRemainder = txRankChunkCount % numSlices;
+      size_t rxSliceRemainder = rxRankChunkCount % numSlices;
+      size_t txSliceCount = txBaseSliceCount + (s < txSliceRemainder ? 1 : 0);
+      size_t rxSliceCount = rxBaseSliceCount + (s < rxSliceRemainder ? 1 : 0);
+      size_t txSliceOffsetInChunk = s * txBaseSliceCount * typeSize;
+      txSliceOffsetInChunk += std::min(s, (int)txSliceRemainder) * typeSize;
+      size_t rxSliceOffsetInChunk = s * rxBaseSliceCount * typeSize;
+      rxSliceOffsetInChunk += std::min(s, (int)rxSliceRemainder) * typeSize;
+
+      size_t txOffset =
+          (txChunk * baseRankChunkCount) * typeSize + txSliceOffsetInChunk;
+      size_t rxOffset =
+          (rxChunk * baseRankChunkCount) * typeSize + rxSliceOffsetInChunk;
+
+      TRACE(FLAGCX_UNIRUNNER,
+            "Initializing rank %d slice %d, step %d, txRankCount "
+            "%lu, txSliceCount %lu, rxRankCount %lu, rxSliceCount %lu, tx "
+            "chunk %d off %lu, rx chunk %d off %lu",
+            rank, s, i, txRankChunkCount, txSliceCount, rxRankChunkCount,
+            rxSliceCount, txChunk, txOffset, rxChunk, rxOffset);
+
+      // Op 0: Send
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].type =
+          flagcxDevicePrimSend;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank = nextRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count =
+          txSliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
+      // First step sends from sendbuff, others from scratchbuff
+      void *srcBase = (i == 0) ? const_cast<void *>(sendbuff) : scratchbuff;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].addr =
+          static_cast<void *>(static_cast<char *>(srcBase) + txOffset);
+
+      // Op 1: Recv
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
+          flagcxDevicePrimRecv;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank = prevRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count =
+          rxSliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
+          static_cast<void *>(static_cast<char *>(scratchbuff) + rxOffset);
+
+      // Set up p2p node dependency
+      if (p2pNodeIdx == 0) {
+        runnerState->dagNodes[p2pNodeIdx].numParents = 0;
+        flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
+                                &runnerState->dagNodes[p2pNodeIdx]);
+      } else {
+        if (i == 0) {
+          runnerState->dagNodes[p2pNodeIdx].numParents = 1;
+        } else {
+          runnerState->dagNodes[p2pNodeIdx].numParents = 1 + numRedSlices;
+        }
+        runnerState->numPendingNodes++;
+      }
+      if (i == nranks - 1 && s == numSlices - 1) {
+        runnerState->dagNodes[p2pNodeIdx].numChildren = numRedSlices;
+      } else {
+        runnerState->dagNodes[p2pNodeIdx].numChildren = 1 + numRedSlices;
+      }
+      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].children,
+                               runnerState->dagNodes[p2pNodeIdx].numChildren *
+                                   sizeof(int)));
+      for (int r = 0; r < numRedSlices; r++) {
+        runnerState->dagNodes[p2pNodeIdx].children[r] = p2pNodeIdx + 1 + r;
+        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child %d: %d", rank,
+              p2pNodeIdx, r, runnerState->dagNodes[p2pNodeIdx].children[r]);
+      }
+      if (s == numSlices - 1) {
+        runnerState->dagNodes[p2pNodeIdx].children[numRedSlices] =
+            (i + 1) * (1 + numRedSlices);
+        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child %d: %d", rank,
+              p2pNodeIdx, numRedSlices,
+              runnerState->dagNodes[p2pNodeIdx].children[numRedSlices]);
+      } else {
+        runnerState->dagNodes[p2pNodeIdx].children[numRedSlices] =
+            p2pNodeIdx + nodesPerSlice;
+        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child %d: %d", rank,
+              p2pNodeIdx, numRedSlices,
+              runnerState->dagNodes[p2pNodeIdx].children[numRedSlices]);
+      }
+
+      // Reduce Node
+      int redSliceStartIdx = globalNodeIdx;
+      // Calculate redSliceCount with uneven distribution
+      size_t baseRedSliceCount = rxSliceCount / numRedSlices;
+      size_t redSliceRemainder = rxSliceCount % numRedSlices;
+      for (int r = 0; r < numRedSlices; r++) {
+        int redNodeIdx = globalNodeIdx++;
+        runnerState->dagNodes[redNodeIdx].nodeType = uniRunnerDagNodeTypeRed;
+        // Calculate redCount and offset with uneven distribution
+        size_t redCount = baseRedSliceCount;
+        if (r < redSliceRemainder) {
+          redCount++;
+        }
+        size_t redOffset = rxOffset + r * baseRedSliceCount * typeSize;
+        // Add offset for all previous redSlices that got the remainder
+        redOffset += std::min(r, (int)redSliceRemainder) * typeSize;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.input1 =
+            static_cast<void *>(static_cast<char *>(scratchbuff) + redOffset);
+        runnerState->dagNodes[redNodeIdx].nodeData.red.input2 =
+            static_cast<void *>(
+                static_cast<char *>(const_cast<void *>(sendbuff)) + redOffset);
+        runnerState->dagNodes[redNodeIdx].nodeData.red.output =
+            i == nranks - 2
+                ? static_cast<void *>(
+                      static_cast<char *>(recvbuff) + rxSliceOffsetInChunk +
+                      r * baseRedSliceCount * typeSize +
+                      std::min(r, (int)redSliceRemainder) * typeSize)
+                : static_cast<void *>(static_cast<char *>(scratchbuff) +
+                                      redOffset);
+        runnerState->dagNodes[redNodeIdx].nodeData.red.count = redCount;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
+            runnerState->uniRunnerNThreads;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
+
+        // Set up red node dependency
+        runnerState->numPendingNodes++;
+        runnerState->dagNodes[redNodeIdx].numParents = 1;
+        if (i == nranks - 2) {
+          runnerState->dagNodes[redNodeIdx].numChildren = 0;
+          FLAGCXCHECK(flagcxCalloc(
+              &runnerState->dagNodes[redNodeIdx].children,
+              runnerState->dagNodes[redNodeIdx].numChildren * sizeof(int)));
+        } else {
+          runnerState->dagNodes[redNodeIdx].numChildren = 1;
+          FLAGCXCHECK(flagcxCalloc(
+              &runnerState->dagNodes[redNodeIdx].children,
+              runnerState->dagNodes[redNodeIdx].numChildren * sizeof(int)));
+          runnerState->dagNodes[redNodeIdx].children[0] =
+              redSliceStartIdx + numRedSlices;
+          TRACE(FLAGCX_UNIRUNNER, "rank %d redNode %d child 0: %d", rank,
+                redNodeIdx, runnerState->dagNodes[redNodeIdx].children[0]);
+        }
+      }
+    }
+  }
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "DAG scheduler initialized with %d-rank ReduceScatter topology (%d "
+        "slices, %d redSlices)",
+        nranks, numSlices, numRedSlices);
+  // print dependency graph
+  for (int i = 0; i < runnerState->numDagNodes; i++) {
+    TRACE(
+        FLAGCX_UNIRUNNER, "Node %d: type=%s, numParents=%d, numChildren=%d", i,
+        (runnerState->dagNodes[i].nodeType == uniRunnerDagNodeTypeP2p) ? "P2P"
+                                                                       : "RED",
+        runnerState->dagNodes[i].numParents,
+        runnerState->dagNodes[i].numChildren);
+    if (runnerState->dagNodes[i].numChildren > 0) {
+      std::string childStr = "  Children: ";
+      for (int c = 0; c < runnerState->dagNodes[i].numChildren; c++) {
+        childStr += std::to_string(runnerState->dagNodes[i].children[c]) + " ";
+      }
+      TRACE(FLAGCX_UNIRUNNER, "%s", childStr.c_str());
+    }
+  }
 
   return flagcxSuccess;
 }
@@ -988,23 +1173,26 @@ static flagcxResult_t cleanupDagScheduler(flagcxUniRunnerState *runnerState) {
 
 // Initialize P2P event pool
 static flagcxResult_t initP2pEvents(flagcxUniRunnerState *runnerState) {
-  FLAGCXCHECK(flagcxCalloc(&runnerState->p2pEvents,
-                           p2pEventPoolSize * sizeof(flagcxEvent_t)));
-  for (int i = 0; i < p2pEventPoolSize; i++) {
+  runnerState->p2pEventMap.nextIdx = 0;
+  runnerState->p2pEventMap.size = runnerState->p2pEventPoolSize;
+  FLAGCXCHECK(
+      flagcxCalloc(&runnerState->p2pEvents,
+                   runnerState->p2pEventMap.size * sizeof(flagcxEvent_t)));
+  for (int i = 0; i < runnerState->p2pEventMap.size; i++) {
     FLAGCXCHECK(deviceAdaptor->eventCreate(&runnerState->p2pEvents[i],
                                            flagcxEventDisableTiming));
   }
-  runnerState->p2pEventMap.nextIdx = 0;
   FLAGCXCHECK(flagcxCalloc(&runnerState->p2pEventMap.bits,
-                           ((p2pEventPoolSize + 63) / 64) * sizeof(uint64_t)));
+                           ((runnerState->p2pEventMap.size + 63) / 64) *
+                               sizeof(uint64_t)));
   memset(runnerState->p2pEventMap.bits, 0,
-         ((p2pEventPoolSize + 63) / 64) * sizeof(uint64_t));
+         ((runnerState->p2pEventMap.size + 63) / 64) * sizeof(uint64_t));
   return flagcxSuccess;
 }
 
 // Clean up P2P events
 static flagcxResult_t cleanupP2pEvents(flagcxUniRunnerState *runnerState) {
-  for (int i = 0; i < p2pEventPoolSize; i++) {
+  for (int i = 0; i < runnerState->p2pEventPoolSize; i++) {
     FLAGCXCHECK(deviceAdaptor->eventDestroy(runnerState->p2pEvents[i]));
   }
   free(runnerState->p2pEvents);
@@ -1194,109 +1382,94 @@ static flagcxResult_t processInflightQueue(flagcxUniRunnerState *runnerState) {
   return flagcxSuccess;
 }
 
-flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
-                            flagcxDataType_t datatype, flagcxRedOp_t op,
-                            flagcxComm_t comm, flagcxStream_t stream,
-                            flagcxCommOp_t commOp) {
-  flagcxFifo_t fifo = NULL;
-  flagcxResult_t res = flagcxSuccess;
+flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
 
-  p2pEventPoolSize = flagcxParamP2pEventPoolSize();
-  uniRunnerNSlices = flagcxParamUniRunnerNSlices();
-  uniRunnerNThreads = flagcxParamUniRunnerNThreads();
-  uniRunnerNBlocks = flagcxParamUniRunnerNBlocks();
-  uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
-  uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
+  runnerState->p2pEventPoolSize = flagcxParamP2pEventPoolSize();
+  runnerState->uniRunnerNSlices = flagcxParamUniRunnerNSlices();
+  runnerState->uniRunnerNThreads = flagcxParamUniRunnerNThreads();
+  runnerState->uniRunnerNBlocks = flagcxParamUniRunnerNBlocks();
+  runnerState->uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
+  runnerState->uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
 
   // Set device context
-  FLAGCXCHECKGOTO(deviceAdaptor->setDevice(hcomm->cudaDev), res, out);
+  FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
 
   // Create FIFO
-  hcomm->proxyState->uniRunnerState.fifo = new flagcxFifo();
-  FLAGCXCHECKGOTO(hcomm->proxyState->uniRunnerState.fifo->flagcxRedFifoInit(),
-                  res, out);
-  fifo = hcomm->proxyState->uniRunnerState.fifo;
+  runnerState->fifo = new flagcxFifo();
+  FLAGCXCHECK(runnerState->fifo->flagcxRedFifoInit());
   // hcomm->proxyState->uniRunnerState.fifo->buffer is the host pointer
   // hcomm->uniRunnerFifoBuffer stores the device pointer to fifo buffer
-  FLAGCXCHECKGOTO(deviceAdaptor->hostGetDevicePointer(
-                      &hcomm->uniRunnerFifoBuffer,
-                      (void *)hcomm->proxyState->uniRunnerState.fifo->buffer),
-                  res, out);
+  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
+      &hcomm->uniRunnerFifoBuffer, (void *)runnerState->fifo->buffer));
 
-  // Initialize DAG scheduler
-  if (commOp == flagcxCommOpAllReduce) {
-    if (flagcxParamUniRunnerUseLocRed()) {
-      /* initialize uniRunnerState for reduce test */
-      FLAGCXCHECKGOTO(
-          initUniRunnerStateLocRed(&hcomm->proxyState->uniRunnerState, sendbuff,
-                                   recvbuff, count, datatype, op, comm,
-                                   uniRunnerNSlices),
-          res, out);
-    } else if (flagcxParamUniRunnerUseRingAG()) {
-      /* initialize uniRunnerState for p2p test */
-      FLAGCXCHECKGOTO(
-          initUniRunnerStateRingAG(&hcomm->proxyState->uniRunnerState, sendbuff,
-                                   recvbuff, count, datatype, op, comm,
-                                   uniRunnerNSlices),
-          res, out);
-    } else if (flagcxParamUniRunnerUseSlicedAR()) {
-      if (uniRunnerNRedSlices == 0) {
-        if (count <= 0 || uniRunnerRedSliceSize == 0) {
-          uniRunnerNRedSlices = 1;
-        } else {
-          uniRunnerNRedSlices = ceil((float)count / comm->nranks /
-                                     uniRunnerNSlices / uniRunnerRedSliceSize);
-        }
-        TRACE(FLAGCX_UNIRUNNER, "uniRunnerNRedSlices auto set to %lu",
-              uniRunnerNRedSlices);
-      }
-      /* initialize uniRunnerState for sliced AllReduce */
-      FLAGCXCHECKGOTO(initUniRunnerStateSlicedAR(
-                          &hcomm->proxyState->uniRunnerState, sendbuff,
-                          recvbuff, count, datatype, op, comm, uniRunnerNSlices,
-                          uniRunnerNRedSlices),
-                      res, out);
-    } else {
-      /* initialize uniRunnerState for ring AllReduce */
-      FLAGCXCHECKGOTO(
-          initUniRunnerStateRingAR(&hcomm->proxyState->uniRunnerState, sendbuff,
-                                   recvbuff, count, datatype, op, comm,
-                                   uniRunnerNSlices),
-          res, out);
-    }
-  } else {
-    FLAGCXCHECKGOTO(initUniRunnerStateDummy(&hcomm->proxyState->uniRunnerState),
-                    res, out);
-  }
-  FLAGCXCHECKGOTO(initP2pEvents(&hcomm->proxyState->uniRunnerState), res, out);
+  // Initialize queues
+  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->p2pInflightQueue);
+  flagcxIntruQueueConstruct(&runnerState->redInflightQueue);
+  runnerState->numPendingNodes = 0;
+
+  // Initialize P2P event pool
+  FLAGCXCHECK(initP2pEvents(runnerState));
 
   // Create dedicated reduce and copy streams
   flagcxStream_t redStream;
-  FLAGCXCHECKGOTO(deviceAdaptor->streamCreate(&redStream), res, out);
+  FLAGCXCHECK(deviceAdaptor->streamCreate(&redStream));
   flagcxStream_t cpyStream;
-  FLAGCXCHECKGOTO(deviceAdaptor->streamCreate(&cpyStream), res, out);
-  hcomm->proxyState->uniRunnerState.commStream = stream;
-  hcomm->proxyState->uniRunnerState.redStream = redStream;
-  hcomm->proxyState->uniRunnerState.cpyStream = cpyStream;
+  FLAGCXCHECK(deviceAdaptor->streamCreate(&cpyStream));
+  runnerState->redStream = redStream;
+  runnerState->cpyStream = cpyStream;
+  runnerState->commStream = stream;
+
+  return flagcxSuccess;
+}
+
+flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
+  flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxStream_t redStream = hcomm->proxyState->uniRunnerState.redStream;
+  flagcxStream_t cpyStream = hcomm->proxyState->uniRunnerState.cpyStream;
+
+  // Clean up DAG scheduler
+  FLAGCXCHECK(cleanupDagScheduler(&hcomm->proxyState->uniRunnerState));
+  // Clean up P2P events
+  FLAGCXCHECK(cleanupP2pEvents(&hcomm->proxyState->uniRunnerState));
+
+  // Destroy streams
+  FLAGCXCHECK(deviceAdaptor->streamSynchronize(redStream));
+  FLAGCXCHECK(deviceAdaptor->streamDestroy(redStream));
+  FLAGCXCHECK(deviceAdaptor->streamSynchronize(cpyStream));
+  FLAGCXCHECK(deviceAdaptor->streamDestroy(cpyStream));
+
+  // Destroy fifo
+  FLAGCXCHECK(hcomm->proxyState->uniRunnerState.fifo->flagcxRedFifoDestroy());
+  delete hcomm->proxyState->uniRunnerState.fifo;
+  hcomm->uniRunnerFifoBuffer = NULL;
+
+  return flagcxSuccess;
+}
+
+flagcxResult_t runUniRunner(flagcxComm_t comm) {
+  flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxFifo_t fifo = hcomm->proxyState->uniRunnerState.fifo;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+
 #ifdef COMPILE_KERNEL_HOST
   // Launch collective kernel
-  flagcxLaunchCollectiveKernel(hcomm->uniRunnerFifoBuffer, uniRunnerNThreads,
-                               uniRunnerNBlocks, redStream);
+  flagcxLaunchCollectiveKernel(
+      hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
+      runnerState->uniRunnerNBlocks, runnerState->redStream);
 #endif
 
   // Main scheduling loop using DAG-based three-queue scheduling
   while (true) {
     // Check stop flag and all queues empty condition
-    if (flagcxIntruQueueEmpty(
-            &hcomm->proxyState->uniRunnerState.p2pReadyQueue) &&
-        flagcxIntruQueueEmpty(
-            &hcomm->proxyState->uniRunnerState.redReadyQueue) &&
-        flagcxIntruQueueEmpty(
-            &hcomm->proxyState->uniRunnerState.p2pInflightQueue) &&
-        flagcxIntruQueueEmpty(
-            &hcomm->proxyState->uniRunnerState.redInflightQueue) &&
-        hcomm->proxyState->uniRunnerState.numPendingNodes == 0) {
+    if (flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue) &&
+        flagcxIntruQueueEmpty(&runnerState->redReadyQueue) &&
+        flagcxIntruQueueEmpty(&runnerState->p2pInflightQueue) &&
+        flagcxIntruQueueEmpty(&runnerState->redInflightQueue) &&
+        runnerState->numPendingNodes == 0) {
       TRACE(FLAGCX_UNIRUNNER,
             "runUniRunner: all queues empty, terminating runner loop");
       // set terminate flag
@@ -1306,27 +1479,14 @@ flagcxResult_t runUniRunner(const void *sendbuff, void *recvbuff, size_t count,
     }
 
     // Step 1: Process ready queue - write triggers to FIFO
-    FLAGCXCHECK(processReadyQueue(&hcomm->proxyState->uniRunnerState, hcomm));
+    FLAGCXCHECK(processReadyQueue(runnerState, hcomm));
 
     // Step 2: Process inflight queue - check completion and update dependencies
-    FLAGCXCHECK(processInflightQueue(&hcomm->proxyState->uniRunnerState));
+    FLAGCXCHECK(processInflightQueue(runnerState));
   }
-  deviceAdaptor->streamSynchronize(redStream);
-  deviceAdaptor->streamSynchronize(stream);
+  deviceAdaptor->streamSynchronize(runnerState->redStream);
+  deviceAdaptor->streamSynchronize(runnerState->cpyStream);
+  deviceAdaptor->streamSynchronize(runnerState->commStream);
 
-  // Clean up DAG scheduler
-  cleanupDagScheduler(&hcomm->proxyState->uniRunnerState);
-  // Clean up P2P events
-  cleanupP2pEvents(&hcomm->proxyState->uniRunnerState);
-
-  // destroy stream
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(redStream));
-  FLAGCXCHECK(deviceAdaptor->streamDestroy(redStream));
-
-out:
-  // destroy fifo
-  FLAGCXCHECK(hcomm->proxyState->uniRunnerState.fifo->flagcxRedFifoDestroy());
-  delete hcomm->proxyState->uniRunnerState.fifo;
-  hcomm->uniRunnerFifoBuffer = NULL;
-  return res;
+  return flagcxSuccess;
 }
