@@ -1171,10 +1171,9 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
 
   // Nodes per slice chain:
   const int nTotalSteps = 8 * sizeof(int) - __builtin_clz(nranks - 1);
-  const int recvNodesPerSlice =
-      algoRank ? __builtin_ctz(algoRank) : nTotalSteps;
+  int recvNodesPerSlice = algoRank ? __builtin_ctz(algoRank) : nTotalSteps;
   if (algoRank && recvNodesPerSlice &&
-      nranks - algoRank <= (1 << recvNodesPerSlice - 1)) {
+      nranks - algoRank <= (1 << (recvNodesPerSlice - 1))) {
     recvNodesPerSlice = 8 * sizeof(int) - __builtin_clz(nranks - algoRank - 1);
   }
   const int sendNodesPerSlice = algoRank ? 1 : 0;
@@ -1237,13 +1236,13 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
         // return flagcxInternalError;
       }
       int peer = (rank + (1 << i)) % nranks;
-      runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[1].type =
+      runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimRecv;
-      runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[1].peerRank = peer;
-      runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[1].count = sliceCount;
-      runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[1].datatype =
+      runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[0].peerRank = peer;
+      runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[0].count = sliceCount;
+      runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[0].datatype =
           datatype;
-      runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[1].addr =
+      runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[0].addr =
           static_cast<void *>(static_cast<char *>(scratchbuff) + rxOffset);
       TRACE(FLAGCX_UNIRUNNER,
             "rank %d (algoRank %d) recvNode %d recv from peer %d, count %lu, "
@@ -1273,24 +1272,15 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
                                    sizeof(int)));
       for (int r = 0; r < numRedSlices; r++) {
         runnerState->dagNodes[recvNodeIdx].children[r] = recvNodeIdx + 1 + r;
-        // TRACE(FLAGCX_UNIRUNNER, "rank %d recvNode %d child %d: %d", rank,
-        //       recvNodeIdx, r,
-        //       runnerState->dagNodes[recvNodeIdx].children[r]);
       }
       if (s == numSlices - 1) {
         if (i != nTotalSteps - 1) {
           runnerState->dagNodes[recvNodeIdx].children[numRedSlices] =
               (i + 1) * (1 + numRedSlices);
-          // TRACE(FLAGCX_UNIRUNNER, "rank %d recvNode %d child %d: %d", rank,
-          //       recvNodeIdx, numRedSlices,
-          //       runnerState->dagNodes[recvNodeIdx].children[numRedSlices]);
         }
       } else {
         runnerState->dagNodes[recvNodeIdx].children[numRedSlices] =
             recvNodeIdx + nodesPerSlice;
-        // TRACE(FLAGCX_UNIRUNNER, "rank %d recvNode %d child %d: %d", rank,
-        //       recvNodeIdx, numRedSlices,
-        //       runnerState->dagNodes[recvNodeIdx].children[numRedSlices]);
       }
 
       // Reduce Node
@@ -1336,8 +1326,6 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
               runnerState->dagNodes[redNodeIdx].numChildren * sizeof(int)));
           runnerState->dagNodes[redNodeIdx].children[0] =
               redSliceStartIdx + numRedSlices;
-          // TRACE(FLAGCX_UNIRUNNER, "rank %d redNode %d child 0: %d", rank,
-          //       redNodeIdx, runnerState->dagNodes[redNodeIdx].children[0]);
         }
       }
     }
@@ -1386,7 +1374,6 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
       }
       if (s == numSlices - 1) {
         runnerState->dagNodes[sendNodeIdx].numChildren = 0;
-        // TRACE(FLAGCX_UNIRUNNER, "rank %d sendNode %d", rank, sendNodeIdx);
 
       } else {
         runnerState->dagNodes[sendNodeIdx].numChildren = 1;
@@ -1395,8 +1382,6 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
             runnerState->dagNodes[sendNodeIdx].numChildren * sizeof(int)));
         runnerState->dagNodes[sendNodeIdx].children[0] =
             sendNodeIdx + nodesPerSlice;
-        // TRACE(FLAGCX_UNIRUNNER, "rank %d sendNode %d child 0: %d", rank,
-        //       sendNodeIdx, runnerState->dagNodes[sendNodeIdx].children[0]);
       }
     }
   }
@@ -1751,19 +1736,20 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
 
   // Main scheduling loop using DAG-based queue scheduling
   while (true) {
-    TRACE(FLAGCX_UNIRUNNER, "runUniRunner loop");
+    //   TRACE(FLAGCX_UNIRUNNER, "runUniRunner loop");
 
-    for (uniRunnerDagNode *node = runnerState->p2pReadyQueue.head; node != NULL;
-         node = node->next) {
-      TRACE(FLAGCX_UNIRUNNER, "p2pReadyQueue node: type=%s",
-            (node->nodeType == uniRunnerDagNodeTypeP2p) ? "P2P" : "RED");
-    }
+    //   for (uniRunnerDagNode *node = runnerState->p2pReadyQueue.head; node !=
+    //   NULL;
+    //        node = node->next) {
+    //     TRACE(FLAGCX_UNIRUNNER, "p2pReadyQueue node: type=%s",
+    //           (node->nodeType == uniRunnerDagNodeTypeP2p) ? "P2P" : "RED");
+    //   }
 
-    for (uniRunnerDagNode *node = runnerState->p2pInflightQueue.head;
-         node != NULL; node = node->next) {
-      TRACE(FLAGCX_UNIRUNNER, "p2pInflightQueue node: type=%s",
-            (node->nodeType == uniRunnerDagNodeTypeP2p) ? "P2P" : "RED");
-    }
+    //   for (uniRunnerDagNode *node = runnerState->p2pInflightQueue.head;
+    //        node != NULL; node = node->next) {
+    //     TRACE(FLAGCX_UNIRUNNER, "p2pInflightQueue node: type=%s",
+    //           (node->nodeType == uniRunnerDagNodeTypeP2p) ? "P2P" : "RED");
+    //   }
 
     // Check stop flag and all queues empty condition
     if (flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue) &&
