@@ -10,6 +10,7 @@
 FLAGCX_PARAM(UniRunnerUseLocRed, "UNIRUNNER_USE_LOCRED", 0);
 FLAGCX_PARAM(UniRunnerUseRingAG, "UNIRUNNER_USE_RINGAG", 0);
 FLAGCX_PARAM(UniRunnerUseSlicedAR, "UNIRUNNER_USE_SLICEDAR", 0);
+FLAGCX_PARAM(UniRunnerUseGroupedAG, "UNIRUNNER_USE_GROUPEDAG", 0);
 
 flagcxResult_t uniRunnerReduce(const void *sendbuff, void *recvbuff,
                                size_t count, flagcxDataType_t datatype,
@@ -149,18 +150,31 @@ out:
 flagcxResult_t uniRunnerAllGather(const void *sendbuff, void *recvbuff,
                                   size_t sendcount, flagcxDataType_t datatype,
                                   flagcxComm_t comm, flagcxStream_t stream) {
-  size_t size = sendcount * getFlagcxDataTypeSize(datatype);
-  char *bufferOut = static_cast<char *>(recvbuff);
-  FLAGCXCHECK(flagcxHeteroGroupStart());
-  for (int r = 0; r < comm->nranks; r++) {
-    FLAGCXCHECK(flagcxHeteroSend(sendbuff, sendcount, datatype, r,
-                                 comm->heteroComm, stream));
-    FLAGCXCHECK(flagcxHeteroRecv(static_cast<void *>(bufferOut + r * size),
-                                 sendcount, datatype, r, comm->heteroComm,
-                                 stream));
+  if (flagcxParamUniRunnerUseGroupedAG() == 0) {
+    size_t size = sendcount * getFlagcxDataTypeSize(datatype);
+    char *bufferOut = static_cast<char *>(recvbuff);
+    FLAGCXCHECK(flagcxHeteroGroupStart());
+    for (int r = 0; r < comm->nranks; r++) {
+      FLAGCXCHECK(flagcxHeteroSend(sendbuff, sendcount, datatype, r,
+                                   comm->heteroComm, stream));
+      FLAGCXCHECK(flagcxHeteroRecv(static_cast<void *>(bufferOut + r * size),
+                                   sendcount, datatype, r, comm->heteroComm,
+                                   stream));
+    }
+    FLAGCXCHECK(flagcxHeteroGroupEnd());
+    return flagcxSuccess;
   }
-  FLAGCXCHECK(flagcxHeteroGroupEnd());
-  return flagcxSuccess;
+  flagcxResult_t res = flagcxSuccess;
+  flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  FLAGCXCHECK(initUniRunner(comm, stream));
+  FLAGCXCHECKGOTO(initUniRunnerStateGroupedAG(runnerState, sendbuff, recvbuff,
+                                              sendcount, datatype, comm),
+                  res, out);
+  FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
+out:
+  FLAGCXCHECK(cleanupUniRunner(comm));
+  return res;
 }
 
 flagcxResult_t uniRunnerAlltoAll(const void *sendbuff, void *recvbuff,

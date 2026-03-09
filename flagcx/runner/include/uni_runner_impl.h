@@ -141,6 +141,12 @@ typedef struct {
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
+flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
+                                           const void *sendbuff, void *recvbuff,
+                                           size_t count,
+                                           flagcxDataType_t datatype,
+                                           flagcxComm_t comm,
+                                           int groupSize = 8);
 flagcxResult_t initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         size_t count, flagcxDataType_t datatype,
