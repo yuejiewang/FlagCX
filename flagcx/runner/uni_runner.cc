@@ -15,7 +15,23 @@ flagcxResult_t uniRunnerReduce(const void *sendbuff, void *recvbuff,
                                size_t count, flagcxDataType_t datatype,
                                flagcxRedOp_t op, int root, flagcxComm_t comm,
                                flagcxStream_t stream) {
-  return flagcxNotSupported;
+  flagcxResult_t res = flagcxSuccess;
+  flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  void *scratchbuff = nullptr;
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+      &scratchbuff, 2 * count * getFlagcxDataTypeSize(datatype),
+      flagcxMemDevice, stream));
+  FLAGCXCHECKGOTO(initUniRunner(comm, stream), res, out);
+  FLAGCXCHECKGOTO(initUniRunnerStateTreeRed(runnerState, sendbuff, recvbuff,
+                                            scratchbuff, count, datatype, op,
+                                            root, comm),
+                  res, out);
+  FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
+out:
+  FLAGCXCHECK(deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream));
+  FLAGCXCHECK(cleanupUniRunner(comm));
+  return res;
 }
 
 flagcxResult_t uniRunnerGather(const void *sendbuff, void *recvbuff,
@@ -88,38 +104,22 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
   if (flagcxParamUniRunnerUseLocRed()) {
     /* initialize uniRunnerState for reduce test */
     FLAGCXCHECKGOTO(initUniRunnerStateLocRed(runnerState, sendbuff, recvbuff,
-                                             count, datatype, op, comm,
-                                             runnerState->uniRunnerNSlices),
+                                             count, datatype, op, comm),
                     res, out);
   } else if (flagcxParamUniRunnerUseRingAG()) {
     /* initialize uniRunnerState for p2p test */
     FLAGCXCHECKGOTO(initUniRunnerStateRingAG(runnerState, sendbuff, recvbuff,
-                                             count, datatype, op, comm,
-                                             runnerState->uniRunnerNSlices),
+                                             count, datatype, op, comm),
                     res, out);
   } else if (flagcxParamUniRunnerUseSlicedAR()) {
-    if (runnerState->uniRunnerNRedSlices == 0) {
-      if (count <= 0 || runnerState->uniRunnerRedSliceSize == 0) {
-        runnerState->uniRunnerNRedSlices = 1;
-      } else {
-        runnerState->uniRunnerNRedSlices =
-            ceil((float)count / comm->nranks / runnerState->uniRunnerNSlices /
-                 runnerState->uniRunnerRedSliceSize);
-      }
-      TRACE(FLAGCX_UNIRUNNER, "uniRunnerNRedSlices auto set to %lu",
-            runnerState->uniRunnerNRedSlices);
-    }
     /* initialize uniRunnerState for sliced AllReduce */
-    FLAGCXCHECKGOTO(initUniRunnerStateSlicedAR(
-                        runnerState, sendbuff, recvbuff, count, datatype, op,
-                        comm, runnerState->uniRunnerNSlices,
-                        runnerState->uniRunnerNRedSlices),
+    FLAGCXCHECKGOTO(initUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff,
+                                               count, datatype, op, comm),
                     res, out);
   } else {
     /* initialize uniRunnerState for ring AllReduce */
     FLAGCXCHECKGOTO(initUniRunnerStateRingAR(runnerState, sendbuff, recvbuff,
-                                             count, datatype, op, comm,
-                                             runnerState->uniRunnerNSlices),
+                                             count, datatype, op, comm),
                     res, out);
   }
   FLAGCXCHECK(runUniRunner(comm));
@@ -140,11 +140,10 @@ flagcxResult_t uniRunnerReduceScatter(const void *sendbuff, void *recvbuff,
   FLAGCXCHECK(deviceAdaptor->deviceMalloc(
       &scratchbuff, recvcount * comm->nranks * getFlagcxDataTypeSize(datatype),
       flagcxMemDevice, stream));
-  FLAGCXCHECK(initUniRunner(comm, stream));
+  FLAGCXCHECKGOTO(initUniRunner(comm, stream), res, out);
   FLAGCXCHECKGOTO(initUniRunnerStateRingRS(runnerState, sendbuff, recvbuff,
                                            scratchbuff, recvcount, datatype, op,
-                                           comm, runnerState->uniRunnerNSlices,
-                                           runnerState->uniRunnerNRedSlices),
+                                           comm),
                   res, out);
   FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
 out:
