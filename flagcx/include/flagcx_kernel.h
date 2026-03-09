@@ -131,11 +131,9 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr1,
                                              flagcxDataType_t datatype,
                                              flagcxRedOp_t redop, int *idx);
 #ifdef COMPILE_KERNEL
-FLAGCX_DEVICE_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr,
-                                               uint64_t count,
-                                               uint64_t peerRank,
-                                               uint64_t datatype,
-                                               uint64_t type);
+FLAGCX_DEVICE_DECORATOR
+flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr, uint64_t count,
+                       uint64_t peerRank, uint64_t datatype, uint64_t type);
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
                                                       int *idx);
 
@@ -158,4 +156,87 @@ flagcxResult_t flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
                              flagcxStream_t stream);
 void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
                                   size_t nblocks, flagcxStream_t stream);
+
+// ==========================================================================
+// Device Communicator — Host-side lifecycle management
+// ==========================================================================
+
+// Requirements for creating a device communicator.
+// Fixed 16-byte opaque blob — field interpretation is platform-specific.
+// On NVIDIA: fields[0]=lsaBarrierCount, fields[1]=lsaMultimem,
+//            fields[2]=ginBarrierCount,  fields[3]=ginSignalCount
+typedef struct {
+  int fields[4];
+} flagcxDevCommRequirements;
+
+#define FLAGCX_DEV_COMM_REQUIREMENTS_INITIALIZER                               \
+  {                                                                            \
+    { 0, 0, 0, 0 }                                                             \
+  }
+
+// Opaque handle to a device communicator (host-side lifetime management).
+// Internally wraps ncclDevComm on NVIDIA backend (Tier 1),
+// or IPC barrier state on fallback (Tier 2).
+typedef struct flagcxDevCommInternal *flagcxDevComm_t;
+
+// Opaque handle to device memory (host-side lifetime management).
+// Internally wraps ncclWindow_t on NVIDIA backend (Tier 1),
+// or IPC peer pointer table on fallback (Tier 2).
+#ifndef FLAGCX_DEV_MEM_T_DEFINED
+#define FLAGCX_DEV_MEM_T_DEFINED
+typedef struct flagcxDevMemInternal *flagcxDevMem_t;
+#endif
+
+// Device memory mode — distinguishes IPC vs window registration at runtime.
+// Also defined in device_api/flagcx_device.h (with same include guard).
+#ifndef FLAGCX_DEV_MEM_TYPE_DEFINED
+#define FLAGCX_DEV_MEM_TYPE_DEFINED
+typedef enum {
+  flagcxDevMemIpc = 0,   // IPC peer pointer mode (all NCCL versions)
+  flagcxDevMemWindow = 1 // NCCL window mode (NCCL > 2.28 only)
+} flagcxDevMemType;
+#endif
+
+// Kernel launch configuration constants.
+// Also defined in device_api/flagcx_device.h (with same include guard).
+#ifndef FLAGCX_DEVICE_CTA_COUNT
+#define FLAGCX_DEVICE_CTA_COUNT 36
+#endif
+#ifndef FLAGCX_DEVICE_THREADS_PER_CTA
+#define FLAGCX_DEVICE_THREADS_PER_CTA 512
+#endif
+
+// Create a device communicator for custom kernel usage.
+// On NVIDIA backend (Tier 1), internally calls pncclDevCommCreate.
+// On fallback (Tier 2), sets up IPC-based barrier across intra-node peers.
+// The returned handle must be destroyed with flagcxDevCommDestroy(comm,
+// devComm).
+flagcxResult_t flagcxDevCommCreate(flagcxComm_t comm,
+                                   const flagcxDevCommRequirements *reqs,
+                                   flagcxDevComm_t *devComm);
+
+// Destroy a device communicator created by flagcxDevCommCreate.
+flagcxResult_t flagcxDevCommDestroy(flagcxComm_t comm, flagcxDevComm_t devComm);
+
+// Create a device memory handle for a registered buffer.
+// Registration is the caller's responsibility (Decision 7.16):
+//   - IPC mode (win=NULL): caller calls flagcxCommRegister first.
+//   - Window mode (win!=NULL): caller calls flagcxCommWindowRegister first.
+// This function exchanges IPC handles to build peer pointer tables (both modes)
+// and stores the window handle (window mode only).
+flagcxResult_t flagcxDevMemCreate(flagcxComm_t comm, void *buff, size_t size,
+                                  flagcxWindow_t win, flagcxDevMem_t *devMem);
+
+// Destroy a device memory handle created by flagcxDevMemCreate.
+flagcxResult_t flagcxDevMemDestroy(flagcxComm_t comm, flagcxDevMem_t devMem);
+
+// Intra-node AllReduce using FlagCX Device API.
+// The caller provides a registered buffer (via flagcxDevMemCreate)
+// already containing the input data.  The kernel runs an in-place
+// AllReduce across all intra-node GPUs.
+// devComm must be created via flagcxDevCommCreate beforehand.
+flagcxResult_t flagcxIntraAllReduceDemo(void *buff, flagcxDevMem_t devMem,
+                                        size_t count, flagcxDataType_t datatype,
+                                        flagcxDevComm_t devComm,
+                                        flagcxStream_t stream);
 #endif
