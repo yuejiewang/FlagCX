@@ -85,13 +85,15 @@ int main(int argc, char *argv[]) {
   for (size_t size = min_bytes; size <= max_bytes; size *= step_factor) {
     count = size / sizeof(float);
 
-    ((float *)hello)[0] = proc;
+    for (size_t i = 0; i < count; i++) {
+      ((float *)hello)[i] = i % 10 * (1 << proc);
+    }
 
     devHandle->deviceMemcpy(sendbuff, hello, size / totalProcs,
                             flagcxMemcpyHostToDevice, NULL);
 
-    if ((proc == 0 || proc == totalProcs - 1) && color == 0 && print_buffer) {
-      printf("sendbuff = ");
+    if (color == 0 && print_buffer) {
+      printf("rank %d sendbuff = ", proc);
       printf("%f\n", ((float *)hello)[0]);
     }
 
@@ -124,12 +126,24 @@ int main(int argc, char *argv[]) {
     memset(hello, 0, size);
     devHandle->deviceMemcpy(hello, recvbuff, size, flagcxMemcpyDeviceToHost,
                             NULL);
-    if ((proc == 0 || proc == totalProcs - 1) && color == 0 && print_buffer) {
-      printf("recvbuff = ");
+    if (color == 0 && print_buffer) {
+      printf("rank %d recvbuff = ", proc);
       for (int i = 0; i < totalProcs; i++) {
         printf("%f ", ((float *)hello)[i * (count / totalProcs)]);
       }
       printf("\n");
+      int correct = 1;
+      for (size_t i = 0; i < count; i++) {
+        if (((float *)hello)[i] !=
+            (float)(i % 10 * (1 << (i * totalProcs / count)))) {
+          printf("rank %d wrong output at offset %lu, expected %f, got %f\n",
+                 proc, i, (float)(i % 10 * (1 << (i * totalProcs / count))),
+                 ((float *)hello)[i]);
+          correct = 0;
+          break;
+        }
+      }
+      printf("rank %d correctness = %d\n", proc, correct);
     }
   }
 
