@@ -85,7 +85,7 @@ int main(int argc, char *argv[]) {
   for (size_t size = min_bytes; size <= max_bytes; size *= step_factor) {
     count = size / sizeof(float);
 
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < count / totalProcs; i++) {
       ((float *)hello)[i] = i % 10 * (1 << proc);
     }
 
@@ -94,7 +94,10 @@ int main(int argc, char *argv[]) {
 
     if (color == 0 && print_buffer) {
       printf("rank %d sendbuff = ", proc);
-      printf("%f\n", ((float *)hello)[0]);
+      for (size_t i = 0; i < 10; i++) {
+        printf("%f ", ((float *)hello)[i]);
+      }
+      printf("\n");
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
