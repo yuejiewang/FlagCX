@@ -15,6 +15,7 @@
 #include "topo.h"
 #include "transport.h"
 #include "type.h"
+#include "uni_runner_impl.h"
 #include "utils.h"
 #include <algorithm>
 #include <string.h>
@@ -359,6 +360,9 @@ static flagcxResult_t flagcxCommInitRankFunc(struct flagcxAsyncJob *job_) {
   INFO(FLAGCX_INIT, "start initTransportsRank");
   FLAGCXCHECKGOTO(initTransportsRank(comm, NULL), res, fail);
 
+  INFO(FLAGCX_INIT, "start initUniRunner");
+  FLAGCXCHECKGOTO(initUniRunner(comm), res, fail);
+
 exit:
   return res;
 fail:
@@ -458,6 +462,8 @@ flagcxResult_t flagcxHeteroCommDestroy(flagcxHeteroComm_t comm) {
   for (int i = 0; i < MAXCHANNELS; i++) {
     free(comm->proxyState->proxyOps[i].consPeers);
   }
+
+  FLAGCXCHECK(cleanupUniRunner(comm));
 
   free(comm->connectSend);
   free(comm->connectRecv);
