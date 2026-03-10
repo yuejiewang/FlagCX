@@ -144,7 +144,7 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
     return flagcxSystemError;
   }
 
-  int localBaseOffset = 0;
+  int localBaseOffset = groupIdx * groupChunkCount * typeSize;
   int nodeIdx = 0;
   for (int step = 0; step < nGroups; step++) {
     // intra-group
@@ -184,7 +184,8 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
       TRACE(FLAGCX_UNIRUNNER,
             "Node %d: intra-group step %d, sendPeer=%d, recvPeer=%d, "
             "sendOffset=%lu, recvOffset=%lu",
-            nodeIdx, i, locSendPeer, locRecvPeer,
+            nodeIdx, i, groupIdx * groupSize + locSendPeer,
+            groupIdx * groupSize + locRecvPeer,
             localBaseOffset + locRank * count * typeSize,
             localBaseOffset + locRecvPeer * count * typeSize);
     }
