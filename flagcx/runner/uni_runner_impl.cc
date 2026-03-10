@@ -1875,7 +1875,6 @@ flagcxResult_t runUniRunner(flagcxHeteroComm_t comm, flagcxStream_t stream) {
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
 
   fifo->flagcxFifoReset();
-  runnerState->p2pEventMap.reset();
 
 #ifdef COMPILE_KERNEL_HOST
   // Launch collective kernel
