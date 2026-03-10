@@ -182,6 +182,11 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].addr =
           static_cast<void *>(static_cast<char *>(recvbuff) + localBaseOffset +
                               locRecvPeer * count * typeSize);
+      TRACE(FLAGCX_UNIRUNNER,
+            "Node %d: intra-group step %d, sendPeer=%d, recvPeer=%d, "
+            "sendOffset=%lu, recvOffset=%lu", nodeIdx, i, locSendPeer,
+            locRecvPeer, localBaseOffset + locSendPeer * count * typeSize,
+            localBaseOffset + locRecvPeer * count * typeSize);
     }
     nodeIdx++;
 
@@ -323,12 +328,14 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
         nranks);
   // print dependency graph
   for (int i = 0; i < runnerState->numDagNodes; i++) {
-    TRACE(
-        FLAGCX_UNIRUNNER, "Node %d: type=%s, numParents=%d, numChildren=%d", i,
-        (runnerState->dagNodes[i].nodeType == uniRunnerDagNodeTypeP2p) ? "P2P"
-                                                                       : "RED",
-        runnerState->dagNodes[i].numParents,
-        runnerState->dagNodes[i].numChildren);
+    TRACE(FLAGCX_UNIRUNNER, "Node %d: type=%s, numParents=%d, numChildren=%d",
+          i,
+          (runnerState->dagNodes[i].nodeType == uniRunnerDagNodeTypeP2p) ? "P2P"
+          : (runnerState->dagNodes[i].nodeType == uniRunnerDagNodeTypeRed)
+              ? "RED"
+              : "CPY",
+          runnerState->dagNodes[i].numParents,
+          runnerState->dagNodes[i].numChildren);
     if (runnerState->dagNodes[i].numChildren > 0) {
       std::string childStr = "  Children: ";
       for (int c = 0; c < runnerState->dagNodes[i].numChildren; c++) {
