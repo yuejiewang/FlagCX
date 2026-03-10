@@ -101,6 +101,8 @@ typedef struct {
   void markInUse(int index);
   // Mark event at index as available
   void markAvailable(int index);
+  // Reset all events to available
+  void reset();
 } uniRunnerP2pEventBitmap;
 
 typedef struct {

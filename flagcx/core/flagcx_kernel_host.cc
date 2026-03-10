@@ -44,6 +44,16 @@ flagcxResult_t flagcxFifo::flagcxFifoInit() {
   return flagcxSuccess;
 }
 
+flagcxResult_t flagcxFifo::flagcxFifoReset() {
+  INFO(FLAGCX_KERNEL, "flagcxFifoReset called");
+  buffer[flagcxFifoIdxConsumed] = 0;
+  buffer[flagcxFifoIdxProduced] = 0;
+  buffer[flagcxFifoIdxTerminate] = 0;
+  memset((void *)(buffer + flagcxFifoIdxData), 0,
+         flagcxParamKernelFifoCapacity() * sizeof(flagcxDeviceTrigger));
+  return flagcxSuccess;
+}
+
 flagcxResult_t flagcxFifo::flagcxFifoDestroy() {
   INFO(FLAGCX_KERNEL, "flagcxFifoDestroy called");
   FLAGCXCHECK(deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL));

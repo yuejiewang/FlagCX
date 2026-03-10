@@ -60,6 +60,12 @@ void uniRunnerP2pEventBitmap::markAvailable(int index) {
   bits[wordIdx] &= ~(1ULL << bitIdx);
 }
 
+// Reset all events to available
+void uniRunnerP2pEventBitmap::reset() {
+  memset(bits, 0, (size + 63) / 64 * sizeof(uint64_t));
+  nextIdx = 0;
+}
+
 int flagcxUniRunnerState::getEvent() {
   int idx = p2pEventMap.getAvailable();
   if (idx != -1) {
@@ -1867,6 +1873,9 @@ flagcxResult_t runUniRunner(flagcxHeteroComm_t comm, flagcxStream_t stream) {
   flagcxFifo_t fifo = comm->proxyState->uniRunnerState.fifo;
   flagcxUniRunnerState *runnerState = &comm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
+
+  fifo->flagcxFifoReset();
+  runnerState->p2pEventMap.reset();
 
 #ifdef COMPILE_KERNEL_HOST
   // Launch collective kernel
