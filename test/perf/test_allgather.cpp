@@ -137,11 +137,12 @@ int main(int argc, char *argv[]) {
       printf("\n");
       int correct = 1;
       for (size_t i = 0; i < count; i++) {
-        if (((float *)hello)[i] !=
-            (float)(i % 10 * (1 << (i * totalProcs / count)))) {
+        int expectedProc = i / (count / totalProcs);
+        int expectedVal =
+            ((i % (count / totalProcs)) % 10) * (1 << expectedProc);
+        if (((float *)hello)[i] != expectedVal) {
           printf("rank %d wrong output at offset %lu, expected %f, got %f\n",
-                 proc, i, (float)(i % 10 * (1 << (i * totalProcs / count))),
-                 ((float *)hello)[i]);
+                 proc, i, (float)expectedVal, ((float *)hello)[i]);
           correct = 0;
           break;
         }

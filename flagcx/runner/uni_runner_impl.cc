@@ -89,8 +89,7 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
                                            const void *sendbuff, void *recvbuff,
                                            size_t count,
                                            flagcxDataType_t datatype,
-                                           flagcxComm_t comm,
-                                           int groupSize) {
+                                           flagcxComm_t comm, int groupSize) {
   // Assume symmetric server settings and nranks is divisible by groupSize
   int rank = comm->rank;
   int nranks = comm->nranks;
@@ -163,20 +162,20 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
           flagcxDevicePrimSend;
       runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i].peerRank =
           groupIdx * groupSize + locSendPeer;
-      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i].count =
-          count;
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i].count = count;
       runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i].datatype =
           datatype;
       runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i].addr =
-          static_cast<void *>(static_cast<char *>(recvbuff) + localBaseOffset +
-                              locSendPeer * count * typeSize);
+          step == 0 ? const_cast<void *>(sendbuff)
+                    : static_cast<void *>(static_cast<char *>(recvbuff) +
+                                          localBaseOffset +
+                                          locRank * count * typeSize);
       // Recv
       runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].type =
           flagcxDevicePrimRecv;
       runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].peerRank =
           groupIdx * groupSize + locRecvPeer;
-      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].count =
-          count;
+      runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].count = count;
       runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].datatype =
           datatype;
       runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i + 1].addr =
@@ -184,8 +183,9 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
                               locRecvPeer * count * typeSize);
       TRACE(FLAGCX_UNIRUNNER,
             "Node %d: intra-group step %d, sendPeer=%d, recvPeer=%d, "
-            "sendOffset=%lu, recvOffset=%lu", nodeIdx, i, locSendPeer,
-            locRecvPeer, localBaseOffset + locSendPeer * count * typeSize,
+            "sendOffset=%lu, recvOffset=%lu",
+            nodeIdx, i, locSendPeer, locRecvPeer,
+            localBaseOffset + locRank * count * typeSize,
             localBaseOffset + locRecvPeer * count * typeSize);
     }
     nodeIdx++;
