@@ -11,6 +11,7 @@ FLAGCX_PARAM(UniRunnerUseLocRed, "UNIRUNNER_USE_LOCRED", 0);
 FLAGCX_PARAM(UniRunnerUseRingAG, "UNIRUNNER_USE_RINGAG", 0);
 FLAGCX_PARAM(UniRunnerUseSlicedAR, "UNIRUNNER_USE_SLICEDAR", 0);
 FLAGCX_PARAM(UniRunnerUseGroupedAG, "UNIRUNNER_USE_GROUPEDAG", 0);
+FLAGCX_PARAM(UniRunnerAGGroupSize, "UNIRUNNER_AGGROUP_SIZE", 8);
 
 flagcxResult_t uniRunnerReduce(const void *sendbuff, void *recvbuff,
                                size_t count, flagcxDataType_t datatype,
@@ -167,13 +168,13 @@ flagcxResult_t uniRunnerAllGather(const void *sendbuff, void *recvbuff,
   flagcxResult_t res = flagcxSuccess;
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
-  FLAGCXCHECK(initUniRunner(comm, stream));
+  int groupSize = flagcxParamUniRunnerAGGroupSize();
   FLAGCXCHECKGOTO(initUniRunnerStateGroupedAG(runnerState, sendbuff, recvbuff,
-                                              sendcount, datatype, comm),
+                                              sendcount, datatype, hcomm,
+                                              groupSize),
                   res, out);
-  FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
+  FLAGCXCHECKGOTO(runUniRunner(hcomm, stream), res, out);
 out:
-  FLAGCXCHECK(cleanupUniRunner(comm));
   return res;
 }
 

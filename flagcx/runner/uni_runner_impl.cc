@@ -89,10 +89,11 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
                                            const void *sendbuff, void *recvbuff,
                                            size_t count,
                                            flagcxDataType_t datatype,
-                                           flagcxComm_t comm, int groupSize) {
+                                           flagcxHeteroComm_t comm,
+                                           int groupSize) {
   // Assume symmetric server settings and nranks is divisible by groupSize
   int rank = comm->rank;
-  int nranks = comm->nranks;
+  int nranks = comm->nRanks;
   size_t nGroups = nranks / groupSize;
   int groupIdx = rank / groupSize;
   int locRank = rank % groupSize;
@@ -123,8 +124,7 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
   }
 
   TRACE(FLAGCX_UNIRUNNER,
-        "rank %d initUniRunnerStateGroupedAG called, count=%lu", comm->rank,
-        count);
+        "rank %d initUniRunnerStateGroupedAG called, count=%lu", rank, count);
 
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
@@ -253,9 +253,9 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[s].numChildren = 0;
     } else {
       runnerState->dagNodes[s].numChildren = 1;
-      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes[s].children,
-                               runnerState->dagNodes[s].numChildren *
-                                   sizeof(int)));
+      FLAGCXCHECK(
+          flagcxCalloc(&runnerState->dagNodes[s].children,
+                       runnerState->dagNodes[s].numChildren * sizeof(int)));
       runnerState->dagNodes[s].children[0] = s + 1;
     }
   }
