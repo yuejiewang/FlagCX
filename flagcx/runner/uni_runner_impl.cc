@@ -213,6 +213,8 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
     runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].datatype = datatype;
     runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].addr =
         const_cast<void *>(sendbuff);
+    TRACE(FLAGCX_UNIRUNNER, "Node %d: inter-group send step %d, sendPeer=%lu",
+          nodeIdx, step, sendPeer);
     nodeIdx++;
     // Recv
     runnerState->dagNodes[nodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
@@ -228,6 +230,9 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
     runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].datatype = datatype;
     runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[0].addr =
         static_cast<void *>(static_cast<char *>(recvbuff) + recvOffset);
+    TRACE(FLAGCX_UNIRUNNER,
+          "Node %d: inter-group recv step %d, recvPeer=%lu, recvOffset=%lu",
+          nodeIdx, step, recvPeer, recvOffset);
     nodeIdx++;
 
     localBaseOffset = recvGroupIdx * groupChunkCount * typeSize;
