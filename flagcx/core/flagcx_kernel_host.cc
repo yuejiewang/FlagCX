@@ -45,8 +45,8 @@ flagcxResult_t flagcxFifo::flagcxFifoInit() {
 }
 
 flagcxResult_t flagcxFifo::flagcxFifoReset() {
-  INFO(FLAGCX_KERNEL, "flagcxFifoReset called");
-  buffer[flagcxFifoIdxTerminate] = 0;
+  TRACE(FLAGCX_KERNEL, "flagcxFifoReset called");
+  __atomic_store_n(buffer + flagcxFifoIdxTerminate, 0, __ATOMIC_RELEASE);
   return flagcxSuccess;
 }
 
