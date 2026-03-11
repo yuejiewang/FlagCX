@@ -22,6 +22,7 @@ flagcxResult_t uniRunnerReduce(const void *sendbuff, void *recvbuff,
   FLAGCXCHECK(deviceAdaptor->deviceMalloc(
       &scratchbuff, 2 * count * getFlagcxDataTypeSize(datatype),
       flagcxMemDevice, stream));
+  FLAGCXCHECKGOTO(initUniRunner(hcomm), res, out);
   FLAGCXCHECKGOTO(initUniRunnerStateTreeRed(runnerState, sendbuff, recvbuff,
                                             scratchbuff, count, datatype, op,
                                             root, hcomm),
@@ -29,6 +30,7 @@ flagcxResult_t uniRunnerReduce(const void *sendbuff, void *recvbuff,
   FLAGCXCHECKGOTO(runUniRunner(hcomm, stream), res, out);
 out:
   FLAGCXCHECK(deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream));
+  FLAGCXCHECK(cleanupUniRunner(hcomm));
   return res;
 }
 
@@ -98,6 +100,7 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
   flagcxResult_t res = flagcxSuccess;
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  FLAGCXCHECK(initUniRunner(hcomm));
   if (flagcxParamUniRunnerUseLocRed()) {
     /* initialize uniRunnerState for reduce test */
     FLAGCXCHECKGOTO(initUniRunnerStateLocRed(runnerState, sendbuff, recvbuff,
@@ -121,6 +124,7 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
   }
   FLAGCXCHECK(runUniRunner(hcomm, stream));
 out:
+  FLAGCXCHECK(cleanupUniRunner(hcomm));
   return res;
 }
 
@@ -136,6 +140,7 @@ flagcxResult_t uniRunnerReduceScatter(const void *sendbuff, void *recvbuff,
   FLAGCXCHECK(deviceAdaptor->deviceMalloc(
       &scratchbuff, recvcount * comm->nranks * getFlagcxDataTypeSize(datatype),
       flagcxMemDevice, stream));
+  FLAGCXCHECKGOTO(initUniRunner(hcomm), res, out);
   FLAGCXCHECKGOTO(initUniRunnerStateRingRS(runnerState, sendbuff, recvbuff,
                                            scratchbuff, recvcount, datatype, op,
                                            hcomm),
@@ -143,6 +148,7 @@ flagcxResult_t uniRunnerReduceScatter(const void *sendbuff, void *recvbuff,
   FLAGCXCHECKGOTO(runUniRunner(hcomm, stream), res, out);
 out:
   FLAGCXCHECK(deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream));
+  FLAGCXCHECK(cleanupUniRunner(hcomm));
   return res;
 }
 

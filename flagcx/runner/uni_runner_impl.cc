@@ -1874,8 +1874,6 @@ flagcxResult_t runUniRunner(flagcxHeteroComm_t comm, flagcxStream_t stream) {
   flagcxUniRunnerState *runnerState = &comm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
 
-  fifo->flagcxFifoReset();
-
 #ifdef COMPILE_KERNEL_HOST
   // Launch collective kernel
   flagcxLaunchCollectiveKernel(
