@@ -20,6 +20,7 @@ USE_UCX ?= 0
 USE_IBUC ?= 0
 USE_ENFLAME ?= 0
 COMPILE_KERNEL ?= 0
+COMPILE_UNIRUNNER ?= 0
 
 # set to empty if not provided
 DEVICE_HOME ?=
@@ -129,6 +130,7 @@ UCX_LINK =
 NET_ADAPTOR_FLAG =
 COMPILE_KERNEL_HOST_FLAG=
 COMPILE_KERNEL_FLAG =
+COMPILE_UNIRUNNER_FLAG =
 ifeq ($(USE_NVIDIA), 1)
 	include makefiles/nvidia_gencode.mk
 	DEVICE_LIB = $(DEVICE_HOME)/lib64
@@ -280,6 +282,13 @@ ifeq ($(COMPILE_KERNEL), 1)
 	COMPILE_KERNEL_HOST_FLAG = -DCOMPILE_KERNEL_HOST
 endif
 
+ifeq ($(COMPILE_UNIRUNNER), 1)
+	COMPILE_KERNEL = 1
+	COMPILE_KERNEL_FLAG = -DCOMPILE_KERNEL
+	COMPILE_KERNEL_HOST_FLAG =
+	COMPILE_UNIRUNNER_FLAG = -DCOMPILE_UNIRUNNER
+endif
+
 LIBDIR := $(BUILDDIR)/lib
 OBJDIR := $(BUILDDIR)/obj
 PREFIX ?= /usr/local
@@ -333,6 +342,7 @@ print_var:
 	@echo "USE_TSM: $(USE_TSM)"
 	@echo "USE_ENFLAME: $(USE_ENFLAME)"
 	@echo "COMPILE_KERNEL: $(COMPILE_KERNEL)"
+	@echo "COMPILE_UNIRUNNER: $(COMPILE_UNIRUNNER)"
 	@echo "DEVICE_LIB: $(DEVICE_LIB)"
 	@echo "DEVICE_INCLUDE: $(DEVICE_INCLUDE)"
 	@echo "CCL_LIB: $(CCL_LIB)"
@@ -362,7 +372,7 @@ $(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJS)
 $(OBJDIR)/%.o: %.cc
 	@mkdir -p `dirname $@`
 	@echo "Compiling $@"
-	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(COMPILE_KERNEL_HOST_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g -fno-omit-frame-pointer
+	@g++ $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) -I$(DEVICE_INCLUDE) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(COMPILE_KERNEL_HOST_FLAG) $(COMPILE_UNIRUNNER_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g -fno-omit-frame-pointer
 
 ifeq ($(COMPILE_KERNEL), 1)
 $(OBJDIR)/kernel_dlink.o: $(DEVOBJ)

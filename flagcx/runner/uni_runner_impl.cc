@@ -1867,7 +1867,7 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
 
-#ifdef COMPILE_KERNEL_HOST
+#ifdef COMPILE_UNIRUNNER
   // Launch collective kernel
   flagcxLaunchCollectiveKernel(
       hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
