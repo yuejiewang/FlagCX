@@ -39,6 +39,7 @@ struct flagcxIpcImpInfo {
   void *rmtRegAddr;
   bool legacyIpcCap;
   uintptr_t offset;
+  // userOffset removed — sent fresh via SHM each call, never cached
 };
 
 struct flagcxPeerRegIpcAddr {
