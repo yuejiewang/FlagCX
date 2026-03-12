@@ -1,6 +1,8 @@
 import os
 
 import torch
+from torch.profiler import profile, ProfilerActivity, schedule
+
 try:
     #deps for cambricon devices
     import torch_mlu
@@ -45,6 +47,7 @@ def get_args():
                         choices=['broadcast',
                                  'reduce',
                                  'allreduce',
+                                 'allreduce-profile',
                                  'allgather',
                                  'reducescatter',
                                  'sendrecv',
@@ -53,6 +56,7 @@ def get_args():
                                  'alltoall',
                                  'all'],
                         help='operation to test (default: all)')
+    parser.add_argument("--trace-dir", type=str, default="./traces")
     return parser.parse_args()
 
 def init_pg():
@@ -141,6 +145,34 @@ def test_allreduce():
             dist.all_reduce(y, op=dist.ReduceOp.SUM, group=FLAGCX_GROUP1)
         cm.wait()
         print(f"rank {MY_RANK} after all_reduce_coalesced async sum with FLAGCX_GROUP1: x = {x}, y = {y}")
+        
+def test_allreduce_profile():
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"cuda:{local_rank}")
+    if torch.cuda.is_available():
+        # Create tensors
+        x = torch.rand(WORLD_SIZE).cuda()
+        print(f"rank {MY_RANK} before allreduce: x = {x}")
+        # Warm up
+        for _ in range(5):
+            dist.all_reduce(x, op=dist.ReduceOp.SUM, group=FLAGCX_GROUP1)
+        torch.cuda.synchronize(device)
+        # Perform allreduce with FLAGCX_GROUP1
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            schedule=schedule(wait=1, warmup=1, active=3),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                args.trace_dir,
+                worker_name=f"rank{MY_RANK}_local{local_rank}",
+            )
+        ) as prof:
+            for _ in range(50):
+                dist.all_reduce(x, op=dist.ReduceOp.SUM, group=FLAGCX_GROUP1)
+                prof.step()
+        print(f"rank {MY_RANK} after allreduce sum with FLAGCX_GROUP1: x = {x}")
 
 def test_sendrecv():
     if torch.cuda.is_available():
@@ -338,6 +370,7 @@ def test_all():
     test_broadcast()
     test_reduce()
     test_allreduce()
+    test_allreduce_profile()
     test_sendrecv()
     test_allgather()
     test_reducescatter()
@@ -349,6 +382,7 @@ dict_op_to_test = {
     "broadcast": test_broadcast,
     "reduce": test_reduce,
     "allreduce": test_allreduce,
+    "allreduce-profile": test_allreduce_profile,
     "allgather": test_allgather,
     "reducescatter": test_reducescatter,
     "sendrecv": test_sendrecv,
