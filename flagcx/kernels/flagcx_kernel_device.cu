@@ -49,4 +49,3 @@ flagcxDeviceTrigger::setValue(uint64_t addr, uint64_t count, uint64_t peerRank,
         (type & flagcxTriggerMask(flagcxDeviceTriggerBitsPrim))
             << flagcxDeviceTriggerOffPrim;
 }
-

@@ -1042,6 +1042,33 @@ void *flagcxProxyKernelService(void *args) {
   struct flagcxHeteroComm *comm = (struct flagcxHeteroComm *)args;
   flagcxResult_t res = flagcxSuccess;
 
+  auto validateOneSidedPeer = [](struct flagcxHeteroComm *comm,
+                                 int peerRank) -> flagcxResult_t {
+    if (globalOneSideHandles == NULL)
+      return flagcxNotSupported;
+    if (peerRank < 0 || peerRank >= comm->nRanks)
+      return flagcxInvalidArgument;
+
+    // globalOneSideHandles proves registration happened, but the per-peer NET
+    // transport connection still needs to be established.
+    struct flagcxConnector *conn = &comm->channels[0].peers[peerRank]->send[0];
+    if (conn == NULL || conn->connected == 0 ||
+        conn->proxyConn.connection == NULL ||
+        conn->proxyConn.connection->transport != TRANSPORT_NET) {
+      return flagcxNotSupported;
+    }
+
+    // Validate the specific peer has gathered one-sided handles.
+    struct flagcxIbGlobalHandleInfo *handles =
+        (struct flagcxIbGlobalHandleInfo *)globalOneSideHandles;
+    if (handles == NULL || handles->baseVas == NULL || handles->rkeys == NULL)
+      return flagcxNotSupported;
+    if (handles->baseVas[peerRank] == 0 || handles->rkeys[peerRank] == 0)
+      return flagcxNotSupported;
+
+    return flagcxSuccess;
+  };
+
   // Set device context
   FLAGCXCHECKGOTO(deviceAdaptor->setDevice(comm->cudaDev), res, out);
 
@@ -1075,7 +1102,9 @@ void *flagcxProxyKernelService(void *args) {
       break;
     dequeue(fifo->buffer, ptr);
     if ((ptr->getType() == flagcxDevicePrimSend ||
-         ptr->getType() == flagcxDevicePrimRecv) &&
+         ptr->getType() == flagcxDevicePrimRecv ||
+         ptr->getType() == flagcxDevicePrimPut ||
+         ptr->getType() == flagcxDevicePrimSignal) &&
         ptr->getAddr() == 0) {
       sched_yield();
       continue;
@@ -1125,6 +1154,34 @@ void *flagcxProxyKernelService(void *args) {
           groupCount--;
         }
         break;
+      case flagcxDevicePrimPut: {
+        TRACE(FLAGCX_P2P,
+              "rank=%d flagcxDevicePrimPut called by proxyKernelService.",
+              comm->rank);
+        int peerRank = (int)ptr->getPeerRank();
+        res = validateOneSidedPeer(comm, peerRank);
+        if (res != flagcxSuccess)
+          break;
+        size_t srcOffset = (size_t)ptr->getSrcOffset();
+        size_t dstOffset = (size_t)ptr->getDstOffset();
+        size_t size =
+            ptr->getCount() *
+            getFlagcxDataTypeSize((flagcxDataType_t)ptr->getDatatype());
+        res = flagcxHeteroPut(comm, peerRank, srcOffset, dstOffset, size);
+        break;
+      }
+      case flagcxDevicePrimSignal: {
+        TRACE(FLAGCX_P2P,
+              "rank=%d flagcxDevicePrimSignal called by proxyKernelService.",
+              comm->rank);
+        int peerRank = (int)ptr->getPeerRank();
+        res = validateOneSidedPeer(comm, peerRank);
+        if (res != flagcxSuccess)
+          break;
+        size_t dstOffset = (size_t)ptr->getDstOffset();
+        res = flagcxHeteroPutSignal(comm, peerRank, dstOffset);
+        break;
+      }
       case flagcxDevicePrimWait:
         TRACE(FLAGCX_P2P,
               "rank=%d flagcxDevicePrimWait called by proxyKernelService.",
