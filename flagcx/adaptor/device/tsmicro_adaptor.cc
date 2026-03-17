@@ -349,6 +349,11 @@ flagcxResult_t tsmicroAdaptorEventElapsedTime(float *ms, flagcxEvent_t start,
     return flagcxUnhandledDeviceError;
   }
 }
+static flagcxResult_t tsmicroAdaptorStreamWaitValue64(flagcxStream_t, void *,
+                                                      uint64_t, int) {
+  return flagcxNotSupported;
+}
+
 struct flagcxDeviceAdaptor tsmicroAdaptor {
   "TSM",
       // Basic functions
@@ -410,6 +415,7 @@ struct flagcxDeviceAdaptor tsmicroAdaptor {
                                                  // size_t size, unsigned long
                                                  // long flags);
       tsmicroAdaptorEventElapsedTime, // flagcxResult_t
+      tsmicroAdaptorStreamWaitValue64,
 };
 
 #endif // USE_TSM_ADAPTOR

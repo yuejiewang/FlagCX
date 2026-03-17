@@ -1023,7 +1023,8 @@ flagcxUcxAcceptCheck:
 
 #define REG_ALIGN (4096)
 flagcxResult_t flagcxUcxRegMr(void *comm, void *data, size_t size, int type,
-                              void **mhandle) {
+                              int mrFlags, void **mhandle) {
+  (void)mrFlags;
   flagcxUcxCtx_t *ctx = (flagcxUcxCtx_t *)comm;
   uint64_t addr = (uint64_t)data;
   ucp_mem_map_params_t mmap_params;
@@ -1074,8 +1075,8 @@ flagcxResult_t flagcxUcxDeregMr(void *comm, void *mhandle) {
 
 flagcxResult_t flagcxUcxRegMrDmaBuf(void *comm, void *data, size_t size,
                                     int type, uint64_t offset, int fd,
-                                    void **mhandle) {
-  return flagcxUcxRegMr(comm, data, size, type, mhandle);
+                                    int mrFlags, void **mhandle) {
+  return flagcxUcxRegMr(comm, data, size, type, mrFlags, mhandle);
 }
 
 static flagcxUcxRequest_t *flagcxUcxRequestGet(flagcxUcxComm_t *comm) {
@@ -1481,6 +1482,7 @@ flagcxResult_t flagcxUcxGetDevFromName(char *name, int *dev) {
   }
   return flagcxSystemError;
 }
+
 // UCX network adaptor structure
 struct flagcxNetAdaptor flagcxNetUcx = {
     // Basic functions
@@ -1509,7 +1511,8 @@ struct flagcxNetAdaptor flagcxNetUcx = {
     flagcxUcxTest,   // test
 
     // One-sided functions
-    NULL, NULL, NULL, // put, putSignal, waitValue
+    NULL, // iput - not supported on UCX
+    NULL, // iputSignal - not supported on UCX
 
     // Device name lookup
     flagcxUcxGetDevFromName // getDevFromName

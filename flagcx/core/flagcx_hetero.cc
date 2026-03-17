@@ -1,9 +1,13 @@
 #include "flagcx_hetero.h"
+#include "adaptor.h"
 #include "group.h"
 #include "ib_common.h"
 #include "net.h"
 #include "transport.h"
 #include "type.h"
+
+#include <climits>
+#include <sched.h>
 
 flagcxResult_t flagcxHeteroSend(const void *sendbuff, size_t count,
                                 flagcxDataType_t datatype, int peer,
@@ -70,8 +74,8 @@ flagcxResult_t flagcxHeteroRecv(void *recvbuff, size_t count,
 flagcxResult_t flagcxHeteroPut(flagcxHeteroComm_t comm, int peer,
                                size_t srcOffset, size_t dstOffset,
                                size_t size) {
-  // Check if netAdaptor->put is available
-  if (comm->netAdaptor != NULL && comm->netAdaptor->put != NULL) {
+  // Check if netAdaptor->iput is available
+  if (comm->netAdaptor != NULL && comm->netAdaptor->iput != NULL) {
     int channelId = 0;
     int connIndex = 0;
     // Get sendNetResources from connector
@@ -92,18 +96,30 @@ flagcxResult_t flagcxHeteroPut(flagcxHeteroComm_t comm, int peer,
     uint64_t srcOff = srcOffset;
     uint64_t dstOff = dstOffset;
     void **gHandles = (void **)globalOneSideHandles;
+    if (gHandles == NULL) {
+      WARN("flagcxHeteroPut: globalOneSideHandles not initialized");
+      return flagcxInternalError;
+    }
     void *request = NULL;
-    FLAGCXCHECK(comm->netAdaptor->put(sendComm, srcOff, dstOff, size, srcRank,
-                                      dstRank, gHandles, &request));
+    FLAGCXCHECK(comm->netAdaptor->iput(sendComm, srcOff, dstOff, size, srcRank,
+                                       dstRank, gHandles, &request));
+    // Poll completion to free the IB request
+    if (request != NULL) {
+      int done = 0;
+      while (!done) {
+        FLAGCXCHECK(comm->netAdaptor->test(request, &done, NULL));
+      }
+    }
     return flagcxSuccess;
   }
   return flagcxNotSupported;
 }
 
 flagcxResult_t flagcxHeteroPutSignal(flagcxHeteroComm_t comm, int peer,
-                                     size_t dstOffset) {
-  // Check if netAdaptor->putSignal is available
-  if (comm->netAdaptor != NULL && comm->netAdaptor->putSignal != NULL) {
+                                     size_t srcOffset, size_t dstOffset,
+                                     size_t size, size_t signalOffset) {
+  // Check if netAdaptor->iputSignal is available
+  if (comm->netAdaptor != NULL && comm->netAdaptor->iputSignal != NULL) {
     int channelId = 0;
     int connIndex = 0;
     // Get sendNetResources from connector
@@ -118,14 +134,83 @@ flagcxResult_t flagcxHeteroPutSignal(flagcxHeteroComm_t comm, int peer,
         (struct sendNetResources *)
             conn->proxyConn.connection->transportResources;
     void *sendComm = resources->netSendComm;
+    int srcRank = comm->rank;
     int dstRank = peer;
 
-    uint64_t dstOff = dstOffset;
-    void **gHandles = (void **)globalOneSideHandles;
+    void **dataHandles = (void **)globalOneSideHandles;
+    void **signalHandles = (void **)globalOneSideSignalHandles;
+    if (signalHandles == NULL) {
+      WARN("flagcxHeteroPutSignal: globalOneSideSignalHandles not initialized");
+      return flagcxInternalError;
+    }
+    if (size > 0 && dataHandles == NULL) {
+      WARN("flagcxHeteroPutSignal: globalOneSideHandles not initialized for "
+           "data transfer");
+      return flagcxInternalError;
+    }
     void *request = NULL;
-    FLAGCXCHECK(comm->netAdaptor->putSignal(sendComm, dstOff, dstRank, gHandles,
-                                            &request));
+    FLAGCXCHECK(comm->netAdaptor->iputSignal(
+        sendComm, (uint64_t)srcOffset, (uint64_t)dstOffset, size, srcRank,
+        dstRank, dataHandles, (uint64_t)signalOffset, signalHandles, &request));
+    // Poll completion (single CQE for chained WRITE + ATOMIC)
+    if (request != NULL) {
+      int done = 0;
+      while (!done) {
+        FLAGCXCHECK(comm->netAdaptor->test(request, &done, NULL));
+      }
+    }
     return flagcxSuccess;
   }
   return flagcxNotSupported;
+}
+
+flagcxResult_t flagcxHeteroFlush(flagcxHeteroComm_t comm, void *gpuAddr,
+                                 size_t size, void *gHandleInfo) {
+  struct flagcxIbGlobalHandleInfo *info =
+      (struct flagcxIbGlobalHandleInfo *)gHandleInfo;
+  if (info == NULL || info->localRecvComm == NULL ||
+      info->localMrHandle == NULL)
+    return flagcxNotSupported;
+  if (comm->netAdaptor == NULL || comm->netAdaptor->iflush == NULL)
+    return flagcxNotSupported;
+
+  if (size > (size_t)INT_MAX) {
+    WARN("flagcxHeteroFlush: size %zu exceeds int limit", size);
+    return flagcxInternalError;
+  }
+  void *data_arr[1] = {gpuAddr};
+  int sizes_arr[1] = {(int)size};
+  void *mh_arr[1] = {info->localMrHandle};
+  void *request = NULL;
+  FLAGCXCHECK(comm->netAdaptor->iflush(info->localRecvComm, 1, data_arr,
+                                       sizes_arr, mh_arr, &request));
+  if (request != NULL) {
+    int done = 0;
+    while (!done) {
+      FLAGCXCHECK(comm->netAdaptor->test(request, &done, NULL));
+    }
+  }
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxHeteroWaitSignal(flagcxHeteroComm_t comm, int peer,
+                                      size_t signalOffset, uint64_t expected,
+                                      flagcxStream_t stream) {
+  (void)peer;
+  struct flagcxIbGlobalHandleInfo *info =
+      (struct flagcxIbGlobalHandleInfo *)globalOneSideSignalHandles;
+  if (info == NULL || info->baseVas == NULL)
+    return flagcxNotSupported;
+
+  int myRank = comm->rank;
+  void *signalAddr = (void *)(info->baseVas[myRank] + signalOffset);
+
+  // Device-side wait (streamWaitValue64) for GPU signal buffer.
+  // RMA signal buffers are GPU memory (flagcxMemAlloc) — host-side volatile
+  // polling would segfault. Non-CUDA platforms return flagcxNotSupported.
+  // No flush needed: FORCE_SO on signal MR guarantees PCIe ordering.
+  if (stream == NULL)
+    return flagcxInternalError;
+
+  return deviceAdaptor->streamWaitValue64(stream, signalAddr, expected, 0);
 }
