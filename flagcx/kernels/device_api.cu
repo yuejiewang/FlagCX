@@ -1,17 +1,16 @@
 /*************************************************************************
  * Copyright (c) 2025 BAAI. All rights reserved.
  *
- * FlagCX Device API demo kernels.
+ * FlagCX Device API kernels.
  *
  * 1. Intra-node AllReduce — peer pointer + barrier based.
- *    Tier 1 (NCCL > 2.28): wraps ncclDevComm + ncclWindow_t + ncclLsaBarrier.
- *    Tier 2 (fallback):    IPC peer pointers + atomics barrier.
- *    Same kernel code compiles for both tiers.
+ *    Vendor (NCCL > 2.28): wraps ncclDevComm + ncclWindow_t + ncclLsaBarrier.
+ *    Fallback:    IPC peer pointers + atomics barrier.
+ *    Same kernel code compiles for both paths.
  *
- * 2. Inter-node AlltoAll — unified kernel, same structure for both paths.
- *    Thread 0 block-stride loop dispatches communication ops.
- *    One-sided path (Tier 1 + window): put + waitSignal + flush.
- *    Two-sided path (all tiers):       send + recv via FIFO.
+ * 2. Inter-node AlltoAll — two separate kernels:
+ *    a) One-sided (put): thread-stride loop, put + waitSignal + flush.
+ *    b) Two-sided (send/recv): thread-0 block-stride loop, FIFO + term/wait.
  *    Both paths wrapped by bar.sync() pre/post barriers.
  *
  * Host-side flagcxDevCommCreate/Destroy are in flagcx_device.cc.
@@ -95,9 +94,9 @@ template cudaError_t launchFlagcxIntraAllReduce<double>(flagcxDevComm,
                                                         flagcxDevMem, size_t,
                                                         size_t, cudaStream_t);
 
-// Host-side demo function — launches the kernel using caller-provided
+// Host-side function — launches the kernel using caller-provided
 // registered buffer and device communicator.
-flagcxResult_t flagcxIntraAllReduceDemo(flagcxDevMem_t devMem, size_t count,
+flagcxResult_t flagcxIntraAllReduce(flagcxDevMem_t devMem, size_t count,
                                         flagcxDataType_t datatype,
                                         flagcxDevComm_t devComm,
                                         flagcxStream_t stream) {
@@ -107,7 +106,7 @@ flagcxResult_t flagcxIntraAllReduceDemo(flagcxDevMem_t devMem, size_t count,
 
   cudaStream_t cudaStream = *(cudaStream_t *)stream;
 
-  // Unified constructors — work for both Tier 1 and Tier 2
+  // Unified constructors — work for both Vendor and Fallback
   flagcxDevComm devCommKernel(*devComm);
   flagcxDevMem devMemKernel(*devMem);
 
@@ -132,10 +131,11 @@ flagcxResult_t flagcxIntraAllReduceDemo(flagcxDevMem_t devMem, size_t count,
 }
 
 // ==========================================================================
-// 2. Inter-node AlltoAll — Unified kernel
+// 2a. Inter-node One-sided AlltoAll
 //
-// Both one-sided (put) and two-sided (send/recv) paths share the same
-// structure: thread-0 block-stride loop over peers, wrapped by bar.sync().
+// Thread-stride loop: each thread dispatches put ops to different peers.
+// put() posts FIFO descriptor (Fallback) or GIN descriptor (Vendor).
+// After all puts, waitSignal + flush ensure completion.
 //
 // Buffer layout: [rank0_data][rank1_data]...[rankN_data], each of size `count`
 // sendMem: data at offset peerRank * count * elementSize is sent to peerRank
@@ -143,67 +143,98 @@ flagcxResult_t flagcxIntraAllReduceDemo(flagcxDevMem_t devMem, size_t count,
 // ==========================================================================
 
 FLAGCX_GLOBAL_DECORATOR void __launch_bounds__(FLAGCX_DEVICE_THREADS_PER_CTA)
-    flagcxInterAlltoAllKernel(flagcxDevMem sendMem, flagcxDevMem recvMem,
-                              size_t count, flagcxDataType_t datatype,
-                              flagcxDevComm devComm) {
+    flagcxInterOneSidedAlltoAllKernel(flagcxDevMem sendMem, flagcxDevMem recvMem,
+                                      size_t count, flagcxDataType_t datatype,
+                                      flagcxDevComm devComm) {
 
-  flagcxDevNet net(devComm, FLAGCX_BLOCK_IDX_X);
-  flagcxBarrierSession<flagcxCoopBlock> bar(
-      flagcxCoopBlock(), flagcxTeamTagWorld{}, net, FLAGCX_BLOCK_IDX_X);
+  // GIN one-sided: all CTAs share context 0 (matches NCCL GIN pattern).
+  // Per-CTA contexts are for two-sided FIFO channels, not GIN.
+  flagcxDevNet net(devComm, 0);
+  // Inter-only barrier (matches NCCL GIN's ncclGinBarrierSession — no intra).
+  // Uses flagcxInterBarrierSession directly to avoid ncclBarrierSession(Rail) copy issue.
+  flagcxInterBarrierSession<flagcxCoopBlock> bar(
+      flagcxCoopBlock(), net, flagcxTeamWorld(devComm), FLAGCX_BLOCK_IDX_X);
+
+  int nRanks = devComm.getSize();
+  int myRank = devComm.getRank();
+  size_t size = count * getFlagcxDataTypeSizeDevice(datatype);
 
   // Pre-communication barrier
   bar.sync(flagcxCoopBlock(), flagcxDeviceMemoryOrderRelaxed);
 
+  // One-sided put/waitSignal/flush — works for both Vendor (GIN) and Fallback (FIFO proxy).
+  uint64_t signalValue = net.readSignal(0);
+
+  int tid = FLAGCX_THREAD_IDX_X + FLAGCX_BLOCK_IDX_X * FLAGCX_BLOCK_DIM_X;
+  int nthreads = FLAGCX_BLOCK_DIM_X * FLAGCX_GRID_DIM_X;
+  for (int peer = tid; peer < nRanks; peer += nthreads) {
+    net.put(flagcxTeamWorld(devComm), peer, recvMem, myRank * size,
+            sendMem, peer * size, size, flagcxDevNet_SignalInc{0},
+            flagcxDevNet_None{}, flagcxCoopThread{});
+  }
+
+  net.waitSignal(flagcxCoopBlock{}, 0, signalValue + nRanks);
+  net.flush(flagcxCoopBlock{});
+
+  // Post-communication barrier
+  bar.sync(flagcxCoopBlock(), flagcxDeviceMemoryOrderRelaxed);
+}
+
+// ==========================================================================
+// 2b. Inter-node Two-sided AlltoAll
+//
+// Thread-0 block-stride loop dispatches send/recv via FIFO.
+// term() + wait() for group semantic completion.
+//
+// Buffer layout: same as one-sided.
+// ==========================================================================
+
+FLAGCX_GLOBAL_DECORATOR void __launch_bounds__(FLAGCX_DEVICE_THREADS_PER_CTA)
+    flagcxInterTwoSidedAlltoAllKernel(flagcxDevMem sendMem, flagcxDevMem recvMem,
+                                      size_t count, flagcxDataType_t datatype,
+                                      flagcxDevComm devComm) {
+
+  flagcxDevNet net(devComm, FLAGCX_BLOCK_IDX_X);
+  // Inter-only barrier: matches one-sided kernel pattern.
+  // Same-node (nInterPeers == 0): no-op (FIFO term/wait handles completion).
+  // Multi-node: GIN barrier (Vendor) or FIFO Signal relay (Fallback).
+  flagcxInterBarrierSession<flagcxCoopBlock> bar(
+      flagcxCoopBlock(), net, flagcxTeamWorld(devComm), FLAGCX_BLOCK_IDX_X);
+
   int nRanks = devComm.getSize();
+  int myRank = devComm.getRank();
   size_t size = count * getFlagcxDataTypeSizeDevice(datatype);
-  bool oneSided = devComm._hasBase && sendMem._isSymmetric;
+
+  // Pre-communication barrier
+  bar.sync(flagcxCoopBlock(), flagcxDeviceMemoryOrderRelaxed);
 
   // Thread 0 dispatches all communication ops (block-stride over peers).
-  // Both put() and send()/recv() are control-plane descriptors — NIC or
-  // proxy does the actual data movement.
   if (FLAGCX_THREAD_IDX_X == 0) {
-    int myRank = devComm.getRank();
-    uint64_t signalValue = 0;
-    if (oneSided) signalValue = net.readSignal(0);
-
     for (int peer = FLAGCX_BLOCK_IDX_X; peer < nRanks;
          peer += FLAGCX_GRID_DIM_X) {
-      if (oneSided) {
-        net.put(flagcxTeamWorld(devComm), peer, recvMem, myRank * size,
-                sendMem, peer * size, size, flagcxDevNet_SignalInc{0},
-                flagcxDevNet_None{}, flagcxCoopThread{});
-      } else {
-        size_t offset = peer * size;
-        net.send(sendMem, offset, count, datatype, peer);
-        net.recv(recvMem, offset, count, datatype, peer);
-      }
+      size_t offset = peer * size;
+      net.send(sendMem, offset, count, datatype, peer);
+      net.recv(recvMem, offset, count, datatype, peer);
     }
 
-    if (oneSided) {
-      net.waitSignal(flagcxCoopThread{}, 0, signalValue + nRanks);
-      net.flush(flagcxCoopThread{});
-    } else {
-      // Two-sided: all CTAs must enqueue term/wait, even idle ones
-      // (blockIdx >= nRanks), because the proxy counts term entries from all
-      // CTA_COUNT channels to trigger groupEnd. Idle CTAs' term/wait are
-      // benign — no data was enqueued so wait completes instantly.
-      net.term();
-      net.wait();
-    }
+    // Two-sided: all CTAs must enqueue term/wait, even idle ones
+    // (blockIdx >= nRanks), because the proxy counts term entries from all
+    // CTA_COUNT channels to trigger groupEnd. Idle CTAs' term/wait are
+    // benign — no data was enqueued so wait completes instantly.
+    net.term();
+    net.wait();
   }
 
   // Post-communication barrier
   bar.sync(flagcxCoopBlock(), flagcxDeviceMemoryOrderRelaxed);
 }
 
-// Host-side unified alltoall demo function.
-// Runtime dispatch: one-sided (put) if window available, two-sided (send/recv)
-// otherwise. Uses same launch config for both paths.
-flagcxResult_t flagcxInterAlltoAllDemo(flagcxDevMem_t sendMem,
-                                       flagcxDevMem_t recvMem, size_t count,
-                                       flagcxDataType_t datatype,
-                                       flagcxDevComm_t devComm,
-                                       flagcxStream_t stream) {
+// Host-side one-sided AlltoAll function.
+flagcxResult_t flagcxInterOneSidedAlltoAll(flagcxDevMem_t sendMem,
+                                           flagcxDevMem_t recvMem, size_t count,
+                                           flagcxDataType_t datatype,
+                                           flagcxDevComm_t devComm,
+                                           flagcxStream_t stream) {
   if (devComm == nullptr || sendMem == nullptr || recvMem == nullptr) {
     return flagcxInternalError;
   }
@@ -211,22 +242,42 @@ flagcxResult_t flagcxInterAlltoAllDemo(flagcxDevMem_t sendMem,
   flagcxDevComm dc(*devComm);
   flagcxDevMem sm(*sendMem), rm(*recvMem);
 
-  flagcxInterAlltoAllKernel
+  flagcxInterOneSidedAlltoAllKernel
       <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
          *(cudaStream_t *)stream>>>(sm, rm, count, datatype, dc);
 
   cudaError_t err = cudaGetLastError();
 
-  // Advance barrier epoch:
-  // - Single-node: 2 syncs × 1 intra arrive × (intraSize-1) = 2*(intraSize-1)
-  // - Multi-node:  2 syncs × 2 intra arrives × (intraSize-1) = 4*(intraSize-1)
-  int intraArrivesPerSync = (devComm->nInterPeers > 0) ? 2 : 1;
-  devComm->barrierEpoch +=
-      2 * intraArrivesPerSync * (devComm->intraSize - 1);
-
-  // Advance inter-node barrier epoch (2 syncs per kernel, each += nInterPeers)
-  // Only meaningful on leader, but safe to advance on all ranks.
+  // Inter-only barrier: only advance interBarrierEpoch (no intra barriers used)
+  // 2 syncs per kernel, each += nInterPeers
   devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
 
   return (err == cudaSuccess) ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
+
+// Host-side two-sided AlltoAll function.
+flagcxResult_t flagcxInterTwoSidedAlltoAll(flagcxDevMem_t sendMem,
+                                            flagcxDevMem_t recvMem, size_t count,
+                                            flagcxDataType_t datatype,
+                                            flagcxDevComm_t devComm,
+                                            flagcxStream_t stream) {
+  if (devComm == nullptr || sendMem == nullptr || recvMem == nullptr) {
+    return flagcxInternalError;
+  }
+
+  flagcxDevComm dc(*devComm);
+  flagcxDevMem sm(*sendMem), rm(*recvMem);
+
+  flagcxInterTwoSidedAlltoAllKernel
+      <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
+         *(cudaStream_t *)stream>>>(sm, rm, count, datatype, dc);
+
+  cudaError_t err = cudaGetLastError();
+
+  // Advance inter-node barrier epoch only (no intra barrier in this kernel).
+  // 2 syncs per kernel, each += nInterPeers.
+  devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
+
+  return (err == cudaSuccess) ? flagcxSuccess : flagcxUnhandledDeviceError;
+}
+

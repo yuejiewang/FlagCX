@@ -89,10 +89,10 @@ int main(int argc, char *argv[]) {
     FLAGCXCHECK(
         devHandle->deviceMalloc(&regBuff, maxBytes, flagcxMemDevice, NULL));
   } else {
-    FLAGCXCHECK(flagcxMemAlloc(&regBuff, maxBytes, comm));
+    FLAGCXCHECK(flagcxMemAlloc(&regBuff, maxBytes));
   }
   if (localRegister == 2) {
-    // Window mode (NCCL > 2.28 only; graceful fallback on Tier 2/3)
+    // Window mode (NCCL > 2.28 only; graceful fallback on Fallback)
     FLAGCXCHECK(flagcxCommWindowRegister(comm, regBuff, maxBytes, &win,
                                          FLAGCX_WIN_DEFAULT));
     FLAGCXCHECK(flagcxDevMemCreate(comm, regBuff, maxBytes, win, &devMem));
@@ -126,7 +126,7 @@ int main(int argc, char *argv[]) {
                                           count * sizeof(float),
                                           flagcxMemcpyDeviceToDevice, stream));
       FLAGCXCHECK(
-          flagcxIntraAllReduceDemo(devMem, count, DATATYPE, devComm, stream));
+          flagcxIntraAllReduce(devMem, count, DATATYPE, devComm, stream));
       FLAGCXCHECK(devHandle->deviceMemcpy(recvbuff, regBuff,
                                           count * sizeof(float),
                                           flagcxMemcpyDeviceToDevice, stream));
@@ -156,7 +156,7 @@ int main(int argc, char *argv[]) {
       FLAGCXCHECK(devHandle->deviceMemcpy(regBuff, sendbuff, bytes,
                                           flagcxMemcpyDeviceToDevice, stream));
       FLAGCXCHECK(
-          flagcxIntraAllReduceDemo(devMem, count, DATATYPE, devComm, stream));
+          flagcxIntraAllReduce(devMem, count, DATATYPE, devComm, stream));
       FLAGCXCHECK(devHandle->deviceMemcpy(recvbuff, regBuff, bytes,
                                           flagcxMemcpyDeviceToDevice, stream));
     }
@@ -217,7 +217,7 @@ int main(int argc, char *argv[]) {
   if (localRegister == 0) {
     FLAGCXCHECK(devHandle->deviceFree(regBuff, flagcxMemDevice, NULL));
   } else {
-    FLAGCXCHECK(flagcxMemFree(regBuff, comm));
+    FLAGCXCHECK(flagcxMemFree(regBuff));
   }
   FLAGCXCHECK(devHandle->streamDestroy(stream));
   FLAGCXCHECK(flagcxCommDestroy(comm));

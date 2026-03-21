@@ -7,10 +7,12 @@
 #include "comm.h"
 #include "cost_model.h"
 #include "flagcx_hetero.h"
+#include "flagcx_kernel.h"
 #include "flagcx_net.h"
 #include "ib_common.h"
 #include "launch_kernel.h"
 #include "net.h"
+#include "onesided.h"
 #include "param.h"
 #include "proxy.h"
 #include "reg_pool.h"
@@ -24,8 +26,11 @@
 #include <unordered_map>
 
 flagcxRegPool globalRegPool;
-struct flagcxIbGlobalHandleInfo *globalOneSideHandles = NULL;
-struct flagcxIbGlobalHandleInfo *globalOneSideSignalHandles = NULL;
+struct flagcxOneSideHandleInfo
+    *globalOneSideHandleTable[FLAGCX_MAX_ONE_SIDE_HANDLES] = {};
+int globalOneSideHandleCount = 0;
+struct flagcxOneSideHandleInfo *globalOneSideSignalHandles = NULL;
+struct flagcxOneSideHandleInfo *globalOneSideStagingHandles = NULL;
 
 size_t getFlagcxDataTypeSize(flagcxDataType_t dtype) {
   switch (dtype) {
@@ -144,45 +149,142 @@ flagcxResult_t flagcxHandleFree(flagcxHandlerGroup_t handler) {
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxMemAlloc(void **ptr, size_t size, flagcxComm_t comm) {
+FLAGCX_PARAM(MemEnable, "MEM_ENABLE", 0);
+
+flagcxResult_t flagcxMemAlloc(void **ptr, size_t size) {
   if (ptr == NULL || size == 0) {
     WARN("Invalid ptr(NULL) or size(0) for allocation.");
     return flagcxInvalidArgument;
   }
-  if (comm == NULL || (useHomoComm(comm) && !useHeteroComm())) {
-    if (comm == NULL) {
-      INFO(FLAGCX_ALLOC,
-           "flagcxMemAlloc: comm is NULL, delegating to homo adaptor directly");
+  if (flagcxParamMemEnable()) {
+    FLAGCXCHECK(deviceAdaptor->gdrMemAlloc(ptr, size, NULL));
+    if (*ptr != NULL) {
+      INFO(FLAGCX_REG, "flagcxMemAlloc: GDR allocated [%p, %ld]", *ptr, size);
+    } else {
+      WARN("flagcxMemAlloc: GDR allocation failed");
+      return flagcxUnhandledDeviceError;
     }
-    FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->memAlloc(ptr, size));
-    return flagcxSuccess;
-  }
-  FLAGCXCHECK(deviceAdaptor->gdrMemAlloc(ptr, size, NULL));
-  if (*ptr != NULL) {
-    INFO(FLAGCX_REG, "User buffer memory allocated with [%p, %ld]", *ptr, size);
   } else {
-    WARN("User buffer allocation failed");
-    return flagcxUnhandledDeviceError;
+    FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->memAlloc(ptr, size));
   }
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxMemFree(void *ptr, flagcxComm_t comm) {
+flagcxResult_t flagcxMemFree(void *ptr) {
   if (ptr == NULL) {
-    WARN("Invalid pointer(=NULL)for de-allocation.");
+    WARN("Invalid pointer(=NULL) for de-allocation.");
     return flagcxSuccess;
   }
-  if (comm == NULL || (useHomoComm(comm) && !useHeteroComm())) {
-    if (comm == NULL) {
-      INFO(FLAGCX_ALLOC,
-           "flagcxMemFree: comm is NULL, delegating to homo adaptor directly");
-    }
+  if (flagcxParamMemEnable()) {
+    FLAGCXCHECK(deviceAdaptor->gdrMemFree(ptr, NULL));
+    INFO(FLAGCX_REG, "flagcxMemFree: GDR memory deallocated");
+  } else {
     FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->memFree(ptr));
-    return flagcxSuccess;
   }
-  FLAGCXCHECK(deviceAdaptor->gdrMemFree(ptr, NULL));
-  INFO(FLAGCX_REG, "User buffer memory deallocated");
   return flagcxSuccess;
+}
+
+// Build full-mesh IB connections (including self-loopback) for one-sided ops.
+// Called once on the first flagcxOneSideRegister invocation; stored in
+// handle[0]. Pattern aligned with NCCL GIN gin.cc:146-158.
+static flagcxResult_t
+flagcxOneSideBuildFullMesh(const flagcxComm_t comm,
+                           struct flagcxOneSideHandleInfo *info) {
+  struct flagcxHeteroComm *heteroComm = comm->heteroComm;
+  struct bootstrapState *state = heteroComm->bootstrap;
+  int nranks = state->nranks;
+  int rank = state->rank;
+  flagcxResult_t res = flagcxSuccess;
+
+  void *listenComm = NULL;
+  flagcxNetHandle_t *allHandles = NULL;
+
+  FLAGCXCHECKGOTO(flagcxCalloc(&info->fullSendComms, nranks), res, fail);
+  FLAGCXCHECKGOTO(flagcxCalloc(&info->fullRecvComms, nranks), res, fail);
+  info->nRanks = nranks;
+
+  {
+    // 1. Create listen comm and allgather listen handles
+    flagcxNetHandle_t myListenHandle = {};
+    FLAGCXCHECKGOTO(heteroComm->netAdaptor->listen(heteroComm->netDev,
+                                                   (void *)myListenHandle,
+                                                   &listenComm),
+                    res, fail);
+
+    // Allgather listen handles from all ranks
+    FLAGCXCHECKGOTO(flagcxCalloc(&allHandles, nranks), res, fail_listen);
+    memcpy(&allHandles[rank], &myListenHandle, sizeof(flagcxNetHandle_t));
+    FLAGCXCHECKGOTO(bootstrapAllGather(state, (void *)allHandles,
+                                       sizeof(flagcxNetHandle_t)),
+                    res, fail_handles);
+
+    // 2. Deadlock-free full-mesh connection (NCCL GIN pattern)
+    for (int i = 0; i < nranks; i++) {
+      int connectPeer = (rank + i) % nranks; // i=0 → self
+      int acceptPeer = (rank - i + nranks) % nranks;
+
+      // Connect to connectPeer + accept from acceptPeer in lockstep
+      void *sendComm = NULL, *recvComm = NULL;
+      while (sendComm == NULL || recvComm == NULL) {
+        if (sendComm == NULL) {
+          res = heteroComm->netAdaptor->connect(
+              heteroComm->netDev, (void *)&allHandles[connectPeer], &sendComm);
+          if (res != flagcxSuccess && res != flagcxInProgress) {
+            INFO(FLAGCX_REG,
+                 "flagcxOneSideBuildFullMesh: connect to peer %d failed, "
+                 "res=%d",
+                 connectPeer, res);
+            goto fail_handles;
+          }
+        }
+        if (recvComm == NULL) {
+          res = heteroComm->netAdaptor->accept(listenComm, &recvComm);
+          if (res != flagcxSuccess && res != flagcxInProgress) {
+            INFO(FLAGCX_REG,
+                 "flagcxOneSideBuildFullMesh: accept from peer %d failed, "
+                 "res=%d",
+                 acceptPeer, res);
+            goto fail_handles;
+          }
+        }
+        if (sendComm == NULL || recvComm == NULL)
+          sched_yield();
+      }
+      info->fullSendComms[connectPeer] = sendComm;
+      info->fullRecvComms[acceptPeer] = recvComm;
+      INFO(FLAGCX_REG,
+           "flagcxOneSideBuildFullMesh: rank %d connected peer %d (i=%d)", rank,
+           connectPeer, i);
+    }
+
+    free(allHandles);
+    heteroComm->netAdaptor->closeListen(listenComm);
+  }
+
+  INFO(FLAGCX_REG,
+       "flagcxOneSideBuildFullMesh: rank %d, %d full-mesh connections "
+       "(including self-loopback)",
+       rank, nranks);
+  return flagcxSuccess;
+
+fail_handles:
+  // cleanup partial connections on error
+  for (int i = 0; i < nranks; i++) {
+    if (info->fullSendComms[i])
+      heteroComm->netAdaptor->closeSend(info->fullSendComms[i]);
+    if (info->fullRecvComms[i])
+      heteroComm->netAdaptor->closeRecv(info->fullRecvComms[i]);
+  }
+  free(allHandles);
+fail_listen:
+  heteroComm->netAdaptor->closeListen(listenComm);
+fail:
+  free(info->fullSendComms);
+  free(info->fullRecvComms);
+  info->fullSendComms = NULL;
+  info->fullRecvComms = NULL;
+  info->nRanks = 0;
+  return res;
 }
 
 flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
@@ -192,12 +294,22 @@ flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
     return flagcxSuccess;
   }
 
-  if (globalOneSideHandles != NULL) {
-    if (globalOneSideHandles->baseVas != NULL &&
-        globalOneSideHandles->baseVas[comm->rank] != (uintptr_t)buff) {
-      WARN("flagcxOneSideRegister: already registered with a different buffer");
+  // Check for duplicate registration of the same buffer
+  for (int i = 0; i < globalOneSideHandleCount; i++) {
+    if (globalOneSideHandleTable[i] != NULL &&
+        globalOneSideHandleTable[i]->baseVas != NULL &&
+        globalOneSideHandleTable[i]->baseVas[comm->rank] == (uintptr_t)buff) {
+      INFO(FLAGCX_REG,
+           "flagcxOneSideRegister: buffer %p already registered at slot %d",
+           buff, i);
+      return flagcxSuccess;
     }
-    return flagcxSuccess;
+  }
+
+  if (globalOneSideHandleCount >= FLAGCX_MAX_ONE_SIDE_HANDLES) {
+    WARN("flagcxOneSideRegister: handle table full (%d/%d)",
+         globalOneSideHandleCount, FLAGCX_MAX_ONE_SIDE_HANDLES);
+    return flagcxNotSupported;
   }
 
   struct flagcxHeteroComm *heteroComm = comm->heteroComm;
@@ -217,67 +329,33 @@ flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
   flagcxResult_t res = flagcxSuccess;
   void *mrHandle = NULL;
   struct ibv_mr *mr = NULL;
-  void *sendComm = NULL;
-  void *recvComm = NULL;
-  void *listenComm = NULL;
   void *regComm = NULL;
-  struct flagcxIbGlobalHandleInfo *info = NULL;
+  struct flagcxOneSideHandleInfo *info = NULL;
+  int slot = globalOneSideHandleCount;
+  bool isFirstHandle = (slot == 0);
 
-  int sendPeer = (heteroComm->rank + 1) % heteroComm->nRanks;
-  int recvPeer =
-      (heteroComm->rank - 1 + heteroComm->nRanks) % heteroComm->nRanks;
+  FLAGCXCHECKGOTO(flagcxCalloc(&info, 1), res, fail);
 
-  flagcxNetHandle_t listenHandle = {};
-  FLAGCXCHECK(heteroComm->netAdaptor->listen(
-      heteroComm->netDev, (void *)listenHandle, &listenComm));
-
-  flagcxNetHandle_t peerHandle = {};
-  FLAGCXCHECKGOTO(bootstrapSend(state, recvPeer, 1001, (void *)listenHandle,
-                                sizeof(flagcxNetHandle_t)),
-                  res, fail_listen);
-  FLAGCXCHECKGOTO(bootstrapRecv(state, sendPeer, 1001, (void *)peerHandle,
-                                sizeof(flagcxNetHandle_t)),
-                  res, fail_listen);
-
-  // Establish connections
-  while (sendComm == NULL || recvComm == NULL) {
-    if (sendComm == NULL) {
-      res = heteroComm->netAdaptor->connect(heteroComm->netDev,
-                                            (void *)peerHandle, &sendComm);
-      if (res != flagcxSuccess && res != flagcxInProgress) {
-        INFO(FLAGCX_REG,
-             "flagcxOneSideRegister: connect to sendPeer failed, res=%d", res);
-        goto fail_listen;
-      }
-    }
-
-    if (recvComm == NULL) {
-      res = heteroComm->netAdaptor->accept(listenComm, &recvComm);
-      if (res != flagcxSuccess && res != flagcxInProgress) {
-        INFO(FLAGCX_REG,
-             "flagcxOneSideRegister: accept from recvPeer failed, res=%d", res);
-        goto fail_listen;
-      }
-    }
-
-    if (sendComm == NULL || recvComm == NULL) {
-      sched_yield();
-    }
-  }
-  // Close listen comm — connections established
-  heteroComm->netAdaptor->closeListen(listenComm);
-  listenComm = NULL;
-
-  regComm = recvComm;
-  INFO(FLAGCX_REG, "flagcxOneSideRegister: sendComm and recvComm created, "
-                   "using recvComm for registration");
-
-  if (heteroComm->netAdaptor->name &&
-      strcmp(heteroComm->netAdaptor->name, "IB") == 0) {
-    struct flagcxIbRecvComm *ibRecvComm = (struct flagcxIbRecvComm *)regComm;
-    regComm = (void *)&ibRecvComm->base;
+  // First handle: build full-mesh IB connections (including self-loopback)
+  if (isFirstHandle) {
+    FLAGCXCHECKGOTO(flagcxOneSideBuildFullMesh(comm, info), res, fail_info);
   }
 
+  // Use self recvComm for MR registration (PD match)
+  {
+    void *selfRecvComm =
+        isFirstHandle ? info->fullRecvComms[state->rank]
+                      : globalOneSideHandleTable[0]->fullRecvComms[state->rank];
+    info->localRecvComm = selfRecvComm;
+    regComm = selfRecvComm;
+    if (heteroComm->netAdaptor->name &&
+        strcmp(heteroComm->netAdaptor->name, "IB") == 0) {
+      struct flagcxIbRecvComm *ibRecvComm = (struct flagcxIbRecvComm *)regComm;
+      regComm = (void *)&ibRecvComm->base;
+    }
+  }
+
+  // Register MR for this buffer
   {
     int type = FLAGCX_PTR_CUDA;
     res = heteroComm->netAdaptor->regMr(regComm, buff, size, type,
@@ -286,7 +364,7 @@ flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
   if (res != flagcxSuccess || mrHandle == NULL) {
     INFO(FLAGCX_REG, "flagcxOneSideRegister: regMr failed, res=%d", res);
     res = flagcxNotSupported;
-    goto fail_conn;
+    goto fail_mesh;
   }
 
   {
@@ -295,9 +373,9 @@ flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
     mr = localMrHandle->mrs[0];
   }
 
+  // Allgather MR info
   {
     int nranks = state->nranks;
-    FLAGCXCHECKGOTO(flagcxCalloc(&info, 1), res, fail_mr);
     FLAGCXCHECKGOTO(flagcxCalloc(&info->baseVas, nranks), res, fail_mr);
     FLAGCXCHECKGOTO(flagcxCalloc(&info->rkeys, nranks), res, fail_mr);
     FLAGCXCHECKGOTO(flagcxCalloc(&info->lkeys, nranks), res, fail_mr);
@@ -306,8 +384,6 @@ flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
     info->rkeys[state->rank] = mr->rkey;
     info->lkeys[state->rank] = mr->lkey;
     info->localMrHandle = mrHandle;
-    info->localRecvComm = recvComm;
-    info->localSendComm = sendComm;
 
     FLAGCXCHECKGOTO(
         bootstrapAllGather(state, (void *)info->baseVas, sizeof(uintptr_t)),
@@ -318,15 +394,17 @@ flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
     FLAGCXCHECKGOTO(
         bootstrapAllGather(state, (void *)info->lkeys, sizeof(uint32_t)), res,
         fail_mr);
-    globalOneSideHandles = info;
+
+    globalOneSideHandleTable[slot] = info;
+    globalOneSideHandleCount = slot + 1;
+
     INFO(FLAGCX_REG,
-         "One-sided register allgather results (rank %d, nranks %d):",
-         state->rank, nranks);
+         "One-sided register slot %d allgather results (rank %d, nranks %d):",
+         slot, state->rank, nranks);
     for (int i = 0; i < nranks; i++) {
       INFO(FLAGCX_REG, "  Rank %d: base_va=0x%lx, rkey=0x%x, lkey=0x%x", i,
            info->baseVas[i], info->rkeys[i], info->lkeys[i]);
     }
-    INFO(FLAGCX_REG, "flagcxOneSideRegister: allgather results printed");
   }
 
   return flagcxSuccess;
@@ -336,53 +414,71 @@ fail_mr:
     free(info->lkeys);
     free(info->rkeys);
     free(info->baseVas);
-    free(info);
   }
-  heteroComm->netAdaptor->deregMr(regComm, mrHandle);
-fail_conn:
-  heteroComm->netAdaptor->closeSend(sendComm);
-  heteroComm->netAdaptor->closeRecv(recvComm);
-  return res;
-fail_listen:
-  if (listenComm)
-    heteroComm->netAdaptor->closeListen(listenComm);
-  if (sendComm)
-    heteroComm->netAdaptor->closeSend(sendComm);
-  if (recvComm)
-    heteroComm->netAdaptor->closeRecv(recvComm);
+  if (regComm && mrHandle)
+    heteroComm->netAdaptor->deregMr(regComm, mrHandle);
+fail_mesh:
+  if (isFirstHandle) {
+    // Clean up full-mesh connections on first-handle failure
+    for (int i = 0; i < state->nranks; i++) {
+      if (info->fullSendComms && info->fullSendComms[i])
+        heteroComm->netAdaptor->closeSend(info->fullSendComms[i]);
+      if (info->fullRecvComms && info->fullRecvComms[i])
+        heteroComm->netAdaptor->closeRecv(info->fullRecvComms[i]);
+    }
+    free(info->fullSendComms);
+    free(info->fullRecvComms);
+  }
+fail_info:
+  free(info);
+fail:
   return res;
 }
 
 flagcxResult_t flagcxOneSideDeregister(const flagcxComm_t comm) {
-  struct flagcxIbGlobalHandleInfo *info = globalOneSideHandles;
-  if (info == NULL)
-    return flagcxSuccess;
   if (comm == NULL)
     return flagcxInternalError;
-
   struct flagcxHeteroComm *heteroComm = comm->heteroComm;
-  if (heteroComm != NULL && heteroComm->netAdaptor != NULL) {
-    if (info->localMrHandle != NULL && info->localRecvComm != NULL) {
-      void *regComm = info->localRecvComm;
-      if (heteroComm->netAdaptor->name &&
-          strcmp(heteroComm->netAdaptor->name, "IB") == 0) {
-        struct flagcxIbRecvComm *ibRecvComm =
-            (struct flagcxIbRecvComm *)regComm;
-        regComm = (void *)&ibRecvComm->base;
-      }
-      heteroComm->netAdaptor->deregMr(regComm, info->localMrHandle);
-    }
-    if (info->localSendComm != NULL)
-      heteroComm->netAdaptor->closeSend(info->localSendComm);
-    if (info->localRecvComm != NULL)
-      heteroComm->netAdaptor->closeRecv(info->localRecvComm);
-  }
 
-  free(info->baseVas);
-  free(info->rkeys);
-  free(info->lkeys);
-  free(info);
-  globalOneSideHandles = NULL;
+  // Deregister all handles in reverse order
+  for (int slot = globalOneSideHandleCount - 1; slot >= 0; slot--) {
+    struct flagcxOneSideHandleInfo *info = globalOneSideHandleTable[slot];
+    if (info == NULL)
+      continue;
+
+    if (heteroComm != NULL && heteroComm->netAdaptor != NULL) {
+      // Deregister MR
+      if (info->localMrHandle != NULL && info->localRecvComm != NULL) {
+        void *regComm = info->localRecvComm;
+        if (heteroComm->netAdaptor->name &&
+            strcmp(heteroComm->netAdaptor->name, "IB") == 0) {
+          struct flagcxIbRecvComm *ibRecvComm =
+              (struct flagcxIbRecvComm *)regComm;
+          regComm = (void *)&ibRecvComm->base;
+        }
+        heteroComm->netAdaptor->deregMr(regComm, info->localMrHandle);
+      }
+
+      // Close full-mesh connections (only stored in slot 0)
+      if (slot == 0 && info->fullSendComms != NULL) {
+        for (int i = 0; i < info->nRanks; i++) {
+          if (info->fullSendComms[i])
+            heteroComm->netAdaptor->closeSend(info->fullSendComms[i]);
+          if (info->fullRecvComms[i])
+            heteroComm->netAdaptor->closeRecv(info->fullRecvComms[i]);
+        }
+        free(info->fullSendComms);
+        free(info->fullRecvComms);
+      }
+    }
+
+    free(info->baseVas);
+    free(info->rkeys);
+    free(info->lkeys);
+    free(info);
+    globalOneSideHandleTable[slot] = NULL;
+  }
+  globalOneSideHandleCount = 0;
   return flagcxSuccess;
 }
 
@@ -415,58 +511,24 @@ flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
     return flagcxNotSupported;
   }
 
+  // Signal registration reuses full-mesh connections from data handle table.
+  // Requires at least one data handle to be registered first.
+  if (globalOneSideHandleCount == 0 ||
+      globalOneSideHandleTable[0]->fullRecvComms == NULL) {
+    INFO(FLAGCX_REG, "flagcxOneSideSignalRegister: no full-mesh connections, "
+                     "register a data buffer first");
+    return flagcxNotSupported;
+  }
+
   flagcxResult_t res = flagcxSuccess;
   void *mrHandle = NULL;
   struct ibv_mr *mr = NULL;
-  void *sendComm = NULL;
-  void *recvComm = NULL;
-  void *listenComm = NULL;
   void *regComm = NULL;
-  struct flagcxIbGlobalHandleInfo *info = NULL;
+  struct flagcxOneSideHandleInfo *info = NULL;
 
-  int sendPeer = (heteroComm->rank + 1) % heteroComm->nRanks;
-  int recvPeer =
-      (heteroComm->rank - 1 + heteroComm->nRanks) % heteroComm->nRanks;
-
-  flagcxNetHandle_t listenHandle = {};
-  FLAGCXCHECK(heteroComm->netAdaptor->listen(
-      heteroComm->netDev, (void *)listenHandle, &listenComm));
-
-  flagcxNetHandle_t peerHandle = {};
-  FLAGCXCHECKGOTO(bootstrapSend(state, recvPeer, 1002, (void *)listenHandle,
-                                sizeof(flagcxNetHandle_t)),
-                  res, fail_listen);
-  FLAGCXCHECKGOTO(bootstrapRecv(state, sendPeer, 1002, (void *)peerHandle,
-                                sizeof(flagcxNetHandle_t)),
-                  res, fail_listen);
-
-  while (sendComm == NULL || recvComm == NULL) {
-    if (sendComm == NULL) {
-      res = heteroComm->netAdaptor->connect(heteroComm->netDev,
-                                            (void *)peerHandle, &sendComm);
-      if (res != flagcxSuccess && res != flagcxInProgress) {
-        INFO(FLAGCX_REG, "flagcxOneSideSignalRegister: connect failed, res=%d",
-             res);
-        goto fail_listen;
-      }
-    }
-    if (recvComm == NULL) {
-      res = heteroComm->netAdaptor->accept(listenComm, &recvComm);
-      if (res != flagcxSuccess && res != flagcxInProgress) {
-        INFO(FLAGCX_REG, "flagcxOneSideSignalRegister: accept failed, res=%d",
-             res);
-        goto fail_listen;
-      }
-    }
-    if (sendComm == NULL || recvComm == NULL) {
-      sched_yield();
-    }
-  }
-  // Close listen comm — connections established
-  heteroComm->netAdaptor->closeListen(listenComm);
-  listenComm = NULL;
-
-  regComm = recvComm;
+  // Use self recvComm from data handle[0] for MR registration (PD match)
+  void *selfRecvComm = globalOneSideHandleTable[0]->fullRecvComms[state->rank];
+  regComm = selfRecvComm;
   if (heteroComm->netAdaptor->name &&
       strcmp(heteroComm->netAdaptor->name, "IB") == 0) {
     struct flagcxIbRecvComm *ibRecvComm = (struct flagcxIbRecvComm *)regComm;
@@ -480,8 +542,7 @@ flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
   }
   if (res != flagcxSuccess || mrHandle == NULL) {
     INFO(FLAGCX_REG, "flagcxOneSideSignalRegister: regMr failed, res=%d", res);
-    res = flagcxNotSupported;
-    goto fail_conn;
+    return flagcxNotSupported;
   }
 
   {
@@ -501,8 +562,7 @@ flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
     info->rkeys[state->rank] = mr->rkey;
     info->lkeys[state->rank] = mr->lkey;
     info->localMrHandle = mrHandle;
-    info->localRecvComm = recvComm;
-    info->localSendComm = sendComm;
+    info->localRecvComm = selfRecvComm;
 
     FLAGCXCHECKGOTO(
         bootstrapAllGather(state, (void *)info->baseVas, sizeof(uintptr_t)),
@@ -533,22 +593,11 @@ fail_mr:
     free(info);
   }
   heteroComm->netAdaptor->deregMr(regComm, mrHandle);
-fail_conn:
-  heteroComm->netAdaptor->closeSend(sendComm);
-  heteroComm->netAdaptor->closeRecv(recvComm);
-  return res;
-fail_listen:
-  if (listenComm)
-    heteroComm->netAdaptor->closeListen(listenComm);
-  if (sendComm)
-    heteroComm->netAdaptor->closeSend(sendComm);
-  if (recvComm)
-    heteroComm->netAdaptor->closeRecv(recvComm);
   return res;
 }
 
 flagcxResult_t flagcxOneSideSignalDeregister(const flagcxComm_t comm) {
-  struct flagcxIbGlobalHandleInfo *info = globalOneSideSignalHandles;
+  struct flagcxOneSideHandleInfo *info = globalOneSideSignalHandles;
   if (info == NULL)
     return flagcxSuccess;
   if (comm == NULL)
@@ -556,7 +605,7 @@ flagcxResult_t flagcxOneSideSignalDeregister(const flagcxComm_t comm) {
 
   struct flagcxHeteroComm *heteroComm = comm->heteroComm;
   if (heteroComm != NULL && heteroComm->netAdaptor != NULL) {
-    // Deregister MR
+    // Deregister MR (connections are shared with data handle table, not owned)
     if (info->localMrHandle != NULL && info->localRecvComm != NULL) {
       void *regComm = info->localRecvComm;
       if (heteroComm->netAdaptor->name &&
@@ -567,11 +616,7 @@ flagcxResult_t flagcxOneSideSignalDeregister(const flagcxComm_t comm) {
       }
       heteroComm->netAdaptor->deregMr(regComm, info->localMrHandle);
     }
-    // Close network connections
-    if (info->localSendComm != NULL)
-      heteroComm->netAdaptor->closeSend(info->localSendComm);
-    if (info->localRecvComm != NULL)
-      heteroComm->netAdaptor->closeRecv(info->localRecvComm);
+    // No closeSend/closeRecv — connections owned by data handle table[0]
   }
 
   free(info->baseVas);
@@ -579,6 +624,276 @@ flagcxResult_t flagcxOneSideSignalDeregister(const flagcxComm_t comm) {
   free(info->lkeys);
   free(info);
   globalOneSideSignalHandles = NULL;
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxOneSideStagingRegister(const flagcxComm_t comm, void *buff,
+                                            size_t size) {
+  if (useHomoComm(comm) && !useHeteroComm()) {
+    return flagcxSuccess;
+  }
+
+  if (globalOneSideStagingHandles != NULL) {
+    if (globalOneSideStagingHandles->baseVas != NULL &&
+        globalOneSideStagingHandles->baseVas[comm->rank] != (uintptr_t)buff) {
+      WARN("flagcxOneSideStagingRegister: already registered with a different "
+           "buffer");
+    }
+    return flagcxSuccess;
+  }
+
+  struct flagcxHeteroComm *heteroComm = comm->heteroComm;
+  if (heteroComm == NULL || heteroComm->netAdaptor == NULL ||
+      heteroComm->netAdaptor->iput == NULL ||
+      heteroComm->netAdaptor->regMr == NULL) {
+    INFO(FLAGCX_REG, "flagcxOneSideStagingRegister: heteroComm is NULL");
+    return flagcxSuccess;
+  }
+
+  struct bootstrapState *state = heteroComm->bootstrap;
+  if (state == NULL) {
+    INFO(FLAGCX_REG, "flagcxOneSideStagingRegister: state is NULL");
+    return flagcxNotSupported;
+  }
+
+  // Staging registration reuses full-mesh connections from data handle table.
+  if (globalOneSideHandleCount == 0 ||
+      globalOneSideHandleTable[0]->fullRecvComms == NULL) {
+    INFO(FLAGCX_REG, "flagcxOneSideStagingRegister: no full-mesh connections, "
+                     "register a data buffer first");
+    return flagcxNotSupported;
+  }
+
+  flagcxResult_t res = flagcxSuccess;
+  void *mrHandle = NULL;
+  struct ibv_mr *mr = NULL;
+  void *regComm = NULL;
+  struct flagcxOneSideHandleInfo *info = NULL;
+
+  // Use self recvComm from data handle[0] for MR registration (PD match)
+  void *selfRecvComm = globalOneSideHandleTable[0]->fullRecvComms[state->rank];
+  regComm = selfRecvComm;
+  if (heteroComm->netAdaptor->name &&
+      strcmp(heteroComm->netAdaptor->name, "IB") == 0) {
+    struct flagcxIbRecvComm *ibRecvComm = (struct flagcxIbRecvComm *)regComm;
+    regComm = (void *)&ibRecvComm->base;
+  }
+
+  {
+    int type = FLAGCX_PTR_HOST;
+    res =
+        heteroComm->netAdaptor->regMr(regComm, buff, size, type, 0, &mrHandle);
+  }
+  if (res != flagcxSuccess || mrHandle == NULL) {
+    INFO(FLAGCX_REG, "flagcxOneSideStagingRegister: regMr failed, res=%d", res);
+    return flagcxNotSupported;
+  }
+
+  {
+    struct flagcxIbMrHandle *localMrHandle =
+        (struct flagcxIbMrHandle *)mrHandle;
+    mr = localMrHandle->mrs[0];
+  }
+
+  {
+    int nranks = state->nranks;
+    FLAGCXCHECKGOTO(flagcxCalloc(&info, 1), res, fail_mr);
+    FLAGCXCHECKGOTO(flagcxCalloc(&info->baseVas, nranks), res, fail_mr);
+    FLAGCXCHECKGOTO(flagcxCalloc(&info->rkeys, nranks), res, fail_mr);
+    FLAGCXCHECKGOTO(flagcxCalloc(&info->lkeys, nranks), res, fail_mr);
+
+    info->baseVas[state->rank] = (uintptr_t)buff;
+    info->rkeys[state->rank] = mr->rkey;
+    info->lkeys[state->rank] = mr->lkey;
+    info->localMrHandle = mrHandle;
+    info->localRecvComm = selfRecvComm;
+
+    FLAGCXCHECKGOTO(
+        bootstrapAllGather(state, (void *)info->baseVas, sizeof(uintptr_t)),
+        res, fail_mr);
+    FLAGCXCHECKGOTO(
+        bootstrapAllGather(state, (void *)info->rkeys, sizeof(uint32_t)), res,
+        fail_mr);
+    FLAGCXCHECKGOTO(
+        bootstrapAllGather(state, (void *)info->lkeys, sizeof(uint32_t)), res,
+        fail_mr);
+    globalOneSideStagingHandles = info;
+    INFO(FLAGCX_REG, "Staging register allgather results (rank %d, nranks %d):",
+         state->rank, nranks);
+    for (int i = 0; i < nranks; i++) {
+      INFO(FLAGCX_REG, "  Rank %d: base_va=0x%lx, rkey=0x%x, lkey=0x%x", i,
+           info->baseVas[i], info->rkeys[i], info->lkeys[i]);
+    }
+  }
+
+  return flagcxSuccess;
+
+fail_mr:
+  if (info) {
+    free(info->lkeys);
+    free(info->rkeys);
+    free(info->baseVas);
+    free(info);
+  }
+  heteroComm->netAdaptor->deregMr(regComm, mrHandle);
+  return res;
+}
+
+flagcxResult_t flagcxOneSideStagingDeregister(const flagcxComm_t comm) {
+  struct flagcxOneSideHandleInfo *info = globalOneSideStagingHandles;
+  if (info == NULL)
+    return flagcxSuccess;
+  if (comm == NULL)
+    return flagcxInternalError;
+
+  struct flagcxHeteroComm *heteroComm = comm->heteroComm;
+  if (heteroComm != NULL && heteroComm->netAdaptor != NULL) {
+    if (info->localMrHandle != NULL && info->localRecvComm != NULL) {
+      void *regComm = info->localRecvComm;
+      if (heteroComm->netAdaptor->name &&
+          strcmp(heteroComm->netAdaptor->name, "IB") == 0) {
+        struct flagcxIbRecvComm *ibRecvComm =
+            (struct flagcxIbRecvComm *)regComm;
+        regComm = (void *)&ibRecvComm->base;
+      }
+      heteroComm->netAdaptor->deregMr(regComm, info->localMrHandle);
+    }
+  }
+
+  free(info->baseVas);
+  free(info->rkeys);
+  free(info->lkeys);
+  free(info);
+  globalOneSideStagingHandles = NULL;
+  return flagcxSuccess;
+}
+
+flagcxResult_t
+flagcxOneSideBarrierRegister(const flagcxComm_t comm, void *recvComm,
+                             void *buff, size_t size,
+                             struct flagcxOneSideHandleInfo **outInfo) {
+  if (comm == NULL || outInfo == NULL)
+    return flagcxInvalidArgument;
+  *outInfo = NULL;
+
+  struct flagcxHeteroComm *heteroComm = comm->heteroComm;
+  if (heteroComm == NULL || heteroComm->netAdaptor == NULL ||
+      heteroComm->netAdaptor->regMr == NULL)
+    return flagcxNotSupported;
+
+  struct bootstrapState *state = comm->bootstrap;
+  if (state == NULL)
+    return flagcxNotSupported;
+
+  struct flagcxNetAdaptor *net = heteroComm->netAdaptor;
+  flagcxResult_t res = flagcxSuccess;
+  void *mrHandle = NULL;
+  uint32_t rkey = 0, lkey = 0;
+  uintptr_t baseVa = 0;
+  struct flagcxOneSideHandleInfo *info = NULL;
+
+  // Leaders (recvComm != NULL): register MR and extract keys
+  if (recvComm != NULL && buff != NULL && size > 0) {
+    void *regComm = recvComm;
+    if (net->name && strcmp(net->name, "IB") == 0) {
+      struct flagcxIbRecvComm *ibRecvComm = (struct flagcxIbRecvComm *)regComm;
+      regComm = (void *)&ibRecvComm->base;
+    }
+    res = net->regMr(regComm, buff, size, FLAGCX_PTR_HOST,
+                     FLAGCX_NET_MR_FLAG_FORCE_SO, &mrHandle);
+    if (res != flagcxSuccess || mrHandle == NULL) {
+      INFO(FLAGCX_REG, "flagcxOneSideBarrierRegister: regMr failed, res=%d",
+           res);
+      return flagcxNotSupported;
+    }
+    struct flagcxIbMrHandle *ibMrHandle = (struct flagcxIbMrHandle *)mrHandle;
+    struct ibv_mr *mr = ibMrHandle->mrs[0];
+    rkey = mr->rkey;
+    lkey = mr->lkey;
+    baseVa = (uintptr_t)buff;
+  }
+
+  // ALL ranks: allocate info, populate own entry, AllGather
+  {
+    int nranks = state->nranks;
+    int myRank = state->rank;
+    FLAGCXCHECKGOTO(flagcxCalloc(&info, 1), res, fail_mr);
+    FLAGCXCHECKGOTO(flagcxCalloc(&info->baseVas, nranks), res, fail_mr);
+    FLAGCXCHECKGOTO(flagcxCalloc(&info->rkeys, nranks), res, fail_mr);
+    FLAGCXCHECKGOTO(flagcxCalloc(&info->lkeys, nranks), res, fail_mr);
+
+    info->baseVas[myRank] = baseVa;
+    info->rkeys[myRank] = rkey;
+    info->lkeys[myRank] = lkey;
+    info->localMrHandle = mrHandle;
+    info->localRecvComm = recvComm;
+
+    FLAGCXCHECKGOTO(
+        bootstrapAllGather(state, (void *)info->baseVas, sizeof(uintptr_t)),
+        res, fail_mr);
+    FLAGCXCHECKGOTO(
+        bootstrapAllGather(state, (void *)info->rkeys, sizeof(uint32_t)), res,
+        fail_mr);
+    FLAGCXCHECKGOTO(
+        bootstrapAllGather(state, (void *)info->lkeys, sizeof(uint32_t)), res,
+        fail_mr);
+
+    INFO(FLAGCX_REG,
+         "Barrier register allgather results (rank %d, nranks %d):", myRank,
+         nranks);
+    for (int i = 0; i < nranks; i++) {
+      INFO(FLAGCX_REG, "  Rank %d: base_va=0x%lx, rkey=0x%x, lkey=0x%x", i,
+           info->baseVas[i], info->rkeys[i], info->lkeys[i]);
+    }
+  }
+
+  *outInfo = info;
+  return flagcxSuccess;
+
+fail_mr:
+  if (info) {
+    free(info->lkeys);
+    free(info->rkeys);
+    free(info->baseVas);
+    free(info);
+  }
+  if (mrHandle != NULL) {
+    void *regComm = recvComm;
+    if (net->name && strcmp(net->name, "IB") == 0) {
+      struct flagcxIbRecvComm *ibRecvComm = (struct flagcxIbRecvComm *)regComm;
+      regComm = (void *)&ibRecvComm->base;
+    }
+    net->deregMr(regComm, mrHandle);
+  }
+  return res;
+}
+
+flagcxResult_t
+flagcxOneSideBarrierDeregister(const flagcxComm_t comm,
+                               struct flagcxOneSideHandleInfo *info) {
+  if (info == NULL)
+    return flagcxSuccess;
+  if (comm == NULL)
+    return flagcxInternalError;
+
+  struct flagcxHeteroComm *heteroComm = comm->heteroComm;
+  if (heteroComm != NULL && heteroComm->netAdaptor != NULL) {
+    if (info->localMrHandle != NULL && info->localRecvComm != NULL) {
+      void *regComm = info->localRecvComm;
+      if (heteroComm->netAdaptor->name &&
+          strcmp(heteroComm->netAdaptor->name, "IB") == 0) {
+        struct flagcxIbRecvComm *ibRecvComm =
+            (struct flagcxIbRecvComm *)regComm;
+        regComm = (void *)&ibRecvComm->base;
+      }
+      heteroComm->netAdaptor->deregMr(regComm, info->localMrHandle);
+    }
+  }
+
+  free(info->baseVas);
+  free(info->rkeys);
+  free(info->lkeys);
+  free(info);
   return flagcxSuccess;
 }
 
@@ -608,6 +923,9 @@ flagcxResult_t flagcxCommRegister(const flagcxComm_t comm, void *buff,
   flagcxResult_t res = flagcxSuccess;
 
   // Step 2a: Homo path — backend CCL registration
+  // NCCL handles IPC/VMM internally via ncclCommRegister, so skip Step 2b
+  // (cudaIpcGetMemHandle is incompatible with ncclMemAlloc VMM buffers)
+  // and Step 3 (one-sided MR registration, hetero-only).
   if (useHomoComm(comm) && !useHeteroComm()) {
     void *homoHandle = nullptr;
     res = cclAdaptors[flagcxCCLAdaptorDevice]->commRegister(
@@ -615,9 +933,10 @@ flagcxResult_t flagcxCommRegister(const flagcxComm_t comm, void *buff,
     if (res != flagcxSuccess)
       goto fail;
     regItem->homoRegHandle = homoHandle;
+    return flagcxSuccess;
   }
 
-  // Step 2b: Create IPC handle for the buffer (both paths)
+  // Step 2b: Create IPC handle for the buffer (hetero path only)
   {
     flagcxIpcMemHandle_t handlePtr = nullptr;
     size_t ipcSize = 0;
@@ -636,6 +955,15 @@ flagcxResult_t flagcxCommRegister(const flagcxComm_t comm, void *buff,
     }
     memcpy(&regItem->ipcHandleData, handlePtr, ipcSize);
     deviceAdaptor->ipcMemHandleFree(handlePtr);
+  }
+
+  // Step 3: One-sided MR registration (hetero path only)
+  {
+    flagcxResult_t regRes = flagcxOneSideRegister(comm, buff, size);
+    if (regRes != flagcxSuccess) {
+      INFO(FLAGCX_REG, "flagcxCommRegister: one-sided register skipped (%d)",
+           regRes);
+    }
   }
 
   return flagcxSuccess;
@@ -1192,18 +1520,6 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
   free(comm->localRankToRank);
   free(comm->c2cSchedule);
 
-  // Destroy bootstrap state and net
-  bootstrapClose(comm->bootstrap);
-
-  if (!useHomoComm(comm)) {
-    // Destroy hetero comm
-    FLAGCXCHECK(flagcxHeteroCommDestroy(comm->heteroComm));
-    // Destroy host comm
-    if (useHostComm()) {
-      FLAGCXCHECK(
-          cclAdaptors[flagcxCCLAdaptorHost]->commDestroy(comm->hostComm));
-    }
-  }
   // Destroy homo comms
   if (comm->tuner) {
     for (const auto &item : comm->homoCommMap) {
@@ -1216,6 +1532,26 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
     FLAGCXCHECK(
         cclAdaptors[flagcxCCLAdaptorDevice]->commDestroy(comm->homoComm));
   }
+
+  if (!useHomoComm(comm)) {
+    // Destroy hetero comm
+    FLAGCXCHECK(flagcxHeteroCommDestroy(comm->heteroComm));
+    // Destroy host comm
+    if (useHostComm()) {
+      FLAGCXCHECK(
+          cclAdaptors[flagcxCCLAdaptorHost]->commDestroy(comm->hostComm));
+    }
+  }
+
+  // Clean up IPC peer pointer table — deferred to here.
+  FLAGCXCHECK(flagcxCommCleanupIpcTable(comm));
+
+  // Drain deferred device/host-pinned memory frees,
+  // collected during DevComm/DevMem cleanup.
+  FLAGCXCHECK(flagcxCommDrainDeferredFrees(comm));
+
+  // Destroy bootstrap state and net
+  bootstrapClose(comm->bootstrap);
 
   // Destroy tuner
   if (comm->tuner) {

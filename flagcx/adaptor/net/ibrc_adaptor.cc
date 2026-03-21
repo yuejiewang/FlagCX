@@ -2422,16 +2422,19 @@ flagcxResult_t flagcxIbGetProperties(int dev, void *props) {
 }
 flagcxResult_t flagcxIbIput(void *sendComm, uint64_t srcOff, uint64_t dstOff,
                             size_t size, int srcRank, int dstRank,
-                            void **gHandles, void **request) {
+                            void **srcHandles, void **dstHandles,
+                            void **request) {
   struct flagcxIbSendComm *comm = (struct flagcxIbSendComm *)sendComm;
-  struct flagcxIbGlobalHandleInfo *info =
-      (struct flagcxIbGlobalHandleInfo *)gHandles;
+  struct flagcxOneSideHandleInfo *srcInfo =
+      (struct flagcxOneSideHandleInfo *)srcHandles;
+  struct flagcxOneSideHandleInfo *dstInfo =
+      (struct flagcxOneSideHandleInfo *)dstHandles;
 
   struct flagcxIbQp *qp = &comm->base.qps[0];
-  void *srcPtr = (void *)(info->baseVas[srcRank] + srcOff);
-  void *dstPtr = (void *)(info->baseVas[dstRank] + dstOff);
-  int lkey = info->lkeys[srcRank];
-  int rkey = info->rkeys[dstRank];
+  void *srcPtr = (void *)(srcInfo->baseVas[srcRank] + srcOff);
+  void *dstPtr = (void *)(dstInfo->baseVas[dstRank] + dstOff);
+  int lkey = srcInfo->lkeys[srcRank];
+  int rkey = dstInfo->rkeys[dstRank];
   struct flagcxIbRequest *req;
   FLAGCXCHECK(flagcxIbGetRequest(&comm->base, &req));
   req->type = FLAGCX_NET_IB_REQ_IPUT;
@@ -2475,12 +2478,12 @@ flagcxResult_t flagcxIbIputSignal(void *sendComm, uint64_t srcOff,
                                   uint64_t dstOff, size_t size, int srcRank,
                                   int dstRank, void **dataHandles,
                                   uint64_t signalOff, void **signalHandles,
-                                  void **request) {
+                                  uint64_t signalValue, void **request) {
   struct flagcxIbSendComm *comm = (struct flagcxIbSendComm *)sendComm;
-  struct flagcxIbGlobalHandleInfo *dataInfo =
-      (struct flagcxIbGlobalHandleInfo *)dataHandles;
-  struct flagcxIbGlobalHandleInfo *signalInfo =
-      (struct flagcxIbGlobalHandleInfo *)signalHandles;
+  struct flagcxOneSideHandleInfo *dataInfo =
+      (struct flagcxOneSideHandleInfo *)dataHandles;
+  struct flagcxOneSideHandleInfo *signalInfo =
+      (struct flagcxOneSideHandleInfo *)signalHandles;
   if (signalInfo == NULL || signalInfo->baseVas == NULL) {
     WARN("flagcxIbIputSignal: signalHandles is NULL or uninitialized");
     return flagcxInternalError;
@@ -2537,7 +2540,7 @@ flagcxResult_t flagcxIbIputSignal(void *sendComm, uint64_t srcOff,
   wr[1].wr_id = req - comm->base.reqs;
   wr[1].next = NULL;
   wr[1].wr.atomic.remote_addr = (uint64_t)signalPtr;
-  wr[1].wr.atomic.compare_add = 1;
+  wr[1].wr.atomic.compare_add = signalValue;
   wr[1].wr.atomic.rkey = signalRkey;
   wr[1].sg_list = &sge[1];
   wr[1].num_sge = 1;

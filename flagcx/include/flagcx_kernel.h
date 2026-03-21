@@ -14,7 +14,10 @@ typedef enum {
   flagcxDevicePrimWait = 3,
   flagcxDevicePrimPut = 4,
   flagcxDevicePrimSignal = 5,
-  flagcxDevicePrimBarrierSignal = 6
+  flagcxDevicePrimBarrierSignal = 6,
+  flagcxDevicePrimWaitSignal = 7,
+  flagcxDevicePrimPutValue = 8,
+  flagcxDevicePrimPutSignal = 9
 } flagcxDevicePrim;
 
 // Unified buffer index enumeration for fifo
@@ -35,28 +38,78 @@ typedef enum {
   flagcxReduceTriggerComplete = 3
 } flagcxReduceTriggerState;
 
-constexpr unsigned int flagcxDeviceTriggerBitsAddr = 64;
-constexpr unsigned int flagcxDeviceTriggerOffCount = 0;
-constexpr unsigned int flagcxDeviceTriggerBitsCount = 32;
-constexpr unsigned int flagcxDeviceTriggerOffPeerRank =
-    flagcxDeviceTriggerOffCount + flagcxDeviceTriggerBitsCount;
-constexpr unsigned int flagcxDeviceTriggerBitsPeerRank = 20;
-constexpr unsigned int flagcxDeviceTriggerOffDatatype =
-    flagcxDeviceTriggerOffPeerRank + flagcxDeviceTriggerBitsPeerRank;
-constexpr unsigned int flagcxDeviceTriggerBitsDatatype = 4;
-constexpr unsigned int flagcxDeviceTriggerOffPrim =
-    flagcxDeviceTriggerOffDatatype + flagcxDeviceTriggerBitsDatatype;
-constexpr unsigned int flagcxDeviceTriggerBitsPrim = 4;
-constexpr unsigned int flagcxDeviceTriggerBitsFifoReserved = 1;
-// Valid bit for lock-free MPSC FIFO (bit 63 of snd field)
+// ==========================================================================
+// flagcxDeviceTrigger bit layout (24 bytes = 3 × uint64_t: fst, snd, trd)
+//
+// trd (word2, control header — written last with valid bit):
+//   [63]    valid
+//   [62:59] prim (4 bits)
+//   [58:39] peerRank (20 bits)
+//   [38:36] slotIdx (3 bits, reserved for future multi-FIFO)
+//   [35:0]  prim-specific (36 bits)
+//
+// fst (word0, payload — written first):
+//   prim-specific (64 bits)
+//
+// snd (word1, payload — written second):
+//   prim-specific (64 bits)
+// ==========================================================================
+
+// Valid bit (trd[63])
 constexpr unsigned int flagcxDeviceTriggerOffValid = 63;
 constexpr uint64_t flagcxDeviceTriggerValidMask = (1ULL << 63);
 
-// Offset fields in fst (when used for PUT operations)
+// Common header in trd
+constexpr unsigned int flagcxDeviceTriggerOffPrim = 59;
+constexpr unsigned int flagcxDeviceTriggerBitsPrim = 4;
+constexpr unsigned int flagcxDeviceTriggerOffPeerRank = 39;
+constexpr unsigned int flagcxDeviceTriggerBitsPeerRank = 20;
+constexpr unsigned int flagcxDeviceTriggerOffSlotIdx = 36;
+constexpr unsigned int flagcxDeviceTriggerBitsSlotIdx = 3;
+
+// Two-sided Send/Recv: trd prim-specific
+//   trd[35:32] = datatype(4), trd[31:0] = count(32)
+//   fst = addr(64), snd = 0
+constexpr unsigned int flagcxDeviceTriggerOffDatatype = 32;
+constexpr unsigned int flagcxDeviceTriggerBitsDatatype = 4;
+constexpr unsigned int flagcxDeviceTriggerOffCount = 0;
+constexpr unsigned int flagcxDeviceTriggerBitsCount = 32;
+
+// One-sided Put/PutSignal: trd prim-specific
+//   trd[35:29] = srcMrIdx(7), trd[28:22] = dstMrIdx(7)
+//   PutSignal: trd[14:7] = signalIdx(8)
+//   fst = srcOffset(32)|dstOffset(32), snd = size(32)|reserved(32)
+constexpr unsigned int flagcxDeviceTriggerOffSrcMrIdx = 29;
+constexpr unsigned int flagcxDeviceTriggerBitsSrcMrIdx = 7;
+constexpr unsigned int flagcxDeviceTriggerOffDstMrIdx = 22;
+constexpr unsigned int flagcxDeviceTriggerBitsDstMrIdx = 7;
+constexpr unsigned int flagcxDeviceTriggerOffSignalIdx = 7;
+constexpr unsigned int flagcxDeviceTriggerBitsSignalIdx = 8;
+// fst offsets for srcOffset/dstOffset (shared with PutValue dstOffset accessor)
 constexpr unsigned int flagcxDeviceTriggerOffSrcOffset = 32;
 constexpr unsigned int flagcxDeviceTriggerBitsSrcOffset = 32;
 constexpr unsigned int flagcxDeviceTriggerOffDstOffset = 0;
 constexpr unsigned int flagcxDeviceTriggerBitsDstOffset = 32;
+// snd offset for size
+constexpr unsigned int flagcxDeviceTriggerOffSize = 32;
+constexpr unsigned int flagcxDeviceTriggerBitsSize = 32;
+
+// One-sided PutValue: trd prim-specific
+//   trd[28:22] = dstMrIdx(7) (same position as Put/PutSignal dstMrIdx)
+//   fst = 0|dstOffset(32) (fst[31:0], same position as Put/PutSignal)
+//   snd = value(64)
+
+// Signal/WaitSignal: all in trd prim-specific
+//   trd[35:34] = bufferType(2), trd[33:26] = signalIdx(8),
+//   trd[25:2] = signalValue/expectedValue(24)
+//   fst = 0, snd = 0
+constexpr unsigned int flagcxDeviceTriggerOffBufferType = 34;
+constexpr unsigned int flagcxDeviceTriggerBitsBufferType = 2;
+constexpr unsigned int flagcxDeviceTriggerOffSignalIdxSig = 26;
+constexpr unsigned int flagcxDeviceTriggerBitsSignalIdxSig = 8;
+constexpr unsigned int flagcxDeviceTriggerOffSignalValue = 2;
+constexpr unsigned int flagcxDeviceTriggerBitsSignalValue =
+    24; // max signal value: 2^24 (~16M)
 
 constexpr unsigned int flagcxReduceTriggerBitsAddr = 64;
 constexpr unsigned int flagcxReduceTriggerOffCount = 0;
@@ -77,19 +130,35 @@ constexpr unsigned int flagcxReduceTriggerBitsState = 2;
 constexpr unsigned int flagcxReduceTriggerBitsFifoReserved = 1;
 
 struct flagcxDeviceTrigger {
-  uint64_t fst;
-  uint64_t snd;
+  uint64_t fst; // word0 — payload, written first
+  uint64_t snd; // word1 — payload, written second
+  uint64_t trd; // word2 — control header (valid bit), written last
 
-  FLAGCX_HOST_DECORATOR uint64_t getAddr();
-  FLAGCX_HOST_DECORATOR uint64_t getCount();
+  // Common accessors (trd common header)
+  FLAGCX_HOST_DECORATOR uint64_t getPrim();
   FLAGCX_HOST_DECORATOR uint64_t getPeerRank();
-  FLAGCX_HOST_DECORATOR uint64_t getDatatype();
-  FLAGCX_HOST_DECORATOR uint64_t getType();
-  FLAGCX_HOST_DECORATOR uint64_t getSrcOffset();
-  FLAGCX_HOST_DECORATOR uint64_t getDstOffset();
-  FLAGCX_DEVICE_DECORATOR void setValue(uint64_t addr, uint64_t count,
-                                        uint64_t peerRank, uint64_t datatype,
-                                        uint64_t type);
+  FLAGCX_HOST_DECORATOR uint64_t getSlotIdx();
+
+  // Two-sided accessors (Send/Recv)
+  FLAGCX_HOST_DECORATOR uint64_t getAddr();     // fst
+  FLAGCX_HOST_DECORATOR uint64_t getDatatype(); // trd[35:32]
+  FLAGCX_HOST_DECORATOR uint64_t getCount();    // trd[31:0]
+
+  // One-sided accessors (Put/PutSignal/PutValue)
+  FLAGCX_HOST_DECORATOR uint64_t getSrcMrIdx();  // trd[35:29]
+  FLAGCX_HOST_DECORATOR uint64_t getDstMrIdx();  // trd[28:22]
+  FLAGCX_HOST_DECORATOR uint64_t getSize();      // snd[63:32]
+  FLAGCX_HOST_DECORATOR uint64_t getSrcOffset(); // fst[63:32]
+  FLAGCX_HOST_DECORATOR uint64_t getDstOffset(); // fst[31:0]
+  FLAGCX_HOST_DECORATOR uint64_t getValue();     // snd (PutValue)
+  FLAGCX_HOST_DECORATOR uint64_t
+  getSignalIdx(); // trd (PutSignal/Signal/WaitSignal)
+  FLAGCX_HOST_DECORATOR uint64_t getSignalValue();   // trd (Signal)
+  FLAGCX_HOST_DECORATOR uint64_t getExpectedValue(); // trd (WaitSignal)
+  FLAGCX_HOST_DECORATOR uint64_t getBufferType();    // trd (Signal/WaitSignal)
+
+  // Backward compat alias
+  FLAGCX_HOST_DECORATOR uint64_t getType(); // alias for getPrim()
 };
 typedef flagcxDeviceTrigger *flagcxDeviceTrigger_t;
 
@@ -151,9 +220,6 @@ getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype);
 FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer);
 #endif // COMPILE_KERNEL
 
-void flagcxP2pDemo(const void *sendbuff, void *recvbuff, size_t count,
-                   flagcxDataType_t datatype, int sendPeer, int recvPeer,
-                   flagcxComm_t comm, flagcxStream_t stream);
 void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
                                   size_t nblocks, flagcxStream_t stream);
 
@@ -162,7 +228,7 @@ void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
 // ==========================================================================
 
 // Requirements for creating a device communicator.
-// Named fields map to NCCL ncclDevCommRequirements (Tier 1).
+// Named fields map to NCCL ncclDevCommRequirements (Vendor).
 // Naming: NCCL "lsa" → FlagCX "intra", "gin" → "inter", "multimem" →
 // "multicast".
 struct flagcxDevCommRequirements {
@@ -236,26 +302,31 @@ flagcxResult_t flagcxInterBarrierCreateRequirement(
     flagcxInterBarrierHandle_t *outHandle, flagcxDevCommRequirements *outReq);
 
 // Opaque handle to a device communicator (host-side lifetime management).
-// Internally wraps ncclDevComm on NVIDIA backend (Tier 1),
-// or IPC barrier state on fallback (Tier 2).
+// Internally wraps ncclDevComm on NVIDIA backend (Vendor),
+// or IPC barrier state on fallback (Fallback).
 typedef struct flagcxDevCommInternal *flagcxDevComm_t;
 
 // Opaque handle to device memory (host-side lifetime management).
-// Internally wraps ncclWindow_t on NVIDIA backend (Tier 1),
-// or IPC peer pointer table on fallback (Tier 2).
+// Internally wraps ncclWindow_t on NVIDIA backend (Vendor),
+// or IPC peer pointer table on fallback (Fallback).
 #ifndef FLAGCX_DEV_MEM_T_DEFINED
 #define FLAGCX_DEV_MEM_T_DEFINED
 typedef struct flagcxDevMemInternal *flagcxDevMem_t;
 #endif
 
-// Unified inter-node AlltoAll demo.
-// Runtime dispatch: one-sided (put + signal) if window available (Tier 1 -R 2),
-// two-sided (send/recv + FIFO) otherwise (all tiers, all -R modes).
-flagcxResult_t flagcxInterAlltoAllDemo(flagcxDevMem_t sendMem,
-                                       flagcxDevMem_t recvMem, size_t count,
-                                       flagcxDataType_t datatype,
-                                       flagcxDevComm_t devComm,
-                                       flagcxStream_t stream);
+// Inter-node one-sided AlltoAll (put + waitSignal + flush).
+flagcxResult_t flagcxInterOneSidedAlltoAll(flagcxDevMem_t sendMem,
+                                           flagcxDevMem_t recvMem, size_t count,
+                                           flagcxDataType_t datatype,
+                                           flagcxDevComm_t devComm,
+                                           flagcxStream_t stream);
+
+// Inter-node two-sided AlltoAll (send/recv + term/wait via FIFO).
+flagcxResult_t flagcxInterTwoSidedAlltoAll(flagcxDevMem_t sendMem,
+                                           flagcxDevMem_t recvMem, size_t count,
+                                           flagcxDataType_t datatype,
+                                           flagcxDevComm_t devComm,
+                                           flagcxStream_t stream);
 
 // Kernel launch configuration constants.
 // Also defined in device_api/flagcx_device.h (with same include guard).
@@ -267,8 +338,8 @@ flagcxResult_t flagcxInterAlltoAllDemo(flagcxDevMem_t sendMem,
 #endif
 
 // Create a device communicator for custom kernel usage.
-// On NVIDIA backend (Tier 1), internally calls pncclDevCommCreate.
-// On fallback (Tier 2), sets up IPC-based barrier across intra-node peers.
+// On NVIDIA backend (Vendor), internally calls pncclDevCommCreate.
+// On fallback (Fallback), sets up IPC-based barrier across intra-node peers.
 // The returned handle must be destroyed with flagcxDevCommDestroy(comm,
 // devComm).
 flagcxResult_t flagcxDevCommCreate(flagcxComm_t comm,
@@ -290,6 +361,16 @@ flagcxResult_t flagcxDevMemCreate(flagcxComm_t comm, void *buff, size_t size,
 // Destroy a device memory handle created by flagcxDevMemCreate.
 flagcxResult_t flagcxDevMemDestroy(flagcxComm_t comm, flagcxDevMem_t devMem);
 
+// Clean up IPC peer pointer table on comm.
+// Must be called after homoComm destroy.
+// so that cudaFree does not deadlock on device synchronization.
+flagcxResult_t flagcxCommCleanupIpcTable(flagcxComm_t comm);
+
+// Deferred device/host-pinned memory free.
+// Collects pointers during DevComm/DevMem cleanup.
+void flagcxCommDeferFree(flagcxComm_t comm, void *ptr, int memType);
+flagcxResult_t flagcxCommDrainDeferredFrees(flagcxComm_t comm);
+
 // One-sided data buffer registration.
 // Must be called after flagcxCommInitRank and before one-sided operations.
 flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
@@ -304,21 +385,34 @@ flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
 // Release signal buffer resources (MR, network connections, handle arrays).
 flagcxResult_t flagcxOneSideSignalDeregister(const flagcxComm_t comm);
 
+// One-sided staging buffer registration (host-pinned memory for PutValue).
+// Must be called after flagcxOneSideSignalRegister (requires full-mesh
+// connections).
+flagcxResult_t flagcxOneSideStagingRegister(const flagcxComm_t comm, void *buff,
+                                            size_t size);
+// Release staging buffer MR resources.
+flagcxResult_t flagcxOneSideStagingDeregister(const flagcxComm_t comm);
+
+// One-sided barrier MR registration (host-pinned memory for inter-node
+// barrier). Collective: ALL ranks must call. Leaders pass recvComm+buff,
+// non-leaders pass NULL.
+flagcxResult_t
+flagcxOneSideBarrierRegister(const flagcxComm_t comm, void *recvComm,
+                             void *buff, size_t size,
+                             struct flagcxOneSideHandleInfo **outInfo);
+// Release barrier MR and free handle info.
+flagcxResult_t
+flagcxOneSideBarrierDeregister(const flagcxComm_t comm,
+                               struct flagcxOneSideHandleInfo *info);
+
 // Intra-node AllReduce using FlagCX Device API.
 // The caller provides a registered buffer (via flagcxDevMemCreate)
 // already containing the input data.  The kernel runs an in-place
 // AllReduce across all intra-node GPUs.
 // devComm must be created via flagcxDevCommCreate beforehand.
-flagcxResult_t flagcxIntraAllReduceDemo(flagcxDevMem_t devMem, size_t count,
-                                        flagcxDataType_t datatype,
-                                        flagcxDevComm_t devComm,
-                                        flagcxStream_t stream);
+flagcxResult_t flagcxIntraAllReduce(flagcxDevMem_t devMem, size_t count,
+                                    flagcxDataType_t datatype,
+                                    flagcxDevComm_t devComm,
+                                    flagcxStream_t stream);
 
-void flagcxOnesidedSendDemo(size_t srcOffset, size_t dstOffset,
-                            size_t signalOffset, size_t count,
-                            flagcxDataType_t datatype, int peer,
-                            flagcxDevComm_t devComm, flagcxStream_t stream);
-void flagcxOnesidedRecvDemo(volatile uint64_t *waitAddr, uint64_t expectedValue,
-                            volatile int *errorFlag, flagcxDevComm_t devComm,
-                            flagcxStream_t stream);
 #endif

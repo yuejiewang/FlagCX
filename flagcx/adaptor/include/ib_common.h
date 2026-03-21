@@ -12,8 +12,12 @@
 #include "ibvcore.h"
 #include "ibvwrap.h"
 #include "net.h"
+#include "onesided.h"
 #include <pthread.h>
 #include <stdint.h>
+
+// Backward-compat alias so adaptor code can keep using the old name.
+typedef struct flagcxOneSideHandleInfo flagcxIbGlobalHandleInfo;
 
 #define MAXNAMESIZE 64
 #define MAX_IB_DEVS 32
@@ -120,21 +124,6 @@ struct flagcxIbGidInfo {
 struct flagcxIbMrHandle {
   ibv_mr *mrs[FLAGCX_IB_MAX_DEVS_PER_NIC];
 };
-
-// Structure to store handle info for allgather
-struct flagcxIbGlobalHandleInfo {
-  uintptr_t *baseVas;
-  uint32_t *rkeys;
-  uint32_t *lkeys;
-  void *localMrHandle; // local rank's MR handle for iflush
-  void *localRecvComm; // local recvComm for iflush (gpuFlush QP)
-  void *localSendComm; // local sendComm for cleanup
-};
-
-// Global variable for one-sided data handles
-extern struct flagcxIbGlobalHandleInfo *globalOneSideHandles;
-// Global variable for one-sided signal handles (separate MR, NCCL-style)
-extern struct flagcxIbGlobalHandleInfo *globalOneSideSignalHandles;
 
 #define FLAGCX_NET_IB_REQ_UNUSED 0
 #define FLAGCX_NET_IB_REQ_SEND 1
