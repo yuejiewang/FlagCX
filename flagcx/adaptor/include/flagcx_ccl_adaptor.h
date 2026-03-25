@@ -16,8 +16,17 @@ extern "C" {
 typedef struct flagcxInnerComm *flagcxInnerComm_t;
 struct bootstrapState;
 
-struct flagcxCCLAdaptor {
-  const char name[32];
+// Version history:
+//   v1 — 34 function pointers: getVersion, getUniqueId, getErrorString,
+//         getLastError, getStagedBuffer, commInitRank, commFinalize,
+//         commDestroy, commAbort, commResume, commSuspend, commCount,
+//         commGetDeviceNumber, commUserRank, commGetAsyncError, memAlloc,
+//         memFree, commRegister, commDeregister, commWindowRegister,
+//         commWindowDeregister, reduce, gather, scatter, broadcast,
+//         allReduce, reduceScatter, allGather, alltoAll, alltoAllv,
+//         send, recv, groupStart, groupEnd
+struct flagcxCCLAdaptor_v1 {
+  const char *name;
   // Basic functions
   flagcxResult_t (*getVersion)(int *version);
   flagcxResult_t (*getUniqueId)(flagcxUniqueId_t *uniqueId);
@@ -97,13 +106,10 @@ struct flagcxCCLAdaptor {
   flagcxResult_t (*groupStart)();
   flagcxResult_t (*groupEnd)();
 };
+#define flagcxCCLAdaptor flagcxCCLAdaptor_v1
 
-// CCL adaptor plugin API version (independent of Device/Net versions)
-#define FLAGCX_CCL_ADAPTOR_PLUGIN_VERSION 1
-
-// Versioned export symbol name — plugin libraries must export a global
-// struct flagcxCCLAdaptor with this name
-#define FLAGCX_CCL_ADAPTOR_PLUGIN_SYMBOL flagcxCCLAdaptorPlugin_v1
+// Versioned export symbol name
+#define FLAGCX_CCL_ADAPTOR_PLUGIN_SYMBOL_V1 flagcxCCLAdaptorPlugin_v1
 
 #ifdef __cplusplus
 } // end extern "C"

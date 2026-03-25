@@ -1,5 +1,3 @@
-#ifdef USE_NVIDIA_ADAPTOR
-
 #include "flagcx.h"
 #include "nccl.h"
 #include <cuda.h>
@@ -81,5 +79,3 @@ struct flagcxWindow {
     if (ret != cudaSuccess)                                                    \
       return flagcxUnhandledDeviceError;                                       \
   }
-
-#endif // USE_NVIDIA_ADAPTOR

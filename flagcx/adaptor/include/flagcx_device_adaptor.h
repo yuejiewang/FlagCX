@@ -11,15 +11,23 @@
 extern "C" {
 #endif
 
-// Forward declaration for opaque types not in flagcx.h
-// (flagcxStream_t, flagcxEvent_t, flagcxIpcMemHandle_t are already typedef'd in
-// flagcx.h)
-struct flagcxDevProps;
+// Device properties — defined here so plugin authors have the full layout.
+struct flagcxDevProps {
+  char name[256];
+  int pciBusId;
+  int pciDeviceId;
+  int pciDomainId;
+};
 
 // C-compatible typedef matching the C++ using alias in dlsymbols.h.
 typedef void (*flagcxLaunchFunc_t)(flagcxStream_t, void *);
 
-struct flagcxDeviceAdaptor {
+// Version history:
+//   v1 — Initial version with basic device functions, GDR functions,
+//         stream/event/IPC functions, kernel launch, device properties,
+//         host func launch, DMA buffer, event elapsed time, and
+//         stream memory operations.
+struct flagcxDeviceAdaptor_v1 {
   char name[32];
   // Basic functions
   flagcxResult_t (*deviceSynchronize)();
@@ -106,12 +114,13 @@ struct flagcxDeviceAdaptor {
                                              size_t size,
                                              unsigned long long flags);
 };
+#define flagcxDeviceAdaptor flagcxDeviceAdaptor_v1
 
 // Device adaptor plugin API version (independent of CCL/Net versions)
 #define FLAGCX_DEVICE_ADAPTOR_PLUGIN_VERSION 1
 
 // Versioned export symbol name
-#define FLAGCX_DEVICE_ADAPTOR_PLUGIN_SYMBOL flagcxDeviceAdaptorPlugin_v1
+#define FLAGCX_DEVICE_ADAPTOR_PLUGIN_SYMBOL_V1 flagcxDeviceAdaptorPlugin_v1
 
 #ifdef __cplusplus
 } // end extern "C"
