@@ -18,16 +18,17 @@ typedef enum {
       (1 << 0), // Force strong ordering (disable relaxed ordering)
 } flagcxNetMrFlag_t;
 
-struct flagcxNetAdaptor {
+// Version history:
+//   v1 — 22 function pointers: name, init, devices, getProperties,
+//         listen, connect, accept, closeSend, closeRecv, closeListen,
+//         regMr, regMrDmaBuf, deregMr, isend, irecv, iflush, test,
+//         iput, iget, iputSignal, getDevFromName
+struct flagcxNetAdaptor_v1 {
   // Basic functions
   const char *name;
   flagcxResult_t (*init)();
   flagcxResult_t (*devices)(int *ndev);
   flagcxResult_t (*getProperties)(int dev, void *props);
-  flagcxResult_t (*reduceSupport)(flagcxDataType_t dataType,
-                                  flagcxRedOp_t redOp, int *supported);
-  flagcxResult_t (*getDeviceMr)(void *comm, void *mhandle, void **dptr_mhandle);
-  flagcxResult_t (*irecvConsumed)(void *recvComm, int n, void *request);
 
   // Setup functions
   flagcxResult_t (*listen)(int dev, void *handle, void **listenComm);
@@ -74,12 +75,10 @@ struct flagcxNetAdaptor {
   // Device name lookup
   flagcxResult_t (*getDevFromName)(char *name, int *dev);
 };
-
-// Net adaptor plugin API version (independent of CCL/Device versions)
-#define FLAGCX_NET_ADAPTOR_PLUGIN_VERSION 1
+#define flagcxNetAdaptor flagcxNetAdaptor_v1
 
 // Versioned export symbol name
-#define FLAGCX_NET_ADAPTOR_PLUGIN_SYMBOL flagcxNetAdaptorPlugin_v1
+#define FLAGCX_NET_ADAPTOR_PLUGIN_SYMBOL_V1 flagcxNetAdaptorPlugin_v1
 
 #ifdef __cplusplus
 } // end extern "C"
