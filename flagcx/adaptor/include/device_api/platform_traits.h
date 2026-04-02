@@ -7,8 +7,8 @@
  *   - Intrin: SIMT intrinsics (lane, activemask, syncwarp, popc, ...)
  *   - Atomic: Scoped atomic operations (load, store, fetchAdd, ...)
  *
- * Each platform (NVIDIA, Cambricon, ...) provides a specialization.
- * DeviceTraits<D> pulls in platform capabilities via using-aliases.
+ * Each platform (NVIDIA, DU, ...) provides a specialization.
+ * CommTraits<D> pulls in platform capabilities via using-aliases.
  ************************************************************************/
 
 #ifndef FLAGCX_PLATFORM_TRAITS_H_
@@ -111,13 +111,12 @@ private:
 };
 
 // Include platform specializations
-#ifdef USE_NVIDIA_ADAPTOR
+#if defined(USE_NVIDIA_ADAPTOR)
 #include "nvidia_platform_traits.h"
+#elif defined(USE_DU_ADAPTOR)
+#include "du_platform_traits.h"
+#else
+#include "fallback_platform_traits.h"
 #endif
-
-// Future:
-// #ifdef USE_CAMBRICON_ADAPTOR
-// #include "cambricon_platform_traits.h"
-// #endif
 
 #endif // FLAGCX_PLATFORM_TRAITS_H_

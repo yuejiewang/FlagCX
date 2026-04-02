@@ -535,7 +535,7 @@ flagcxResult_t flagcxOneSideDeregister(const flagcxComm_t comm) {
 }
 
 flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
-                                           size_t size) {
+                                           size_t size, int ptrType) {
   if (useHomoComm(comm) && !useHeteroComm()) {
     return flagcxSuccess;
   }
@@ -549,11 +549,17 @@ flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
     return flagcxSuccess;
   }
 
+  // Validate ptrType — only known pointer types are accepted.
+  if (ptrType != FLAGCX_PTR_HOST && ptrType != FLAGCX_PTR_CUDA &&
+      ptrType != FLAGCX_PTR_DMABUF) {
+    WARN("flagcxOneSideSignalRegister: invalid ptrType %d", ptrType);
+    return flagcxInvalidArgument;
+  }
+
   struct flagcxHeteroComm *heteroComm = comm->heteroComm;
   if (heteroComm == NULL || heteroComm->netAdaptor == NULL ||
       heteroComm->netAdaptor->iputSignal == NULL ||
       heteroComm->netAdaptor->regMr == NULL) {
-    INFO(FLAGCX_REG, "flagcxOneSideSignalRegister: heteroComm is NULL");
     return flagcxSuccess;
   }
 
@@ -588,8 +594,7 @@ flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
   }
 
   {
-    int type = FLAGCX_PTR_CUDA;
-    res = heteroComm->netAdaptor->regMr(regComm, buff, size, type,
+    res = heteroComm->netAdaptor->regMr(regComm, buff, size, ptrType,
                                         FLAGCX_NET_MR_FLAG_FORCE_SO, &mrHandle);
   }
   if (res != flagcxSuccess || mrHandle == NULL) {
