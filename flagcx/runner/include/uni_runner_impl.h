@@ -16,6 +16,13 @@
 #include <memory>
 #include <pthread.h>
 
+typedef struct {
+  void *base;
+  size_t bytes;
+  int transport;
+  bool deviceAccessible;
+} uniRunnerTransportBufferView;
+
 // DAG node types
 typedef enum {
   uniRunnerDagNodeTypeP2p = 0,
@@ -36,6 +43,8 @@ struct uniRunnerP2pOpData {
 struct uniRunnerP2pNodeData {
   struct uniRunnerP2pOpData *ops; // Array of P2P operations
   int numOps;                     // Number of operations
+  int useInternalTransportSubmit; // 0: legacy HeteroSend/Recv, 1: internal
+                                  // submit
 };
 
 // Reduce node data (operation-specific fields only)
@@ -105,6 +114,12 @@ typedef struct {
 
   // Stream completion flags, one uint64_t per DAG node.
   void *streamFlags;
+
+  // Per-node completion semaphore lifetime for transport-submitted P2P ops.
+  std::shared_ptr<flagcxSemaphore> *nodeSemaphores;
+
+  // Registration handle for the transport work buffer used by zero-copy DAGs.
+  void *transportWorkBufferRegHandle;
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
@@ -130,6 +145,12 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
                                           size_t count,
                                           flagcxDataType_t datatype,
                                           flagcxRedOp_t op, flagcxComm_t comm);
+flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
+                                              const void *sendbuff,
+                                              void *recvbuff, size_t count,
+                                              flagcxDataType_t datatype,
+                                              flagcxRedOp_t op,
+                                              flagcxComm_t comm);
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,

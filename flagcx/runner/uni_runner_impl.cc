@@ -12,6 +12,7 @@
 #include "timer.h"
 
 #include <assert.h>
+#include <climits>
 #include <math.h>
 #include <string>
 #include <sys/syscall.h>
@@ -131,6 +132,133 @@ getDagNodeExecutionStream(flagcxUniRunnerState *runnerState,
     default:
       return NULL;
   }
+}
+
+static flagcxResult_t ensureUniRunnerPeerConnection(flagcxHeteroComm_t comm,
+                                                    int peer, bool isSend) {
+  if (comm == NULL || peer < 0 || peer >= comm->nRanks) {
+    return flagcxInvalidArgument;
+  }
+
+  const int channelId = 0;
+  flagcxConnector *conn = isSend ? comm->channels[channelId].peers[peer]->send
+                                 : comm->channels[channelId].peers[peer]->recv;
+  if (conn[0].connected == 1) {
+    return flagcxSuccess;
+  }
+
+  if (comm->proxyState->initialized == 0) {
+    FLAGCXCHECK(flagcxProxyInit(comm));
+  }
+
+  if (isSend) {
+    comm->connectSend[peer] |= (1UL << channelId);
+  } else {
+    comm->connectRecv[peer] |= (1UL << channelId);
+  }
+  conn[0].registered = 1;
+
+  FLAGCXCHECK(flagcxTransportP2pSetup(comm, NULL, 0));
+  return conn[0].connected == 1 ? flagcxSuccess : flagcxInternalError;
+}
+
+static flagcxResult_t
+getUniRunnerRecvTransportBuffer(flagcxHeteroComm_t comm, int peer,
+                                uniRunnerTransportBufferView *view) {
+  if (view == NULL) {
+    return flagcxInvalidArgument;
+  }
+
+  memset(view, 0, sizeof(*view));
+  FLAGCXCHECK(ensureUniRunnerPeerConnection(comm, peer, false));
+
+  flagcxConnector *conn = comm->channels[0].peers[peer]->recv;
+  if (conn[0].proxyConn.connection == NULL) {
+    return flagcxInternalError;
+  }
+
+  view->transport = conn[0].proxyConn.connection->transport;
+  if (view->transport == TRANSPORT_P2P) {
+    view->base = conn[0].conn.buffs[FLAGCX_PROTO_SIMPLE];
+    view->bytes = flagcxP2pBufferSize;
+    view->deviceAccessible = true;
+  } else if (view->transport == TRANSPORT_NET) {
+    recvNetResources *resources = reinterpret_cast<recvNetResources *>(
+        conn[0].proxyConn.connection->transportResources);
+    if (resources == NULL) {
+      return flagcxInternalError;
+    }
+    view->base = resources->buffers[0];
+    view->bytes = resources->buffSizes[0];
+    view->deviceAccessible =
+        resources->netAdaptor != getUnifiedNetAdaptor(SOCKET) &&
+        (resources->netAdaptor == getUnifiedNetAdaptor(IBRC) ||
+         (resources->ptrSupport & FLAGCX_PTR_CUDA));
+  } else {
+    return flagcxNotSupported;
+  }
+
+  if (view->base == NULL || view->bytes == 0) {
+    return flagcxInternalError;
+  }
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+registerUniRunnerWorkBuffer(flagcxUniRunnerState *runnerState,
+                            flagcxHeteroComm_t comm, void *base, size_t bytes) {
+  if (base == NULL || bytes == 0) {
+    return flagcxInvalidArgument;
+  }
+  if (runnerState->transportWorkBufferRegHandle != NULL) {
+    return flagcxSuccess;
+  }
+
+  FLAGCXCHECK(globalRegPool.registerBuffer(reinterpret_cast<void *>(comm), base,
+                                           bytes));
+  runnerState->transportWorkBufferRegHandle =
+      reinterpret_cast<void *>(globalRegPool.getItem(
+          reinterpret_cast<void *>(comm), static_cast<void *>(base)));
+  return runnerState->transportWorkBufferRegHandle != NULL
+             ? flagcxSuccess
+             : flagcxInternalError;
+}
+
+static int resolveUniRunnerZeroCopySlices(size_t maxRankChunkBytes,
+                                          size_t bankBytes,
+                                          int requestedSlices) {
+  if (requestedSlices <= 0) {
+    requestedSlices = 1;
+  }
+  if (maxRankChunkBytes == 0) {
+    return requestedSlices;
+  }
+  if (bankBytes == 0) {
+    return 0;
+  }
+
+  size_t minSlices = (maxRankChunkBytes + bankBytes - 1) / bankBytes;
+  if (minSlices == 0) {
+    minSlices = 1;
+  }
+  if (minSlices > static_cast<size_t>(INT_MAX)) {
+    return 0;
+  }
+  return std::max(requestedSlices, static_cast<int>(minSlices));
+}
+
+static flagcxResult_t validateUniRunnerTransportBufferRange(
+    const char *bufferName, int rank, int peer, int slice, int step,
+    size_t resourceBytes, size_t offset, size_t bytes) {
+  if (offset > resourceBytes || bytes > resourceBytes - offset) {
+    WARN(
+        "uniRunner transport buffer overflow: rank %d peer %d slice %d step %d "
+        "buffer %s offset %zu bytes %zu capacity %zu",
+        rank, peer, slice, step, bufferName ? bufferName : "unknown", offset,
+        bytes, resourceBytes);
+    return flagcxInternalError;
+  }
+  return flagcxSuccess;
 }
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState) {
@@ -1349,6 +1477,352 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   return validateDagNodes(runnerState);
 }
 
+flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
+                                              const void *sendbuff,
+                                              void *recvbuff, size_t count,
+                                              flagcxDataType_t datatype,
+                                              flagcxRedOp_t op,
+                                              flagcxComm_t comm) {
+  int rank = comm->rank;
+  int nranks = comm->nranks;
+
+  if (nranks < 1) {
+    return flagcxInvalidArgument;
+  } else if (nranks == 1) {
+    if (count > 0 && sendbuff != recvbuff) {
+      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                               sizeof(struct uniRunnerDagNode)));
+      if (runnerState->dagNodes == NULL) {
+        return flagcxSystemError;
+      }
+      runnerState->numDagNodes = 1;
+      runnerState->dagNodes[0].nodeIdx = 0;
+      runnerState->dagNodes[0].nodeType = uniRunnerDagNodeTypeCpy;
+      runnerState->dagNodes[0].nodeData.cpy.src = const_cast<void *>(sendbuff);
+      runnerState->dagNodes[0].nodeData.cpy.dst = recvbuff;
+      runnerState->dagNodes[0].nodeData.cpy.count = count;
+      runnerState->dagNodes[0].nodeData.cpy.datatype = datatype;
+      runnerState->dagNodes[0].numParents = 0;
+      runnerState->dagNodes[0].numChildren = 0;
+      FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[0]));
+      flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
+                              &runnerState->dagNodes[0]);
+    }
+    return validateDagNodes(runnerState);
+  }
+  if (count == 0) {
+    return flagcxSuccess;
+  }
+
+  flagcxHeteroComm_t hcomm = comm->heteroComm;
+  int nextRank = (rank + 1) % nranks;
+  int prevRank = (rank - 1 + nranks) % nranks;
+  size_t typeSize = getFlagcxDataTypeSize(datatype);
+
+  uniRunnerTransportBufferView recvTransport = {};
+  FLAGCXCHECK(getUniRunnerRecvTransportBuffer(hcomm, prevRank, &recvTransport));
+  if (!recvTransport.deviceAccessible) {
+    return flagcxNotSupported;
+  }
+  FLAGCXCHECK(registerUniRunnerWorkBuffer(
+      runnerState, hcomm, recvTransport.base, recvTransport.bytes));
+  FLAGCXCHECK(ensureUniRunnerPeerConnection(hcomm, nextRank, true));
+
+  size_t baseRankChunkCount = count / nranks;
+  size_t rankChunkRemainder = count % nranks;
+  size_t maxRankChunkCount =
+      baseRankChunkCount + (rankChunkRemainder > 0 ? 1 : 0);
+  size_t bankBytes = recvTransport.bytes / 2;
+  int numSlices = resolveUniRunnerZeroCopySlices(
+      maxRankChunkCount * typeSize, bankBytes, runnerState->uniRunnerNSlices);
+  if (numSlices <= 0) {
+    return flagcxNotSupported;
+  }
+
+  int numRedSlices = 1;
+  if (runnerState->uniRunnerNRedSlices != 0) {
+    numRedSlices = runnerState->uniRunnerNRedSlices;
+  } else if (runnerState->uniRunnerRedSliceSize != 0) {
+    size_t totalPerSlice =
+        std::max<size_t>(1, count / nranks / static_cast<size_t>(numSlices));
+    numRedSlices = std::max<size_t>(
+        1, (totalPerSlice + runnerState->uniRunnerRedSliceSize - 1) /
+               runnerState->uniRunnerRedSliceSize);
+  }
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initUniRunnerStateSlicedARZCPY count=%lu bankBytes=%lu "
+        "numSlices=%d numRedSlices=%d transport=%d",
+        rank, count, bankBytes, numSlices, numRedSlices,
+        recvTransport.transport);
+
+  auto getChunkSliceLayout = [&](int chunk, int slice, size_t *sliceCount,
+                                 size_t *globalOffset) {
+    size_t rankChunkCount =
+        baseRankChunkCount +
+        (chunk < static_cast<int>(rankChunkRemainder) ? 1 : 0);
+    size_t baseSliceCount = rankChunkCount / static_cast<size_t>(numSlices);
+    size_t sliceRemainder = rankChunkCount % static_cast<size_t>(numSlices);
+    size_t countOut =
+        baseSliceCount + (slice < static_cast<int>(sliceRemainder) ? 1 : 0);
+    size_t sliceOffsetInChunk =
+        (static_cast<size_t>(slice) * baseSliceCount +
+         std::min(slice, static_cast<int>(sliceRemainder))) *
+        typeSize;
+    if (sliceCount != NULL) {
+      *sliceCount = countOut;
+    }
+    if (globalOffset != NULL) {
+      *globalOffset = (chunk * baseRankChunkCount +
+                       std::min(chunk, static_cast<int>(rankChunkRemainder))) *
+                          typeSize +
+                      sliceOffsetInChunk;
+    }
+  };
+
+  const int rsNodesPerSlice = 1 + (nranks - 1) * (1 + numRedSlices) + 1;
+  const int agNodesPerSlice = nranks - 1;
+  const int nodesPerSlice = rsNodesPerSlice + agNodesPerSlice;
+  runnerState->numDagNodes = numSlices * nodesPerSlice;
+  FLAGCXCHECK(
+      flagcxCalloc(&runnerState->dagNodes,
+                   runnerState->numDagNodes * sizeof(struct uniRunnerDagNode)));
+  if (runnerState->dagNodes == NULL) {
+    return flagcxSystemError;
+  }
+
+  char *workBase = static_cast<char *>(recvTransport.base);
+  char *bankBase[2] = {workBase, workBase + bankBytes};
+  auto validateBankAccess = [&](const char *bufferName, int peer, int slice,
+                                int step, int bank, size_t offsetInBank,
+                                size_t elemCount) {
+    size_t accessBytes = elemCount * typeSize;
+    size_t bankOffset = static_cast<size_t>(bank) * bankBytes;
+    return validateUniRunnerTransportBufferRange(
+        bufferName, rank, peer, slice, step, recvTransport.bytes,
+        bankOffset + offsetInBank, accessBytes);
+  };
+
+  for (int s = 0; s < numSlices; s++) {
+    const int sliceBase = s * nodesPerSlice;
+    const int preloadIdx = sliceBase;
+    const int postCopyIdx = sliceBase + rsNodesPerSlice - 1;
+    const int agBase = sliceBase + rsNodesPerSlice;
+    const int prevSliceTail = (s == 0) ? -1 : (sliceBase - 1);
+
+    size_t initialSendCount = 0;
+    size_t initialSendOffset = 0;
+    getChunkSliceLayout(rank, s, &initialSendCount, &initialSendOffset);
+    FLAGCXCHECK(validateBankAccess("transport-preload-dst", rank, s, -1, 0, 0,
+                                   initialSendCount));
+
+    runnerState->dagNodes[preloadIdx].nodeIdx = preloadIdx;
+    runnerState->dagNodes[preloadIdx].nodeType = uniRunnerDagNodeTypeCpy;
+    runnerState->dagNodes[preloadIdx].nodeData.cpy.src = static_cast<void *>(
+        static_cast<char *>(const_cast<void *>(sendbuff)) + initialSendOffset);
+    runnerState->dagNodes[preloadIdx].nodeData.cpy.dst =
+        static_cast<void *>(bankBase[0]);
+    runnerState->dagNodes[preloadIdx].nodeData.cpy.count = initialSendCount;
+    runnerState->dagNodes[preloadIdx].nodeData.cpy.datatype = datatype;
+    runnerState->dagNodes[preloadIdx].numParents = (s == 0) ? 0 : 1;
+    runnerState->dagNodes[preloadIdx].numChildren = 1;
+    FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[preloadIdx]));
+    if (s == 0) {
+      flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
+                              &runnerState->dagNodes[preloadIdx]);
+    } else {
+      runnerState->numPendingNodes++;
+      FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[preloadIdx], 0,
+                                   prevSliceTail));
+    }
+    runnerState->dagNodes[preloadIdx].children[0] = sliceBase + 1;
+
+    for (int i = 0; i < nranks - 1; i++) {
+      const int p2pNodeIdx = sliceBase + 1 + i * (1 + numRedSlices);
+      const int sendBank = i % 2;
+      const int recvBank = 1 - sendBank;
+
+      int txChunk = (rank - i + nranks) % nranks;
+      int rxChunk = (rank - i - 1 + nranks) % nranks;
+      size_t txSliceCount = 0, rxSliceCount = 0, rxOffset = 0;
+      getChunkSliceLayout(txChunk, s, &txSliceCount, NULL);
+      getChunkSliceLayout(rxChunk, s, &rxSliceCount, &rxOffset);
+      FLAGCXCHECK(validateBankAccess("transport-send-bank", nextRank, s, i,
+                                     sendBank, 0, txSliceCount));
+      FLAGCXCHECK(validateBankAccess("transport-recv-bank", prevRank, s, i,
+                                     recvBank, 0, rxSliceCount));
+
+      runnerState->dagNodes[p2pNodeIdx].nodeIdx = p2pNodeIdx;
+      runnerState->dagNodes[p2pNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.numOps = 2;
+      runnerState->dagNodes[p2pNodeIdx]
+          .nodeData.p2p.useInternalTransportSubmit = 1;
+      FLAGCXCHECK(
+          flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
+                       2 * sizeof(struct uniRunnerP2pOpData)));
+
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].type =
+          flagcxDevicePrimSend;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank = nextRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count =
+          txSliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].addr =
+          static_cast<void *>(bankBase[sendBank]);
+
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
+          flagcxDevicePrimRecv;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank = prevRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count =
+          rxSliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
+          static_cast<void *>(bankBase[recvBank]);
+
+      runnerState->dagNodes[p2pNodeIdx].numParents =
+          (i == 0) ? 1 : numRedSlices;
+      runnerState->dagNodes[p2pNodeIdx].numChildren = numRedSlices;
+      FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[p2pNodeIdx]));
+      if (s == 0 && i == 0) {
+        runnerState->numPendingNodes++;
+      } else {
+        runnerState->numPendingNodes++;
+      }
+
+      if (i == 0) {
+        FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], 0,
+                                     preloadIdx));
+      } else {
+        int prevRedStart = p2pNodeIdx - numRedSlices;
+        for (int r = 0; r < numRedSlices; r++) {
+          FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], r,
+                                       prevRedStart + r));
+        }
+      }
+      for (int r = 0; r < numRedSlices; r++) {
+        runnerState->dagNodes[p2pNodeIdx].children[r] = p2pNodeIdx + 1 + r;
+      }
+
+      size_t baseRedCount = rxSliceCount / static_cast<size_t>(numRedSlices);
+      size_t redRemainder = rxSliceCount % static_cast<size_t>(numRedSlices);
+      for (int r = 0; r < numRedSlices; r++) {
+        const int redNodeIdx = p2pNodeIdx + 1 + r;
+        size_t redCount =
+            baseRedCount + (r < static_cast<int>(redRemainder) ? 1 : 0);
+        size_t redOffset = (static_cast<size_t>(r) * baseRedCount +
+                            std::min(r, static_cast<int>(redRemainder))) *
+                           typeSize;
+        FLAGCXCHECK(validateBankAccess("transport-reduce-input", prevRank, s, i,
+                                       recvBank, redOffset, redCount));
+        FLAGCXCHECK(validateBankAccess("transport-reduce-output", nextRank, s,
+                                       i, recvBank, redOffset, redCount));
+
+        runnerState->dagNodes[redNodeIdx].nodeIdx = redNodeIdx;
+        runnerState->dagNodes[redNodeIdx].nodeType = uniRunnerDagNodeTypeRed;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.triggerIdx = -1;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.input1 =
+            static_cast<void *>(bankBase[recvBank] + redOffset);
+        runnerState->dagNodes[redNodeIdx].nodeData.red.input2 =
+            static_cast<void *>(
+                static_cast<char *>(const_cast<void *>(sendbuff)) + rxOffset +
+                redOffset);
+        runnerState->dagNodes[redNodeIdx].nodeData.red.output =
+            static_cast<void *>(bankBase[recvBank] + redOffset);
+        runnerState->dagNodes[redNodeIdx].nodeData.red.count = redCount;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
+            runnerState->uniRunnerNThreads;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
+        runnerState->dagNodes[redNodeIdx].numParents = 1;
+        runnerState->dagNodes[redNodeIdx].numChildren = 1;
+        runnerState->numPendingNodes++;
+        FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[redNodeIdx]));
+        FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[redNodeIdx], 0,
+                                     p2pNodeIdx));
+        runnerState->dagNodes[redNodeIdx].children[0] =
+            (i == nranks - 2) ? postCopyIdx : (p2pNodeIdx + 1 + numRedSlices);
+      }
+    }
+
+    size_t localChunkCount = 0, localChunkOffset = 0;
+    getChunkSliceLayout(rank, s, &localChunkCount, &localChunkOffset);
+    FLAGCXCHECK(validateBankAccess("transport-postcopy-src", rank, s,
+                                   nranks - 1, (nranks - 1) % 2, 0,
+                                   localChunkCount));
+    runnerState->dagNodes[postCopyIdx].nodeIdx = postCopyIdx;
+    runnerState->dagNodes[postCopyIdx].nodeType = uniRunnerDagNodeTypeCpy;
+    runnerState->dagNodes[postCopyIdx].nodeData.cpy.src =
+        static_cast<void *>(bankBase[(nranks - 1) % 2]);
+    runnerState->dagNodes[postCopyIdx].nodeData.cpy.dst =
+        static_cast<void *>(static_cast<char *>(recvbuff) + localChunkOffset);
+    runnerState->dagNodes[postCopyIdx].nodeData.cpy.count = localChunkCount;
+    runnerState->dagNodes[postCopyIdx].nodeData.cpy.datatype = datatype;
+    runnerState->dagNodes[postCopyIdx].numParents = numRedSlices;
+    runnerState->dagNodes[postCopyIdx].numChildren = 1;
+    runnerState->numPendingNodes++;
+    FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[postCopyIdx]));
+    {
+      int finalRedStart = sliceBase + 1 + (nranks - 2) * (1 + numRedSlices) + 1;
+      for (int r = 0; r < numRedSlices; r++) {
+        FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[postCopyIdx], r,
+                                     finalRedStart + r));
+      }
+    }
+    runnerState->dagNodes[postCopyIdx].children[0] = agBase;
+
+    for (int i = 0; i < nranks - 1; i++) {
+      int p2pNodeIdx = agBase + i;
+      int txChunk = (rank - i + 1 + nranks) % nranks;
+      int rxChunk = (rank - i + nranks) % nranks;
+      size_t txSliceCount = 0, rxSliceCount = 0, txOffset = 0, rxOffset = 0;
+      getChunkSliceLayout(txChunk, s, &txSliceCount, &txOffset);
+      getChunkSliceLayout(rxChunk, s, &rxSliceCount, &rxOffset);
+
+      runnerState->dagNodes[p2pNodeIdx].nodeIdx = p2pNodeIdx;
+      runnerState->dagNodes[p2pNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.numOps = 2;
+      runnerState->dagNodes[p2pNodeIdx]
+          .nodeData.p2p.useInternalTransportSubmit = 1;
+      FLAGCXCHECK(
+          flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
+                       2 * sizeof(struct uniRunnerP2pOpData)));
+
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].type =
+          flagcxDevicePrimSend;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].peerRank = nextRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].count =
+          txSliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].addr =
+          static_cast<void *>(static_cast<char *>(recvbuff) + txOffset);
+
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
+          flagcxDevicePrimRecv;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].peerRank = prevRank;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].count =
+          rxSliceCount;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
+      runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
+          static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
+
+      runnerState->dagNodes[p2pNodeIdx].numParents = 1;
+      runnerState->dagNodes[p2pNodeIdx].numChildren =
+          (i == nranks - 2) ? ((s == numSlices - 1) ? 0 : 1) : 1;
+      runnerState->numPendingNodes++;
+      FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[p2pNodeIdx]));
+      FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], 0,
+                                   (i == 0) ? postCopyIdx : (p2pNodeIdx - 1)));
+      if (i != nranks - 2) {
+        runnerState->dagNodes[p2pNodeIdx].children[0] = p2pNodeIdx + 1;
+      } else if (s != numSlices - 1) {
+        runnerState->dagNodes[p2pNodeIdx].children[0] = (s + 1) * nodesPerSlice;
+      }
+    }
+  }
+
+  return validateDagNodes(runnerState);
+}
+
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,
@@ -1986,6 +2460,110 @@ static flagcxResult_t cleanupDagScheduler(flagcxUniRunnerState *runnerState) {
   return flagcxSuccess;
 }
 
+static flagcxResult_t submitUniRunnerTransportOp(
+    flagcxHeteroComm_t comm, const uniRunnerP2pOpData *opData,
+    const std::shared_ptr<flagcxSemaphore> &semaphore, flagcxStream_t stream) {
+  if (opData == NULL) {
+    return flagcxInvalidArgument;
+  }
+
+  size_t nbytes = opData->count * getFlagcxDataTypeSize(opData->datatype);
+  if (nbytes == 0) {
+    return flagcxSuccess;
+  }
+
+  const bool isSend = opData->type == flagcxDevicePrimSend;
+  const bool isRecv = opData->type == flagcxDevicePrimRecv;
+  if (!isSend && !isRecv) {
+    return flagcxNotSupported;
+  }
+
+  FLAGCXCHECK(ensureUniRunnerPeerConnection(comm, opData->peerRank,
+                                            isSend ? true : false));
+
+  flagcxConnector *conn = isSend
+                              ? comm->channels[0].peers[opData->peerRank]->send
+                              : comm->channels[0].peers[opData->peerRank]->recv;
+  if (conn[0].proxyConn.connection == NULL) {
+    return flagcxInternalError;
+  }
+
+  flagcxProxyOp *proxyOp = NULL;
+  FLAGCXCHECK(flagcxCalloc(&proxyOp, 1));
+  proxyOp->pattern = isSend ? flagcxPatternSend : flagcxPatternRecv;
+  proxyOp->nbytes = nbytes;
+  proxyOp->channelId = 0;
+  proxyOp->root = opData->peerRank;
+  proxyOp->connection = conn[0].proxyConn.connection;
+  proxyOp->stream = stream;
+  proxyOp->dtype = opData->datatype;
+  proxyOp->rank = comm->rank;
+  proxyOp->peerRank = opData->peerRank;
+  proxyOp->comm = comm;
+  proxyOp->args.semaphore = semaphore;
+  proxyOp->args.opId = 0;
+  proxyOp->args.step = 0;
+  proxyOp->args.regBufFlag = 0;
+  proxyOp->recvbuff = static_cast<uint8_t *>(opData->addr);
+
+  if (proxyOp->connection->transport == TRANSPORT_P2P) {
+    proxyOp->args.chunkSize = computeP2pChunkSize(nbytes);
+    proxyOp->args.chunkSteps =
+        (nbytes + proxyOp->args.chunkSize - 1) / proxyOp->args.chunkSize;
+    proxyOp->args.sendStepMask = flagcxP2pChunks - 1;
+
+    uintptr_t *peerRmtAddr = NULL;
+    uintptr_t regOffset = 0;
+    flagcxConnector *peerConns[] = {conn};
+    int peerRanks[] = {opData->peerRank};
+
+    if (isSend) {
+      setP2pSlotInfo(comm->rank, opData->peerRank, nbytes, opData->datatype, 0,
+                     &proxyOp->args.p2pOpHash, &proxyOp->args.p2pSlotIdx);
+      setP2pSlotInfo(opData->peerRank, comm->rank, nbytes, opData->datatype, 1,
+                     &proxyOp->args.p2pPeerOpHash,
+                     &proxyOp->args.p2pPeerSlotIdx);
+      FLAGCXCHECK(flagcxP2pRegisterBuffer(
+          comm, opData->addr, nbytes, peerConns, peerRanks, 1,
+          /*isSender=*/true, &proxyOp->args.regBufFlag, &regOffset,
+          &peerRmtAddr, proxyOp->args.p2pSlotIdx));
+      if (proxyOp->args.regBufFlag && peerRmtAddr != NULL) {
+        proxyOp->args.p2pRmtAddr = reinterpret_cast<void *>(peerRmtAddr);
+      }
+    } else {
+      setP2pSlotInfo(comm->rank, opData->peerRank, nbytes, opData->datatype, 1,
+                     &proxyOp->args.p2pOpHash, &proxyOp->args.p2pSlotIdx);
+      setP2pSlotInfo(opData->peerRank, comm->rank, nbytes, opData->datatype, 0,
+                     &proxyOp->args.p2pPeerOpHash,
+                     &proxyOp->args.p2pPeerSlotIdx);
+      FLAGCXCHECK(flagcxP2pRegisterBuffer(
+          comm, opData->addr, nbytes, peerConns, peerRanks, 1,
+          /*isSender=*/false, &proxyOp->args.regBufFlag, &regOffset,
+          &peerRmtAddr, proxyOp->args.p2pPeerSlotIdx));
+    }
+  } else if (proxyOp->connection->transport == TRANSPORT_NET) {
+    proxyOp->args.chunkSize = flagcxNetChunkSize;
+    proxyOp->args.chunkSteps =
+        (nbytes + flagcxNetChunkSize - 1) / flagcxNetChunkSize;
+    proxyOp->args.sendStepMask = flagcxNetChunks - 1;
+    flagcxConnector *peerConns[] = {conn};
+    FLAGCXCHECK(flagcxNetRegisterBuffer(comm, opData->addr, nbytes, peerConns,
+                                        1, &proxyOp->args.regBufFlag,
+                                        &proxyOp->args.regHandle));
+  } else {
+    free(proxyOp);
+    return flagcxNotSupported;
+  }
+
+  semaphore->addCounter(0);
+  flagcxResult_t ret = flagcxProxySaveOp(comm, proxyOp);
+  if (ret != flagcxSuccess) {
+    free(proxyOp);
+    return ret;
+  }
+  return flagcxSuccess;
+}
+
 static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
                                    flagcxHeteroComm_t comm) {
   // Dequeue
@@ -2017,24 +2595,44 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
             comm->rank, current->nodeIdx, parentIdx);
     }
 
-    // Prepare ops list
     struct uniRunnerP2pOpData *ops = current->nodeData.p2p.ops;
+    if (current->nodeData.p2p.useInternalTransportSubmit) {
+      std::shared_ptr<flagcxSemaphore> semaphore =
+          std::make_shared<flagcxHostSemaphore>();
+      runnerState->nodeSemaphores[current->nodeIdx] = semaphore;
 
-    // Start Group P2P
-    FLAGCXCHECK(flagcxHeteroGroupStart());
-    for (int i = 0; i < current->nodeData.p2p.numOps; i++) {
-      struct uniRunnerP2pOpData *op = &ops[i];
-      if (op->type == flagcxDevicePrimSend) {
-        FLAGCXCHECK(flagcxHeteroSend(op->addr, op->count, op->datatype,
-                                     op->peerRank, comm,
-                                     runnerState->commStream));
-      } else if (op->type == flagcxDevicePrimRecv) {
-        FLAGCXCHECK(flagcxHeteroRecv(op->addr, op->count, op->datatype,
-                                     op->peerRank, comm,
-                                     runnerState->commStream));
+      int submittedOps = 0;
+      for (int i = 0; i < current->nodeData.p2p.numOps; i++) {
+        struct uniRunnerP2pOpData *op = &ops[i];
+        size_t nbytes = op->count * getFlagcxDataTypeSize(op->datatype);
+        if (nbytes == 0) {
+          continue;
+        }
+        FLAGCXCHECK(submitUniRunnerTransportOp(comm, op, semaphore,
+                                               runnerState->commStream));
+        submittedOps++;
       }
+
+      if (submittedOps > 0) {
+        FLAGCXCHECK(deviceAdaptor->launchHostFunc(
+            runnerState->commStream, cpuAsyncKernel, semaphore.get()));
+      }
+    } else {
+      FLAGCXCHECK(flagcxHeteroGroupStart());
+      for (int i = 0; i < current->nodeData.p2p.numOps; i++) {
+        struct uniRunnerP2pOpData *op = &ops[i];
+        if (op->type == flagcxDevicePrimSend) {
+          FLAGCXCHECK(flagcxHeteroSend(op->addr, op->count, op->datatype,
+                                       op->peerRank, comm,
+                                       runnerState->commStream));
+        } else if (op->type == flagcxDevicePrimRecv) {
+          FLAGCXCHECK(flagcxHeteroRecv(op->addr, op->count, op->datatype,
+                                       op->peerRank, comm,
+                                       runnerState->commStream));
+        }
+      }
+      FLAGCXCHECK(flagcxHeteroGroupEnd());
     }
-    FLAGCXCHECK(flagcxHeteroGroupEnd());
 
     TRACE(FLAGCX_UNIRUNNER, "rank %d p2p op %d streamWrite flag %d: DONE",
           comm->rank, current->nodeIdx, current->nodeIdx);
@@ -2169,6 +2767,8 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->dagNodes = NULL;
   runnerState->numDagNodes = 0;
   runnerState->streamFlags = NULL;
+  runnerState->nodeSemaphores = NULL;
+  runnerState->transportWorkBufferRegHandle = NULL;
 
   runnerState->uniRunnerNSlices = flagcxParamUniRunnerNSlices();
   runnerState->uniRunnerNThreads = flagcxParamUniRunnerNThreads();
@@ -2205,12 +2805,13 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
 
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   flagcxStream_t commStream = hcomm->proxyState->uniRunnerState.commStream;
   flagcxStream_t redStream = hcomm->proxyState->uniRunnerState.redStream;
   flagcxStream_t cpyStream = hcomm->proxyState->uniRunnerState.cpyStream;
 
   // Clean up DAG scheduler
-  FLAGCXCHECK(cleanupDagScheduler(&hcomm->proxyState->uniRunnerState));
+  FLAGCXCHECK(cleanupDagScheduler(runnerState));
 
   // Outstanding stream waits/writes may still touch streamFlags when
   // runUniRunner exits early on an error path, so synchronize before releasing
@@ -2223,6 +2824,18 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
     FLAGCXCHECK(deviceAdaptor->deviceFree(
         hcomm->proxyState->uniRunnerState.streamFlags, flagcxMemDevice, NULL));
     hcomm->proxyState->uniRunnerState.streamFlags = NULL;
+  }
+
+  if (runnerState->nodeSemaphores != NULL) {
+    delete[] runnerState->nodeSemaphores;
+    runnerState->nodeSemaphores = NULL;
+  }
+
+  if (runnerState->transportWorkBufferRegHandle != NULL) {
+    FLAGCXCHECK(globalRegPool.deregisterBuffer(
+        reinterpret_cast<void *>(hcomm),
+        runnerState->transportWorkBufferRegHandle));
+    runnerState->transportWorkBufferRegHandle = NULL;
   }
 
   // Destroy streams
@@ -2249,6 +2862,8 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
     FLAGCXCHECK(deviceAdaptor->deviceMemset(
         runnerState->streamFlags, 0,
         runnerState->numDagNodes * sizeof(uint64_t), flagcxMemDevice, NULL));
+    runnerState->nodeSemaphores =
+        new std::shared_ptr<flagcxSemaphore>[runnerState->numDagNodes];
   }
 
 #ifdef COMPILE_KERNEL_HOST

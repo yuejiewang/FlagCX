@@ -12,6 +12,7 @@ FLAGCX_PARAM(UniRunnerUseRingAG, "UNIRUNNER_USE_RINGAG", 0);
 FLAGCX_PARAM(UniRunnerUseSlicedAR, "UNIRUNNER_USE_SLICEDAR", 0);
 FLAGCX_PARAM(UniRunnerUseGroupedAG, "UNIRUNNER_USE_GROUPEDAG", 1);
 FLAGCX_PARAM(UniRunnerGroupSize, "UNIRUNNER_GROUPSIZE", 0);
+FLAGCX_PARAM(UniRunnerZeroCopy, "UNIRUNNER_ZCPY", 0);
 
 static int resolveUniRunnerGroupedAGGroupSize(flagcxComm_t comm) {
   if (comm->nranks <= 0) {
@@ -134,10 +135,25 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
                                              count, datatype, op, comm),
                     res, out);
   } else if (flagcxParamUniRunnerUseSlicedAR()) {
-    /* initialize uniRunnerState for sliced AllReduce */
-    FLAGCXCHECKGOTO(initUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff,
-                                               count, datatype, op, comm),
-                    res, out);
+    res = flagcxNotSupported;
+    if (flagcxParamUniRunnerZeroCopy()) {
+      res = initUniRunnerStateSlicedARZCPY(runnerState, sendbuff, recvbuff,
+                                           count, datatype, op, comm);
+      if (res == flagcxNotSupported) {
+        TRACE(FLAGCX_UNIRUNNER,
+              "rank %d slicedAR zero-copy unsupported, fallback to slicedAR",
+              comm->rank);
+      } else if (res != flagcxSuccess) {
+        goto out;
+      }
+    }
+    if (res == flagcxNotSupported) {
+      /* initialize uniRunnerState for sliced AllReduce */
+      FLAGCXCHECKGOTO(initUniRunnerStateSlicedAR(runnerState, sendbuff,
+                                                 recvbuff, count, datatype, op,
+                                                 comm),
+                      res, out);
+    }
   } else {
     /* initialize uniRunnerState for ring AllReduce */
     FLAGCXCHECKGOTO(initUniRunnerStateRingAR(runnerState, sendbuff, recvbuff,
