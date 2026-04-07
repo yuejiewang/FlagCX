@@ -134,21 +134,22 @@ getDagNodeExecutionStream(flagcxUniRunnerState *runnerState,
   }
 }
 
-static flagcxResult_t ensureUniRunnerPeerConnection(flagcxHeteroComm_t comm,
-                                                    int peer, bool isSend) {
+static inline flagcxConnector *
+getUniRunnerPeerConnector(flagcxHeteroComm_t comm, int peer, bool isSend) {
+  return isSend ? comm->channels[0].peers[peer]->send
+                : comm->channels[0].peers[peer]->recv;
+}
+
+static flagcxResult_t markUniRunnerPeerConnection(flagcxHeteroComm_t comm,
+                                                  int peer, bool isSend) {
   if (comm == NULL || peer < 0 || peer >= comm->nRanks) {
     return flagcxInvalidArgument;
   }
 
   const int channelId = 0;
-  flagcxConnector *conn = isSend ? comm->channels[channelId].peers[peer]->send
-                                 : comm->channels[channelId].peers[peer]->recv;
+  flagcxConnector *conn = getUniRunnerPeerConnector(comm, peer, isSend);
   if (conn[0].connected == 1) {
     return flagcxSuccess;
-  }
-
-  if (comm->proxyState->initialized == 0) {
-    FLAGCXCHECK(flagcxProxyInit(comm));
   }
 
   if (isSend) {
@@ -157,9 +158,70 @@ static flagcxResult_t ensureUniRunnerPeerConnection(flagcxHeteroComm_t comm,
     comm->connectRecv[peer] |= (1UL << channelId);
   }
   conn[0].registered = 1;
+  return flagcxSuccess;
+}
 
+static flagcxResult_t connectUniRunnerPendingPeers(flagcxHeteroComm_t comm) {
+  if (comm == NULL) {
+    return flagcxInvalidArgument;
+  }
+
+  bool hasPendingConnections = false;
+  for (int peer = 0; peer < comm->nRanks; peer++) {
+    if (comm->connectSend[peer] != 0 || comm->connectRecv[peer] != 0) {
+      hasPendingConnections = true;
+      break;
+    }
+  }
+  if (!hasPendingConnections) {
+    return flagcxSuccess;
+  }
+
+  if (comm->proxyState->initialized == 0) {
+    FLAGCXCHECK(flagcxProxyInit(comm));
+  }
   FLAGCXCHECK(flagcxTransportP2pSetup(comm, NULL, 0));
+  return flagcxSuccess;
+}
+
+static flagcxResult_t ensureUniRunnerPeerConnection(flagcxHeteroComm_t comm,
+                                                    int peer, bool isSend) {
+  FLAGCXCHECK(markUniRunnerPeerConnection(comm, peer, isSend));
+  FLAGCXCHECK(connectUniRunnerPendingPeers(comm));
+
+  flagcxConnector *conn = getUniRunnerPeerConnector(comm, peer, isSend);
   return conn[0].connected == 1 ? flagcxSuccess : flagcxInternalError;
+}
+
+static flagcxResult_t
+preconnectUniRunnerP2pOps(flagcxHeteroComm_t comm,
+                          const uniRunnerP2pOpData *ops, int numOps) {
+  if (numOps < 0) {
+    return flagcxInvalidArgument;
+  }
+  if (numOps == 0) {
+    return flagcxSuccess;
+  }
+  if (ops == NULL) {
+    return flagcxInvalidArgument;
+  }
+
+  for (int i = 0; i < numOps; i++) {
+    const uniRunnerP2pOpData *op = &ops[i];
+    size_t nbytes = op->count * getFlagcxDataTypeSize(op->datatype);
+    if (nbytes == 0) {
+      continue;
+    }
+
+    const bool isSend = op->type == flagcxDevicePrimSend;
+    const bool isRecv = op->type == flagcxDevicePrimRecv;
+    if (!isSend && !isRecv) {
+      return flagcxNotSupported;
+    }
+    FLAGCXCHECK(markUniRunnerPeerConnection(comm, op->peerRank, isSend));
+  }
+
+  return connectUniRunnerPendingPeers(comm);
 }
 
 static flagcxResult_t
@@ -1519,6 +1581,12 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
   int prevRank = (rank - 1 + nranks) % nranks;
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
+  // Batch both ring directions before setup so nranks==2 does not enter
+  // transport setup with only one half of the handshake registered.
+  FLAGCXCHECK(markUniRunnerPeerConnection(hcomm, prevRank, false));
+  FLAGCXCHECK(markUniRunnerPeerConnection(hcomm, nextRank, true));
+  FLAGCXCHECK(connectUniRunnerPendingPeers(hcomm));
+
   uniRunnerTransportBufferView recvTransport = {};
   FLAGCXCHECK(getUniRunnerRecvTransportBuffer(hcomm, prevRank, &recvTransport));
   if (!recvTransport.deviceAccessible) {
@@ -1526,7 +1594,6 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
   }
   FLAGCXCHECK(registerUniRunnerWorkBuffer(
       runnerState, hcomm, recvTransport.base, recvTransport.bytes));
-  FLAGCXCHECK(ensureUniRunnerPeerConnection(hcomm, nextRank, true));
 
   size_t baseRankChunkCount = count / nranks;
   size_t rankChunkRemainder = count % nranks;
@@ -2478,8 +2545,8 @@ static flagcxResult_t submitUniRunnerTransportOp(
     return flagcxNotSupported;
   }
 
-  FLAGCXCHECK(ensureUniRunnerPeerConnection(comm, opData->peerRank,
-                                            isSend ? true : false));
+  FLAGCXCHECK(
+      ensureUniRunnerPeerConnection(comm, opData->peerRank, isSend));
 
   flagcxConnector *conn = isSend
                               ? comm->channels[0].peers[opData->peerRank]->send
@@ -2597,6 +2664,8 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
 
     struct uniRunnerP2pOpData *ops = current->nodeData.p2p.ops;
     if (current->nodeData.p2p.useInternalTransportSubmit) {
+      FLAGCXCHECK(preconnectUniRunnerP2pOps(
+          comm, ops, current->nodeData.p2p.numOps));
       std::shared_ptr<flagcxSemaphore> semaphore =
           std::make_shared<flagcxHostSemaphore>();
       runnerState->nodeSemaphores[current->nodeIdx] = semaphore;
