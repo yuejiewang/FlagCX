@@ -5,7 +5,7 @@
  *
  * Architecture:
  *   PlatformTraits<P>         — platform-level: Intrin, Atomic
- *   CommTraits<D>             — backend-level:  Window, DevComm, Team, ...
+ *   CommTraits<D>             — backend-level:  Window, Comm, Team, ...
  *   Fallback<PlatformTag>     — common IPC fallback (partial specialization)
  *
  * CommTraits pulls in platform capabilities via using-aliases (not
@@ -14,7 +14,7 @@
  * types that work with any platform.
  *
  * Selection:
- *   NVIDIA + NCCL > 2.28:   DeviceAPI = CommTraits<NvidiaVendor>
+ *   NVIDIA + NCCL > 2.28:    DeviceAPI = CommTraits<NvidiaVendor>
  *   NVIDIA + fallback:       DeviceAPI = CommTraits<Fallback<NvidiaPlatform>>
  *
  * Kernel code uses DeviceAPI::* exclusively, no #ifdef branches.
@@ -36,51 +36,49 @@ template <typename PlatformTag>
 struct Fallback {};
 
 // ============================================================
-// Action types for one-sided operations (needed by traits Net types).
+// Action types for one-sided operations (needed by traits Transport types).
 // Pure POD structs with no device builtins.
 // ============================================================
-typedef uint32_t flagcxDevNetSignal_t;
-typedef uint32_t flagcxDevNetCounter_t;
+typedef uint32_t flagcxDevTransportSignal_t;
+typedef uint32_t flagcxDevTransportCounter_t;
 
-struct flagcxDevNet_None {};
-struct flagcxDevNet_SignalInc {
-  flagcxDevNetSignal_t signal;
+struct flagcxDevTransport_None {};
+struct flagcxDevTransport_SignalInc {
+  flagcxDevTransportSignal_t signal;
 };
-struct flagcxDevNet_SignalAdd {
-  flagcxDevNetSignal_t signal;
+struct flagcxDevTransport_SignalAdd {
+  flagcxDevTransportSignal_t signal;
   uint64_t value;
 };
-struct flagcxDevNet_CounterInc {
-  flagcxDevNetCounter_t counter;
+struct flagcxDevTransport_CounterInc {
+  flagcxDevTransportCounter_t counter;
 };
 
 // Shared memory descriptor for NIC descriptor optimization.
-// Uses void* on all paths; vendor Net casts to native type in toNccl().
+// Uses void* on all paths; vendor Transport casts to native type in toNccl().
 struct flagcxDescriptorSmem {
   void *_impl = nullptr;
 };
 
-struct flagcxDevNet_DescriptorSmem {
+struct flagcxDevTransport_DescriptorSmem {
   flagcxDescriptorSmem smem;
 };
 
 // Fence level enum — available on all tiers for unified barrier API
-enum class flagcxGinFenceLevel { Relaxed };
+enum class flagcxTransportFenceLevel { Relaxed };
 
 // ============================================================
-// Barrier tag types for DevBarrier<Backend, Tag> dispatch.
+// Unified team/barrier tag types.
+// Used as both Barrier<Backend, Tag> template parameter
+// and as ctor dispatch tags — eliminating the old two-tag redundancy.
 // ============================================================
-struct flagcxBarrierIntra {};
-struct flagcxBarrierInter {};
-struct flagcxBarrierWorld {
-  struct World {}; // tag for world-barrier ctor
-  struct Intra {}; // tag for intra-only ctor
-  struct Inter {}; // tag for inter-only ctor
-};
+struct flagcxTeamTagIntra {};
+struct flagcxTeamTagInter {};
+struct flagcxTeamTagWorld {};
 
 // Primary template — each backend provides specializations
-template <typename Backend, typename BarrierTag, typename Coop>
-struct DevBarrier;
+template <typename Backend, typename Tag, typename Coop>
+struct Barrier;
 
 // Vendor specializations + DeviceAPI selection
 #if defined(USE_NVIDIA_ADAPTOR)

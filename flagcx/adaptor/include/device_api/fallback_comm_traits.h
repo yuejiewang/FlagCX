@@ -6,7 +6,7 @@
  * CommTraits<Fallback<PlatformTag>> provides:
  *   - Intrin, Atomic: inherited from PlatformTraits<PlatformTag> via using
  *   - Window:   IPC peer pointers + raw pointer
- *   - DevComm:  rank/size + IPC barriers + signal buffers
+ *   - Comm:  rank/size + IPC barriers + signal buffers
  *   - Team:     pure arithmetic (nRanks, rank, stride)
  *   - Multimem: placeholder (no multicast)
  *
@@ -73,7 +73,7 @@ struct CommTraits<Fallback<PlatformTag>> {
     }
 
     FLAGCX_HOST_DEVICE_INLINE bool hasAccess() const {
-      return rawPtr != nullptr || peerPtrs != nullptr;
+      return peerPtrs != nullptr;
     }
     FLAGCX_HOST_DEVICE_INLINE void *getRawPtr() const { return rawPtr; }
     FLAGCX_HOST_DEVICE_INLINE void **getDevPeerPtrs() const { return peerPtrs; }
@@ -87,8 +87,8 @@ struct CommTraits<Fallback<PlatformTag>> {
     }
   };
 
-  // ---- DevComm: All fallback layers ----
-  struct DevComm {
+  // ---- Comm: All fallback layers ----
+  struct Comm {
     // Baseline
     int rank, nRanks;
     int intraRank, intraSize;
@@ -127,7 +127,7 @@ struct CommTraits<Fallback<PlatformTag>> {
 
     // Populate from host-side handle (deferred template avoids forward-decl)
     template <typename DI>
-    static FLAGCX_HOST_DEVICE_INLINE void populateFromInternal(DevComm &dc,
+    static FLAGCX_HOST_DEVICE_INLINE void populateFromInternal(Comm &dc,
                                                                const DI &di) {
       dc.rank = di.rank;
       dc.nRanks = di.nRanks;
@@ -171,10 +171,10 @@ struct CommTraits<Fallback<PlatformTag>> {
   // ---- DescriptorSmem: empty on fallback ----
   struct DescriptorSmem {};
 
-  // ---- DevBarrier alias: delegates to standalone DevBarrier<Backend, Tag>
+  // ---- Barrier alias: delegates to standalone Barrier<Backend, Tag>
   // ----
   template <typename Tag, typename Coop>
-  using DevBarrier = ::DevBarrier<Fallback<PlatformTag>, Tag, Coop>;
+  using Barrier = ::Barrier<Fallback<PlatformTag>, Tag, Coop>;
 
   // ============================================================
   // Static FIFO helpers (used by Net and InterBarrierSession)
@@ -254,9 +254,10 @@ struct CommTraits<Fallback<PlatformTag>> {
   }
 
   // ============================================================
-  // Net: FIFO-based two-sided + one-sided + GPU-spin signal/counter
+  // Transport: FIFO-based two-sided + one-sided + GPU-spin signal/counter
   // ============================================================
-  struct Net {
+  struct Transport {
+    Comm _dc;
     void *fifoBuffer;
     uint64_t *signalBuffer;
     uint64_t *shadowBuffer;
@@ -266,12 +267,34 @@ struct CommTraits<Fallback<PlatformTag>> {
     int contextId;
 
     FLAGCX_DEVICE_INLINE_DECORATOR
-    Net(const DevComm &dc, int contextIndex)
-        : fifoBuffer(dc.fifoBuffer), signalBuffer(dc.signalBuffer),
+    Transport(const Comm &dc, int contextIndex)
+        : _dc(dc), fifoBuffer(dc.fifoBuffer), signalBuffer(dc.signalBuffer),
           shadowBuffer(dc.shadowBuffer), counterBuffer(dc.counterBuffer),
           signalCount(dc.signalCount), counterCount(dc.counterCount) {
       int cnt = (dc.contextCount > 0) ? dc.contextCount : 1;
       contextId = contextIndex % cnt;
+    }
+
+    FLAGCX_DEVICE_INLINE_DECORATOR bool isIntraPeer(int peer) const {
+      int intraBase = _dc.rank - _dc.intraRank;
+      return peer >= intraBase && peer < intraBase + _dc.intraSize;
+    }
+
+    // ---- store: write to peer's IPC pointer ----
+    template <typename T>
+    FLAGCX_DEVICE_INLINE_DECORATOR void
+    store(const Window &win, size_t byteOffset, int peer, T val) const {
+      T *ptr = (T *)win.getIntraPointer(byteOffset, peer);
+      if (ptr)
+        *ptr = val;
+    }
+
+    // ---- load: read from peer's IPC pointer ----
+    template <typename T>
+    FLAGCX_DEVICE_INLINE_DECORATOR T load(const Window &win, size_t byteOffset,
+                                          int peer) const {
+      const T *ptr = (const T *)win.getIntraPointer(byteOffset, peer);
+      return ptr ? *ptr : T{};
     }
 
     // ---- Two-sided FIFO encoders ----
@@ -439,11 +462,11 @@ struct CommTraits<Fallback<PlatformTag>> {
       return false;
     }
     FLAGCX_DEVICE_INLINE_DECORATOR constexpr bool
-    isSignal(flagcxDevNet_SignalInc) const {
+    isSignal(flagcxDevTransport_SignalInc) const {
       return true;
     }
     FLAGCX_DEVICE_INLINE_DECORATOR constexpr bool
-    isSignal(flagcxDevNet_SignalAdd) const {
+    isSignal(flagcxDevTransport_SignalAdd) const {
       return true;
     }
 
@@ -452,11 +475,11 @@ struct CommTraits<Fallback<PlatformTag>> {
       return 0;
     }
     FLAGCX_DEVICE_INLINE_DECORATOR constexpr int
-    getSignalIdx(flagcxDevNet_SignalInc a) const {
+    getSignalIdx(flagcxDevTransport_SignalInc a) const {
       return a.signal;
     }
     FLAGCX_DEVICE_INLINE_DECORATOR constexpr int
-    getSignalIdx(flagcxDevNet_SignalAdd a) const {
+    getSignalIdx(flagcxDevTransport_SignalAdd a) const {
       return a.signal;
     }
 
@@ -465,11 +488,11 @@ struct CommTraits<Fallback<PlatformTag>> {
       return 0;
     }
     FLAGCX_DEVICE_INLINE_DECORATOR constexpr uint32_t
-    getSignalValue(flagcxDevNet_SignalInc) const {
+    getSignalValue(flagcxDevTransport_SignalInc) const {
       return 1;
     }
     FLAGCX_DEVICE_INLINE_DECORATOR constexpr uint32_t
-    getSignalValue(flagcxDevNet_SignalAdd a) const {
+    getSignalValue(flagcxDevTransport_SignalAdd a) const {
       return (uint32_t)a.value;
     }
 
@@ -478,11 +501,11 @@ struct CommTraits<Fallback<PlatformTag>> {
       return false;
     }
     FLAGCX_DEVICE_INLINE_DECORATOR constexpr bool
-    canFuseSignal(flagcxDevNet_SignalInc) const {
+    canFuseSignal(flagcxDevTransport_SignalInc) const {
       return true;
     }
     FLAGCX_DEVICE_INLINE_DECORATOR constexpr bool
-    canFuseSignal(flagcxDevNet_SignalAdd) const {
+    canFuseSignal(flagcxDevTransport_SignalAdd) const {
       return true;
     }
 
@@ -491,7 +514,7 @@ struct CommTraits<Fallback<PlatformTag>> {
       return false;
     }
     FLAGCX_DEVICE_INLINE_DECORATOR constexpr bool
-    isCounter(flagcxDevNet_CounterInc) const {
+    isCounter(flagcxDevTransport_CounterInc) const {
       return true;
     }
 
@@ -500,7 +523,7 @@ struct CommTraits<Fallback<PlatformTag>> {
       return 0;
     }
     FLAGCX_DEVICE_INLINE_DECORATOR constexpr int
-    getCounterIdx(flagcxDevNet_CounterInc a) const {
+    getCounterIdx(flagcxDevTransport_CounterInc a) const {
       return a.counter;
     }
 
@@ -603,7 +626,7 @@ struct CommTraits<Fallback<PlatformTag>> {
     // ---- waitSignal: GPU spin on signalBuffer[ctx*N+id] ----
     template <typename Coop>
     FLAGCX_DEVICE_INLINE_DECORATOR void
-    waitSignal(Coop coop, flagcxDevNetSignal_t signalId, uint64_t least,
+    waitSignal(Coop coop, flagcxDevTransportSignal_t signalId, uint64_t least,
                int bits, flagcxDeviceMemoryOrder_t order) const {
       (void)bits;
       (void)order;
@@ -621,8 +644,8 @@ struct CommTraits<Fallback<PlatformTag>> {
 
     template <typename Coop>
     FLAGCX_DEVICE_INLINE_DECORATOR void
-    waitSignalMeetShadow(Coop coop, flagcxDevNetSignal_t signalId, int bits,
-                         flagcxDeviceMemoryOrder_t order) const {
+    waitSignalMeetShadow(Coop coop, flagcxDevTransportSignal_t signalId,
+                         int bits, flagcxDeviceMemoryOrder_t order) const {
       int idx = contextId * signalCount + (int)signalId;
       uint64_t shadow = ((volatile uint64_t *)shadowBuffer)[idx];
       waitSignal(coop, signalId, shadow, bits, order);
@@ -630,8 +653,9 @@ struct CommTraits<Fallback<PlatformTag>> {
 
     template <typename Coop, typename Uint>
     FLAGCX_DEVICE_INLINE_DECORATOR void
-    waitSignalFollowShadow(Coop coop, flagcxDevNetSignal_t signalId, Uint delta,
-                           Uint *outSignalValue, Uint *outShadowValue, int bits,
+    waitSignalFollowShadow(Coop coop, flagcxDevTransportSignal_t signalId,
+                           Uint delta, Uint *outSignalValue,
+                           Uint *outShadowValue, int bits,
                            flagcxDeviceMemoryOrder_t order) const {
       int idx = contextId * signalCount + (int)signalId;
       uint64_t shadow = ((volatile uint64_t *)shadowBuffer)[idx];
@@ -646,17 +670,18 @@ struct CommTraits<Fallback<PlatformTag>> {
 
     // ---- Shadow manipulation ----
     FLAGCX_DEVICE_INLINE_DECORATOR uint64_t *
-    getSignalShadowPtr(flagcxDevNetSignal_t signalId) const {
+    getSignalShadowPtr(flagcxDevTransportSignal_t signalId) const {
       return &shadowBuffer[contextId * signalCount + (int)signalId];
     }
 
     FLAGCX_DEVICE_INLINE_DECORATOR void
-    increaseSignalShadow(flagcxDevNetSignal_t signalId, uint64_t delta) const {
+    increaseSignalShadow(flagcxDevTransportSignal_t signalId,
+                         uint64_t delta) const {
       shadowBuffer[contextId * signalCount + (int)signalId] += delta;
     }
 
     FLAGCX_DEVICE_INLINE_DECORATOR uint64_t
-    readSignal(flagcxDevNetSignal_t signalId, int bits,
+    readSignal(flagcxDevTransportSignal_t signalId, int bits,
                flagcxDeviceMemoryOrder_t order) const {
       (void)bits;
       (void)order;
@@ -665,7 +690,7 @@ struct CommTraits<Fallback<PlatformTag>> {
     }
 
     FLAGCX_DEVICE_INLINE_DECORATOR void
-    resetSignal(flagcxDevNetSignal_t signalId) const {
+    resetSignal(flagcxDevTransportSignal_t signalId) const {
       int idx = contextId * signalCount + (int)signalId;
       Atomic::store(&signalBuffer[idx], (uint64_t)0,
                     flagcxDeviceMemoryOrderRelease);
@@ -674,8 +699,9 @@ struct CommTraits<Fallback<PlatformTag>> {
     // ---- Counter: GPU spin on counterBuffer[ctx*N+id] ----
     template <typename Coop>
     FLAGCX_DEVICE_INLINE_DECORATOR void
-    waitCounter(Coop coop, flagcxDevNetCounter_t counterId, uint64_t least,
-                int bits, flagcxDeviceMemoryOrder_t order) const {
+    waitCounter(Coop coop, flagcxDevTransportCounter_t counterId,
+                uint64_t least, int bits,
+                flagcxDeviceMemoryOrder_t order) const {
       (void)bits;
       (void)order;
       coop.sync();
@@ -691,7 +717,7 @@ struct CommTraits<Fallback<PlatformTag>> {
     }
 
     FLAGCX_DEVICE_INLINE_DECORATOR uint64_t
-    readCounter(flagcxDevNetCounter_t counterId, int bits,
+    readCounter(flagcxDevTransportCounter_t counterId, int bits,
                 flagcxDeviceMemoryOrder_t order) const {
       (void)bits;
       (void)order;
@@ -700,7 +726,7 @@ struct CommTraits<Fallback<PlatformTag>> {
     }
 
     FLAGCX_DEVICE_INLINE_DECORATOR void
-    resetCounter(flagcxDevNetCounter_t counterId) const {
+    resetCounter(flagcxDevTransportCounter_t counterId) const {
       int idx = contextId * counterCount + (int)counterId;
       Atomic::store(&counterBuffer[idx], (uint64_t)0,
                     flagcxDeviceMemoryOrderRelease);
@@ -709,19 +735,19 @@ struct CommTraits<Fallback<PlatformTag>> {
 };
 
 // ============================================================
-// DevBarrier specializations for Fallback<P>
+// Barrier specializations for Fallback<P>
 //
 // Standalone partial specializations (C++ forbids explicit specialization
 // of member templates inside a partial class specialization).
 // ============================================================
 
-// ---- DevBarrier<Fallback<P>, flagcxBarrierIntra, Coop> ----
+// ---- Barrier<Fallback<P>, flagcxTeamTagIntra, Coop> ----
 // Thread-striped per-peer inbox barrier using IPC-mapped atomics.
 template <typename P, typename Coop>
-struct DevBarrier<Fallback<P>, flagcxBarrierIntra, Coop> {
+struct Barrier<Fallback<P>, flagcxTeamTagIntra, Coop> {
   using Atomic = typename PlatformTraits<P>::Atomic;
   using Intrin = typename PlatformTraits<P>::Intrin;
-  using DevComm = typename CommTraits<Fallback<P>>::DevComm;
+  using Comm = typename CommTraits<Fallback<P>>::Comm;
   using Team = typename CommTraits<Fallback<P>>::Team;
   using Multimem = typename CommTraits<Fallback<P>>::Multimem;
 
@@ -734,14 +760,14 @@ struct DevBarrier<Fallback<P>, flagcxBarrierIntra, Coop> {
 
   // Default ctor (no-op, for barrier composition)
   FLAGCX_DEVICE_INLINE_DECORATOR
-  DevBarrier()
+  Barrier()
       : _coop(), _peerBuffers(nullptr), _nRanks(0), _myRank(0), _nBarriers(0),
         _ctaIndex(0), _epoch(0) {}
 
   // Active ctor
   FLAGCX_DEVICE_INLINE_DECORATOR
-  DevBarrier(Coop coop, const DevComm &dc, Team team, uint32_t index,
-             bool = false, const Multimem & = {})
+  Barrier(Coop coop, const Comm &dc, Team team, uint32_t index, bool = false,
+          const Multimem & = {})
       : _coop(coop), _peerBuffers(dc.barrierPeers), _nRanks(team.nRanks),
         _myRank(team.rank), _nBarriers(dc.nBarriers), _ctaIndex(index),
         _epoch(dc.intraBarrierEpoch) {}
@@ -784,16 +810,16 @@ struct DevBarrier<Fallback<P>, flagcxBarrierIntra, Coop> {
   }
 };
 
-// ---- DevBarrier<Fallback<P>, flagcxBarrierInter, Coop> ----
+// ---- Barrier<Fallback<P>, flagcxTeamTagInter, Coop> ----
 // Inter-node barrier via FIFO BarrierSignal + host-mapped interSignalFlags.
 // Only the inter leader actually sends/waits; non-leaders are no-ops.
 template <typename P, typename Coop>
-struct DevBarrier<Fallback<P>, flagcxBarrierInter, Coop> {
+struct Barrier<Fallback<P>, flagcxTeamTagInter, Coop> {
   using Atomic = typename PlatformTraits<P>::Atomic;
   using Intrin = typename PlatformTraits<P>::Intrin;
-  using DevComm = typename CommTraits<Fallback<P>>::DevComm;
+  using Comm = typename CommTraits<Fallback<P>>::Comm;
   using Team = typename CommTraits<Fallback<P>>::Team;
-  using Net = typename CommTraits<Fallback<P>>::Net;
+  using Transport = typename CommTraits<Fallback<P>>::Transport;
 
   Coop _coop;
   uint64_t *_interSignals;
@@ -805,14 +831,14 @@ struct DevBarrier<Fallback<P>, flagcxBarrierInter, Coop> {
 
   // Default ctor (no-op)
   FLAGCX_DEVICE_INLINE_DECORATOR
-  DevBarrier()
+  Barrier()
       : _coop(), _interSignals(nullptr), _fifoBuffer(nullptr), _nInterPeers(0),
         _isLeader(false), _ctaIndex(0), _epoch(0) {}
 
   // Active ctor
   FLAGCX_DEVICE_INLINE_DECORATOR
-  DevBarrier(Coop coop, const Net &net, const DevComm &dc, Team, uint32_t index,
-             int nInterPeers)
+  Barrier(Coop coop, const Transport &, const Comm &dc, Team, uint32_t index,
+          int nInterPeers)
       : _coop(coop), _interSignals(dc.interSignalFlags),
         _fifoBuffer(dc.fifoBuffer), _nInterPeers(nInterPeers),
         _isLeader(dc.isInterLeader), _ctaIndex(index),
@@ -821,7 +847,7 @@ struct DevBarrier<Fallback<P>, flagcxBarrierInter, Coop> {
   // arrive: FIFO BarrierSignal (leader only)
   FLAGCX_DEVICE_INLINE_DECORATOR void
   arrive(flagcxDeviceMemoryOrder_t order = flagcxDeviceMemoryOrderAcqRel,
-         flagcxGinFenceLevel fence = flagcxGinFenceLevel::Relaxed) {
+         flagcxTransportFenceLevel fence = flagcxTransportFenceLevel::Relaxed) {
     _epoch += _nInterPeers;
     _coop.sync();
     if (_coop.threadRank() == 0 && _isLeader) {
@@ -836,7 +862,7 @@ struct DevBarrier<Fallback<P>, flagcxBarrierInter, Coop> {
   // wait: spin on host-mapped inter signal array (leader only)
   FLAGCX_DEVICE_INLINE_DECORATOR void
   wait(flagcxDeviceMemoryOrder_t order = flagcxDeviceMemoryOrderAcqRel,
-       flagcxGinFenceLevel fence = flagcxGinFenceLevel::Relaxed) {
+       flagcxTransportFenceLevel fence = flagcxTransportFenceLevel::Relaxed) {
     _coop.sync();
     if (_coop.threadRank() == 0 && _isLeader) {
       int iter = 0;
@@ -851,55 +877,55 @@ struct DevBarrier<Fallback<P>, flagcxBarrierInter, Coop> {
   // sync = arrive + wait
   FLAGCX_DEVICE_INLINE_DECORATOR void
   sync(flagcxDeviceMemoryOrder_t order = flagcxDeviceMemoryOrderAcqRel,
-       flagcxGinFenceLevel fence = flagcxGinFenceLevel::Relaxed) {
+       flagcxTransportFenceLevel fence = flagcxTransportFenceLevel::Relaxed) {
     arrive(order);
     wait(order);
   }
 };
 
-// ---- DevBarrier<Fallback<P>, flagcxBarrierWorld, Coop> ----
+// ---- Barrier<Fallback<P>, flagcxTeamTagWorld, Coop> ----
 // Composes intra + inter barriers.
 // Three-phase pattern for multi-node: intra → inter → intra.
 // Single-node: just one intra sync.
 template <typename P, typename Coop>
-struct DevBarrier<Fallback<P>, flagcxBarrierWorld, Coop> {
-  using DevComm = typename CommTraits<Fallback<P>>::DevComm;
+struct Barrier<Fallback<P>, flagcxTeamTagWorld, Coop> {
+  using Comm = typename CommTraits<Fallback<P>>::Comm;
   using Team = typename CommTraits<Fallback<P>>::Team;
-  using Net = typename CommTraits<Fallback<P>>::Net;
+  using Transport = typename CommTraits<Fallback<P>>::Transport;
 
   Coop _coop;
-  DevBarrier<Fallback<P>, flagcxBarrierIntra, Coop> _intra;
-  DevBarrier<Fallback<P>, flagcxBarrierInter, Coop> _inter;
+  Barrier<Fallback<P>, flagcxTeamTagIntra, Coop> _intra;
+  Barrier<Fallback<P>, flagcxTeamTagInter, Coop> _inter;
   int _nInterPeers;
 
   // World barrier: intra (IPC) + inter (FIFO Signal)
   FLAGCX_DEVICE_INLINE_DECORATOR
-  DevBarrier(Coop coop, flagcxBarrierWorld::World, const Net &net,
-             const DevComm &dc, uint32_t index, bool multimem, int nInterPeers)
+  Barrier(Coop coop, flagcxTeamTagWorld, const Transport &trans, const Comm &dc,
+          uint32_t index, bool multimem, int nInterPeers)
       : _coop(coop),
         _intra(coop, dc, Team{dc.intraSize, dc.intraRank, 1}, index),
-        _inter(coop, net, dc, Team{}, index, nInterPeers),
+        _inter(coop, trans, dc, Team{}, index, nInterPeers),
         _nInterPeers(nInterPeers) {}
 
   // Intra-only barrier: inter is default constructed (no-op)
   FLAGCX_DEVICE_INLINE_DECORATOR
-  DevBarrier(Coop coop, flagcxBarrierWorld::Intra, const Net &,
-             const DevComm &dc, uint32_t index, bool multimem, int)
+  Barrier(Coop coop, flagcxTeamTagIntra, const Transport &, const Comm &dc,
+          uint32_t index, bool multimem, int)
       : _coop(coop),
         _intra(coop, dc, Team{dc.intraSize, dc.intraRank, 1}, index), _inter(),
         _nInterPeers(0) {}
 
   // Inter-only barrier: intra is default constructed (no-op)
   FLAGCX_DEVICE_INLINE_DECORATOR
-  DevBarrier(Coop coop, flagcxBarrierWorld::Inter, const Net &net,
-             const DevComm &dc, uint32_t index, bool, int nInterPeers)
+  Barrier(Coop coop, flagcxTeamTagInter, const Transport &trans, const Comm &dc,
+          uint32_t index, bool, int nInterPeers)
       : _coop(coop), _intra(),
-        _inter(coop, net, dc, Team{}, index, nInterPeers),
+        _inter(coop, trans, dc, Team{}, index, nInterPeers),
         _nInterPeers(nInterPeers) {}
 
   FLAGCX_DEVICE_INLINE_DECORATOR void
   arrive(flagcxDeviceMemoryOrder_t order = flagcxDeviceMemoryOrderAcqRel,
-         flagcxGinFenceLevel fence = flagcxGinFenceLevel::Relaxed) {
+         flagcxTransportFenceLevel fence = flagcxTransportFenceLevel::Relaxed) {
     if (_nInterPeers > 0) {
       _intra.arrive(flagcxDeviceMemoryOrderRelease);
       _intra.wait(flagcxDeviceMemoryOrderRelease);
@@ -911,7 +937,7 @@ struct DevBarrier<Fallback<P>, flagcxBarrierWorld, Coop> {
 
   FLAGCX_DEVICE_INLINE_DECORATOR void
   wait(flagcxDeviceMemoryOrder_t order = flagcxDeviceMemoryOrderAcqRel,
-       flagcxGinFenceLevel fence = flagcxGinFenceLevel::Relaxed) {
+       flagcxTransportFenceLevel fence = flagcxTransportFenceLevel::Relaxed) {
     if (_nInterPeers > 0) {
       _inter.wait(order);
       _intra.arrive(flagcxDeviceMemoryOrderAcquire);
@@ -923,7 +949,7 @@ struct DevBarrier<Fallback<P>, flagcxBarrierWorld, Coop> {
 
   FLAGCX_DEVICE_INLINE_DECORATOR void
   sync(flagcxDeviceMemoryOrder_t order = flagcxDeviceMemoryOrderAcqRel,
-       flagcxGinFenceLevel fence = flagcxGinFenceLevel::Relaxed) {
+       flagcxTransportFenceLevel fence = flagcxTransportFenceLevel::Relaxed) {
     if (_nInterPeers > 0) {
       // Phase 1: intra sync
       _intra.arrive(flagcxDeviceMemoryOrderRelease);
