@@ -23,6 +23,12 @@ typedef struct {
   bool deviceAccessible;
 } uniRunnerTransportBufferView;
 
+typedef struct {
+  size_t bankBytes;
+  size_t usableBytes;
+  int bankCount;
+} uniRunnerTransportBankLayout;
+
 // DAG node types
 typedef enum {
   uniRunnerDagNodeTypeP2p = 0,

@@ -13,12 +13,14 @@
 
 #include <assert.h>
 #include <climits>
+#include <limits>
 #include <math.h>
 #include <string>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <unordered_set>
+#include <vector>
 
 FLAGCX_PARAM(UniRunnerNSlices, "UNIRUNNER_NSLICES", 1);
 FLAGCX_PARAM(UniRunnerNThreads, "UNIRUNNER_NTHREADS", 32);
@@ -193,9 +195,9 @@ static flagcxResult_t ensureUniRunnerPeerConnection(flagcxHeteroComm_t comm,
   return conn[0].connected == 1 ? flagcxSuccess : flagcxInternalError;
 }
 
-static flagcxResult_t
-preconnectUniRunnerP2pOps(flagcxHeteroComm_t comm,
-                          const uniRunnerP2pOpData *ops, int numOps) {
+static flagcxResult_t preconnectUniRunnerP2pOps(flagcxHeteroComm_t comm,
+                                                const uniRunnerP2pOpData *ops,
+                                                int numOps) {
   if (numOps < 0) {
     return flagcxInvalidArgument;
   }
@@ -286,8 +288,52 @@ registerUniRunnerWorkBuffer(flagcxUniRunnerState *runnerState,
              : flagcxInternalError;
 }
 
+static flagcxResult_t
+resolveUniRunnerTransportBankLayout(const uniRunnerTransportBufferView *view,
+                                    size_t maxRankChunkBytes,
+                                    uniRunnerTransportBankLayout *layout) {
+  if (view == NULL || layout == NULL) {
+    return flagcxInvalidArgument;
+  }
+
+  memset(layout, 0, sizeof(*layout));
+  switch (view->transport) {
+    case TRANSPORT_P2P:
+      layout->bankBytes = computeP2pChunkSize(maxRankChunkBytes);
+      layout->bankCount = static_cast<int>(flagcxP2pChunks);
+      break;
+    case TRANSPORT_NET:
+      layout->bankBytes = flagcxNetChunkSize;
+      layout->bankCount = static_cast<int>(flagcxNetChunks);
+      break;
+    default:
+      return flagcxNotSupported;
+  }
+
+  if (layout->bankBytes == 0 || layout->bankCount < 2) {
+    return flagcxNotSupported;
+  }
+  if (layout->bankBytes > std::numeric_limits<size_t>::max() /
+                              static_cast<size_t>(layout->bankCount)) {
+    return flagcxNotSupported;
+  }
+
+  layout->usableBytes =
+      layout->bankBytes * static_cast<size_t>(layout->bankCount);
+  if (layout->usableBytes > view->bytes) {
+    WARN(
+        "uniRunner transport bank layout exceeds transport buffer: "
+        "transport=%d bankBytes=%zu bankCount=%d usableBytes=%zu viewBytes=%zu",
+        view->transport, layout->bankBytes, layout->bankCount,
+        layout->usableBytes, view->bytes);
+    return flagcxNotSupported;
+  }
+
+  return flagcxSuccess;
+}
+
 static int resolveUniRunnerZeroCopySlices(size_t maxRankChunkBytes,
-                                          size_t bankBytes,
+                                          size_t chunkBytes,
                                           int requestedSlices) {
   if (requestedSlices <= 0) {
     requestedSlices = 1;
@@ -295,11 +341,11 @@ static int resolveUniRunnerZeroCopySlices(size_t maxRankChunkBytes,
   if (maxRankChunkBytes == 0) {
     return requestedSlices;
   }
-  if (bankBytes == 0) {
+  if (chunkBytes == 0) {
     return 0;
   }
 
-  size_t minSlices = (maxRankChunkBytes + bankBytes - 1) / bankBytes;
+  size_t minSlices = (maxRankChunkBytes + chunkBytes - 1) / chunkBytes;
   if (minSlices == 0) {
     minSlices = 1;
   }
@@ -307,6 +353,13 @@ static int resolveUniRunnerZeroCopySlices(size_t maxRankChunkBytes,
     return 0;
   }
   return std::max(requestedSlices, static_cast<int>(minSlices));
+}
+
+static inline void getUniRunnerSliceBankPair(int slice, int bankCount,
+                                             int *bank0, int *bank1) {
+  int base = (slice * 2) % bankCount;
+  *bank0 = base;
+  *bank1 = (base + 1) % bankCount;
 }
 
 static flagcxResult_t validateUniRunnerTransportBufferRange(
@@ -1592,16 +1645,19 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
   if (!recvTransport.deviceAccessible) {
     return flagcxNotSupported;
   }
-  FLAGCXCHECK(registerUniRunnerWorkBuffer(
-      runnerState, hcomm, recvTransport.base, recvTransport.bytes));
 
   size_t baseRankChunkCount = count / nranks;
   size_t rankChunkRemainder = count % nranks;
   size_t maxRankChunkCount =
       baseRankChunkCount + (rankChunkRemainder > 0 ? 1 : 0);
-  size_t bankBytes = recvTransport.bytes / 2;
+  size_t maxRankChunkBytes = maxRankChunkCount * typeSize;
+  uniRunnerTransportBankLayout bankLayout = {};
+  FLAGCXCHECK(resolveUniRunnerTransportBankLayout(
+      &recvTransport, maxRankChunkBytes, &bankLayout));
+  FLAGCXCHECK(registerUniRunnerWorkBuffer(
+      runnerState, hcomm, recvTransport.base, bankLayout.usableBytes));
   int numSlices = resolveUniRunnerZeroCopySlices(
-      maxRankChunkCount * typeSize, bankBytes, runnerState->uniRunnerNSlices);
+      maxRankChunkBytes, bankLayout.bankBytes, runnerState->uniRunnerNSlices);
   if (numSlices <= 0) {
     return flagcxNotSupported;
   }
@@ -1617,11 +1673,12 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
                runnerState->uniRunnerRedSliceSize);
   }
 
-  TRACE(FLAGCX_UNIRUNNER,
-        "rank %d initUniRunnerStateSlicedARZCPY count=%lu bankBytes=%lu "
-        "numSlices=%d numRedSlices=%d transport=%d",
-        rank, count, bankBytes, numSlices, numRedSlices,
-        recvTransport.transport);
+  TRACE(
+      FLAGCX_UNIRUNNER,
+      "rank %d initUniRunnerStateSlicedARZCPY count=%lu bankBytes=%zu "
+      "bankCount=%d usableBytes=%zu numSlices=%d numRedSlices=%d transport=%d",
+      rank, count, bankLayout.bankBytes, bankLayout.bankCount,
+      bankLayout.usableBytes, numSlices, numRedSlices, recvTransport.transport);
 
   auto getChunkSliceLayout = [&](int chunk, int slice, size_t *sliceCount,
                                  size_t *globalOffset) {
@@ -1659,14 +1716,17 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
   }
 
   char *workBase = static_cast<char *>(recvTransport.base);
-  char *bankBase[2] = {workBase, workBase + bankBytes};
+  std::vector<int> bankReleaseNodes(bankLayout.bankCount, -1);
+  auto getBankBase = [&](int bank) {
+    return workBase + static_cast<size_t>(bank) * bankLayout.bankBytes;
+  };
   auto validateBankAccess = [&](const char *bufferName, int peer, int slice,
                                 int step, int bank, size_t offsetInBank,
                                 size_t elemCount) {
     size_t accessBytes = elemCount * typeSize;
-    size_t bankOffset = static_cast<size_t>(bank) * bankBytes;
+    size_t bankOffset = static_cast<size_t>(bank) * bankLayout.bankBytes;
     return validateUniRunnerTransportBufferRange(
-        bufferName, rank, peer, slice, step, recvTransport.bytes,
+        bufferName, rank, peer, slice, step, bankLayout.usableBytes,
         bankOffset + offsetInBank, accessBytes);
   };
 
@@ -1675,39 +1735,62 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
     const int preloadIdx = sliceBase;
     const int postCopyIdx = sliceBase + rsNodesPerSlice - 1;
     const int agBase = sliceBase + rsNodesPerSlice;
-    const int prevSliceTail = (s == 0) ? -1 : (sliceBase - 1);
+    int sliceBanks[2] = {-1, -1};
+    getUniRunnerSliceBankPair(s, bankLayout.bankCount, &sliceBanks[0],
+                              &sliceBanks[1]);
 
     size_t initialSendCount = 0;
     size_t initialSendOffset = 0;
     getChunkSliceLayout(rank, s, &initialSendCount, &initialSendOffset);
-    FLAGCXCHECK(validateBankAccess("transport-preload-dst", rank, s, -1, 0, 0,
-                                   initialSendCount));
+    FLAGCXCHECK(validateBankAccess("transport-preload-dst", rank, s, -1,
+                                   sliceBanks[0], 0, initialSendCount));
+
+    int preloadParents[2] = {-1, -1};
+    int preloadParentCount = 0;
+    for (int i = 0; i < 2; i++) {
+      int releaseNodeIdx = bankReleaseNodes[sliceBanks[i]];
+      if (releaseNodeIdx == -1) {
+        continue;
+      }
+      bool alreadyAdded = false;
+      for (int p = 0; p < preloadParentCount; p++) {
+        if (preloadParents[p] == releaseNodeIdx) {
+          alreadyAdded = true;
+          break;
+        }
+      }
+      if (!alreadyAdded) {
+        preloadParents[preloadParentCount++] = releaseNodeIdx;
+      }
+    }
 
     runnerState->dagNodes[preloadIdx].nodeIdx = preloadIdx;
     runnerState->dagNodes[preloadIdx].nodeType = uniRunnerDagNodeTypeCpy;
     runnerState->dagNodes[preloadIdx].nodeData.cpy.src = static_cast<void *>(
         static_cast<char *>(const_cast<void *>(sendbuff)) + initialSendOffset);
     runnerState->dagNodes[preloadIdx].nodeData.cpy.dst =
-        static_cast<void *>(bankBase[0]);
+        static_cast<void *>(getBankBase(sliceBanks[0]));
     runnerState->dagNodes[preloadIdx].nodeData.cpy.count = initialSendCount;
     runnerState->dagNodes[preloadIdx].nodeData.cpy.datatype = datatype;
-    runnerState->dagNodes[preloadIdx].numParents = (s == 0) ? 0 : 1;
+    runnerState->dagNodes[preloadIdx].numParents = preloadParentCount;
     runnerState->dagNodes[preloadIdx].numChildren = 1;
     FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[preloadIdx]));
-    if (s == 0) {
+    if (preloadParentCount == 0) {
       flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
                               &runnerState->dagNodes[preloadIdx]);
     } else {
       runnerState->numPendingNodes++;
-      FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[preloadIdx], 0,
-                                   prevSliceTail));
+      for (int p = 0; p < preloadParentCount; p++) {
+        FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[preloadIdx], p,
+                                     preloadParents[p]));
+      }
     }
     runnerState->dagNodes[preloadIdx].children[0] = sliceBase + 1;
 
     for (int i = 0; i < nranks - 1; i++) {
       const int p2pNodeIdx = sliceBase + 1 + i * (1 + numRedSlices);
-      const int sendBank = i % 2;
-      const int recvBank = 1 - sendBank;
+      const int sendBank = sliceBanks[i % 2];
+      const int recvBank = sliceBanks[1 - (i % 2)];
 
       int txChunk = (rank - i + nranks) % nranks;
       int rxChunk = (rank - i - 1 + nranks) % nranks;
@@ -1735,7 +1818,7 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
           txSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].addr =
-          static_cast<void *>(bankBase[sendBank]);
+          static_cast<void *>(getBankBase(sendBank));
 
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
           flagcxDevicePrimRecv;
@@ -1744,7 +1827,7 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
           rxSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
-          static_cast<void *>(bankBase[recvBank]);
+          static_cast<void *>(getBankBase(recvBank));
 
       runnerState->dagNodes[p2pNodeIdx].numParents =
           (i == 0) ? 1 : numRedSlices;
@@ -1788,13 +1871,13 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
         runnerState->dagNodes[redNodeIdx].nodeType = uniRunnerDagNodeTypeRed;
         runnerState->dagNodes[redNodeIdx].nodeData.red.triggerIdx = -1;
         runnerState->dagNodes[redNodeIdx].nodeData.red.input1 =
-            static_cast<void *>(bankBase[recvBank] + redOffset);
+            static_cast<void *>(getBankBase(recvBank) + redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.input2 =
             static_cast<void *>(
                 static_cast<char *>(const_cast<void *>(sendbuff)) + rxOffset +
                 redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.output =
-            static_cast<void *>(bankBase[recvBank] + redOffset);
+            static_cast<void *>(getBankBase(recvBank) + redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.count = redCount;
         runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
             runnerState->uniRunnerNThreads;
@@ -1814,12 +1897,12 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
     size_t localChunkCount = 0, localChunkOffset = 0;
     getChunkSliceLayout(rank, s, &localChunkCount, &localChunkOffset);
     FLAGCXCHECK(validateBankAccess("transport-postcopy-src", rank, s,
-                                   nranks - 1, (nranks - 1) % 2, 0,
+                                   nranks - 1, sliceBanks[(nranks - 1) % 2], 0,
                                    localChunkCount));
     runnerState->dagNodes[postCopyIdx].nodeIdx = postCopyIdx;
     runnerState->dagNodes[postCopyIdx].nodeType = uniRunnerDagNodeTypeCpy;
     runnerState->dagNodes[postCopyIdx].nodeData.cpy.src =
-        static_cast<void *>(bankBase[(nranks - 1) % 2]);
+        static_cast<void *>(getBankBase(sliceBanks[(nranks - 1) % 2]));
     runnerState->dagNodes[postCopyIdx].nodeData.cpy.dst =
         static_cast<void *>(static_cast<char *>(recvbuff) + localChunkOffset);
     runnerState->dagNodes[postCopyIdx].nodeData.cpy.count = localChunkCount;
@@ -1836,6 +1919,8 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
       }
     }
     runnerState->dagNodes[postCopyIdx].children[0] = agBase;
+    bankReleaseNodes[sliceBanks[0]] = postCopyIdx;
+    bankReleaseNodes[sliceBanks[1]] = postCopyIdx;
 
     for (int i = 0; i < nranks - 1; i++) {
       int p2pNodeIdx = agBase + i;
@@ -1873,16 +1958,13 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
           static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
 
       runnerState->dagNodes[p2pNodeIdx].numParents = 1;
-      runnerState->dagNodes[p2pNodeIdx].numChildren =
-          (i == nranks - 2) ? ((s == numSlices - 1) ? 0 : 1) : 1;
+      runnerState->dagNodes[p2pNodeIdx].numChildren = (i == nranks - 2) ? 0 : 1;
       runnerState->numPendingNodes++;
       FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[p2pNodeIdx]));
       FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], 0,
                                    (i == 0) ? postCopyIdx : (p2pNodeIdx - 1)));
       if (i != nranks - 2) {
         runnerState->dagNodes[p2pNodeIdx].children[0] = p2pNodeIdx + 1;
-      } else if (s != numSlices - 1) {
-        runnerState->dagNodes[p2pNodeIdx].children[0] = (s + 1) * nodesPerSlice;
       }
     }
   }
@@ -2545,8 +2627,7 @@ static flagcxResult_t submitUniRunnerTransportOp(
     return flagcxNotSupported;
   }
 
-  FLAGCXCHECK(
-      ensureUniRunnerPeerConnection(comm, opData->peerRank, isSend));
+  FLAGCXCHECK(ensureUniRunnerPeerConnection(comm, opData->peerRank, isSend));
 
   flagcxConnector *conn = isSend
                               ? comm->channels[0].peers[opData->peerRank]->send
@@ -2664,8 +2745,8 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
 
     struct uniRunnerP2pOpData *ops = current->nodeData.p2p.ops;
     if (current->nodeData.p2p.useInternalTransportSubmit) {
-      FLAGCXCHECK(preconnectUniRunnerP2pOps(
-          comm, ops, current->nodeData.p2p.numOps));
+      FLAGCXCHECK(
+          preconnectUniRunnerP2pOps(comm, ops, current->nodeData.p2p.numOps));
       std::shared_ptr<flagcxSemaphore> semaphore =
           std::make_shared<flagcxHostSemaphore>();
       runnerState->nodeSemaphores[current->nodeIdx] = semaphore;
