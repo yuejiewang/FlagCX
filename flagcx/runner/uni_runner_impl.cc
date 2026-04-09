@@ -1704,8 +1704,9 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
     }
   };
 
-  const int rsNodesPerSlice = 1 + (nranks - 1) * (1 + numRedSlices) + 1;
-  const int agNodesPerSlice = nranks - 1;
+  const int ringSteps = nranks - 1;
+  const int rsNodesPerSlice = 1 + ringSteps * (1 + numRedSlices);
+  const int agNodesPerSlice = 3 * ringSteps;
   const int nodesPerSlice = rsNodesPerSlice + agNodesPerSlice;
   runnerState->numDagNodes = numSlices * nodesPerSlice;
   FLAGCXCHECK(
@@ -1733,17 +1734,21 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
   for (int s = 0; s < numSlices; s++) {
     const int sliceBase = s * nodesPerSlice;
     const int preloadIdx = sliceBase;
-    const int postCopyIdx = sliceBase + rsNodesPerSlice - 1;
     const int agBase = sliceBase + rsNodesPerSlice;
     int sliceBanks[2] = {-1, -1};
     getUniRunnerSliceBankPair(s, bankLayout.bankCount, &sliceBanks[0],
                               &sliceBanks[1]);
+    // Each zero-copy RS slice keeps a fixed send bank and a fixed recv bank:
+    // preload/reduce write the next chunk to sendBank, while transport recv
+    // always lands in recvBank.
+    const int sendBank = sliceBanks[0];
+    const int recvBank = sliceBanks[1];
 
     size_t initialSendCount = 0;
     size_t initialSendOffset = 0;
     getChunkSliceLayout(rank, s, &initialSendCount, &initialSendOffset);
     FLAGCXCHECK(validateBankAccess("transport-preload-dst", rank, s, -1,
-                                   sliceBanks[0], 0, initialSendCount));
+                                   sendBank, 0, initialSendCount));
 
     int preloadParents[2] = {-1, -1};
     int preloadParentCount = 0;
@@ -1769,11 +1774,11 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
     runnerState->dagNodes[preloadIdx].nodeData.cpy.src = static_cast<void *>(
         static_cast<char *>(const_cast<void *>(sendbuff)) + initialSendOffset);
     runnerState->dagNodes[preloadIdx].nodeData.cpy.dst =
-        static_cast<void *>(getBankBase(sliceBanks[0]));
+        static_cast<void *>(getBankBase(sendBank));
     runnerState->dagNodes[preloadIdx].nodeData.cpy.count = initialSendCount;
     runnerState->dagNodes[preloadIdx].nodeData.cpy.datatype = datatype;
     runnerState->dagNodes[preloadIdx].numParents = preloadParentCount;
-    runnerState->dagNodes[preloadIdx].numChildren = 1;
+    runnerState->dagNodes[preloadIdx].numChildren = (ringSteps == 0) ? 0 : 1;
     FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[preloadIdx]));
     if (preloadParentCount == 0) {
       flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
@@ -1785,12 +1790,15 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
                                      preloadParents[p]));
       }
     }
-    runnerState->dagNodes[preloadIdx].children[0] = sliceBase + 1;
+    if (ringSteps != 0) {
+      runnerState->dagNodes[preloadIdx].children[0] = sliceBase + 1;
+    } else {
+      bankReleaseNodes[sliceBanks[0]] = preloadIdx;
+      bankReleaseNodes[sliceBanks[1]] = preloadIdx;
+    }
 
-    for (int i = 0; i < nranks - 1; i++) {
+    for (int i = 0; i < ringSteps; i++) {
       const int p2pNodeIdx = sliceBase + 1 + i * (1 + numRedSlices);
-      const int sendBank = sliceBanks[i % 2];
-      const int recvBank = sliceBanks[1 - (i % 2)];
 
       int txChunk = (rank - i + nranks) % nranks;
       int rxChunk = (rank - i - 1 + nranks) % nranks;
@@ -1865,7 +1873,7 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
         FLAGCXCHECK(validateBankAccess("transport-reduce-input", prevRank, s, i,
                                        recvBank, redOffset, redCount));
         FLAGCXCHECK(validateBankAccess("transport-reduce-output", nextRank, s,
-                                       i, recvBank, redOffset, redCount));
+                                       i, sendBank, redOffset, redCount));
 
         runnerState->dagNodes[redNodeIdx].nodeIdx = redNodeIdx;
         runnerState->dagNodes[redNodeIdx].nodeType = uniRunnerDagNodeTypeRed;
@@ -1877,7 +1885,7 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
                 static_cast<char *>(const_cast<void *>(sendbuff)) + rxOffset +
                 redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.output =
-            static_cast<void *>(getBankBase(recvBank) + redOffset);
+            static_cast<void *>(getBankBase(sendBank) + redOffset);
         runnerState->dagNodes[redNodeIdx].nodeData.red.count = redCount;
         runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
             runnerState->uniRunnerNThreads;
@@ -1890,45 +1898,28 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
         FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[redNodeIdx], 0,
                                      p2pNodeIdx));
         runnerState->dagNodes[redNodeIdx].children[0] =
-            (i == nranks - 2) ? postCopyIdx : (p2pNodeIdx + 1 + numRedSlices);
+            (i == ringSteps - 1) ? agBase : (p2pNodeIdx + 1 + numRedSlices);
       }
     }
 
-    size_t localChunkCount = 0, localChunkOffset = 0;
-    getChunkSliceLayout(rank, s, &localChunkCount, &localChunkOffset);
-    FLAGCXCHECK(validateBankAccess("transport-postcopy-src", rank, s,
-                                   nranks - 1, sliceBanks[(nranks - 1) % 2], 0,
-                                   localChunkCount));
-    runnerState->dagNodes[postCopyIdx].nodeIdx = postCopyIdx;
-    runnerState->dagNodes[postCopyIdx].nodeType = uniRunnerDagNodeTypeCpy;
-    runnerState->dagNodes[postCopyIdx].nodeData.cpy.src =
-        static_cast<void *>(getBankBase(sliceBanks[(nranks - 1) % 2]));
-    runnerState->dagNodes[postCopyIdx].nodeData.cpy.dst =
-        static_cast<void *>(static_cast<char *>(recvbuff) + localChunkOffset);
-    runnerState->dagNodes[postCopyIdx].nodeData.cpy.count = localChunkCount;
-    runnerState->dagNodes[postCopyIdx].nodeData.cpy.datatype = datatype;
-    runnerState->dagNodes[postCopyIdx].numParents = numRedSlices;
-    runnerState->dagNodes[postCopyIdx].numChildren = 1;
-    runnerState->numPendingNodes++;
-    FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[postCopyIdx]));
-    {
-      int finalRedStart = sliceBase + 1 + (nranks - 2) * (1 + numRedSlices) + 1;
-      for (int r = 0; r < numRedSlices; r++) {
-        FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[postCopyIdx], r,
-                                     finalRedStart + r));
-      }
-    }
-    runnerState->dagNodes[postCopyIdx].children[0] = agBase;
-    bankReleaseNodes[sliceBanks[0]] = postCopyIdx;
-    bankReleaseNodes[sliceBanks[1]] = postCopyIdx;
-
-    for (int i = 0; i < nranks - 1; i++) {
-      int p2pNodeIdx = agBase + i;
+    int agNodeIdx = agBase;
+    int prevAgRecvOutIdx = -1;
+    int lastAgRecvOutIdx = -1;
+    for (int i = 0; i < ringSteps; i++) {
+      const int p2pNodeIdx = agNodeIdx++;
+      const int localCopyIdx = (i == 0) ? agNodeIdx++ : -1;
+      const int recvToSendIdx = (i < ringSteps - 1) ? agNodeIdx++ : -1;
+      const int recvOutIdx = agNodeIdx++;
+      const int nextP2pIdx = (i == ringSteps - 1) ? -1 : agNodeIdx;
       int txChunk = (rank - i + 1 + nranks) % nranks;
       int rxChunk = (rank - i + nranks) % nranks;
       size_t txSliceCount = 0, rxSliceCount = 0, txOffset = 0, rxOffset = 0;
       getChunkSliceLayout(txChunk, s, &txSliceCount, &txOffset);
       getChunkSliceLayout(rxChunk, s, &rxSliceCount, &rxOffset);
+      FLAGCXCHECK(validateBankAccess("transport-ag-send-bank", nextRank, s, i,
+                                     sendBank, 0, txSliceCount));
+      FLAGCXCHECK(validateBankAccess("transport-ag-recv-bank", prevRank, s, i,
+                                     recvBank, 0, rxSliceCount));
 
       runnerState->dagNodes[p2pNodeIdx].nodeIdx = p2pNodeIdx;
       runnerState->dagNodes[p2pNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
@@ -1946,7 +1937,7 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
           txSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[0].addr =
-          static_cast<void *>(static_cast<char *>(recvbuff) + txOffset);
+          static_cast<void *>(getBankBase(sendBank));
 
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].type =
           flagcxDevicePrimRecv;
@@ -1955,17 +1946,99 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
           rxSliceCount;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].datatype = datatype;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops[1].addr =
-          static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
+          static_cast<void *>(getBankBase(recvBank));
 
-      runnerState->dagNodes[p2pNodeIdx].numParents = 1;
-      runnerState->dagNodes[p2pNodeIdx].numChildren = (i == nranks - 2) ? 0 : 1;
+      runnerState->dagNodes[p2pNodeIdx].numParents =
+          (i == 0) ? numRedSlices : 1;
+      runnerState->dagNodes[p2pNodeIdx].numChildren = 1;
       runnerState->numPendingNodes++;
       FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[p2pNodeIdx]));
-      FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], 0,
-                                   (i == 0) ? postCopyIdx : (p2pNodeIdx - 1)));
-      if (i != nranks - 2) {
-        runnerState->dagNodes[p2pNodeIdx].children[0] = p2pNodeIdx + 1;
+      if (i == 0) {
+        int finalRedStart =
+            sliceBase + 1 + (ringSteps - 1) * (1 + numRedSlices) + 1;
+        for (int r = 0; r < numRedSlices; r++) {
+          FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], r,
+                                       finalRedStart + r));
+        }
+      } else {
+        FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], 0,
+                                     prevAgRecvOutIdx));
       }
+      runnerState->dagNodes[p2pNodeIdx].children[0] =
+          (i == 0) ? localCopyIdx
+                   : ((recvToSendIdx != -1) ? recvToSendIdx : recvOutIdx);
+
+      if (i == 0) {
+        FLAGCXCHECK(validateBankAccess("transport-ag-local-copy", rank, s, i,
+                                       sendBank, 0, txSliceCount));
+        runnerState->dagNodes[localCopyIdx].nodeIdx = localCopyIdx;
+        runnerState->dagNodes[localCopyIdx].nodeType = uniRunnerDagNodeTypeCpy;
+        runnerState->dagNodes[localCopyIdx].nodeData.cpy.src =
+            static_cast<void *>(getBankBase(sendBank));
+        runnerState->dagNodes[localCopyIdx].nodeData.cpy.dst =
+            static_cast<void *>(static_cast<char *>(recvbuff) + txOffset);
+        runnerState->dagNodes[localCopyIdx].nodeData.cpy.count = txSliceCount;
+        runnerState->dagNodes[localCopyIdx].nodeData.cpy.datatype = datatype;
+        runnerState->dagNodes[localCopyIdx].numParents = 1;
+        runnerState->dagNodes[localCopyIdx].numChildren = 1;
+        runnerState->numPendingNodes++;
+        FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[localCopyIdx]));
+        FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[localCopyIdx], 0,
+                                     p2pNodeIdx));
+        runnerState->dagNodes[localCopyIdx].children[0] =
+            (recvToSendIdx != -1) ? recvToSendIdx : recvOutIdx;
+      }
+
+      if (recvToSendIdx != -1) {
+        FLAGCXCHECK(validateBankAccess("transport-ag-forward-src", prevRank, s,
+                                       i, recvBank, 0, rxSliceCount));
+        FLAGCXCHECK(validateBankAccess("transport-ag-forward-dst", nextRank, s,
+                                       i + 1, sendBank, 0, rxSliceCount));
+        runnerState->dagNodes[recvToSendIdx].nodeIdx = recvToSendIdx;
+        runnerState->dagNodes[recvToSendIdx].nodeType = uniRunnerDagNodeTypeCpy;
+        runnerState->dagNodes[recvToSendIdx].nodeData.cpy.src =
+            static_cast<void *>(getBankBase(recvBank));
+        runnerState->dagNodes[recvToSendIdx].nodeData.cpy.dst =
+            static_cast<void *>(getBankBase(sendBank));
+        runnerState->dagNodes[recvToSendIdx].nodeData.cpy.count = rxSliceCount;
+        runnerState->dagNodes[recvToSendIdx].nodeData.cpy.datatype = datatype;
+        runnerState->dagNodes[recvToSendIdx].numParents = 1;
+        runnerState->dagNodes[recvToSendIdx].numChildren = 1;
+        runnerState->numPendingNodes++;
+        FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[recvToSendIdx]));
+        FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[recvToSendIdx], 0,
+                                     (i == 0) ? localCopyIdx : p2pNodeIdx));
+        runnerState->dagNodes[recvToSendIdx].children[0] = recvOutIdx;
+      }
+
+      FLAGCXCHECK(validateBankAccess("transport-ag-recv-copy", prevRank, s, i,
+                                     recvBank, 0, rxSliceCount));
+      runnerState->dagNodes[recvOutIdx].nodeIdx = recvOutIdx;
+      runnerState->dagNodes[recvOutIdx].nodeType = uniRunnerDagNodeTypeCpy;
+      runnerState->dagNodes[recvOutIdx].nodeData.cpy.src =
+          static_cast<void *>(getBankBase(recvBank));
+      runnerState->dagNodes[recvOutIdx].nodeData.cpy.dst =
+          static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
+      runnerState->dagNodes[recvOutIdx].nodeData.cpy.count = rxSliceCount;
+      runnerState->dagNodes[recvOutIdx].nodeData.cpy.datatype = datatype;
+      runnerState->dagNodes[recvOutIdx].numParents = 1;
+      runnerState->dagNodes[recvOutIdx].numChildren =
+          (i == ringSteps - 1) ? 0 : 1;
+      runnerState->numPendingNodes++;
+      FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[recvOutIdx]));
+      FLAGCXCHECK(setDagNodeParent(
+          &runnerState->dagNodes[recvOutIdx], 0,
+          (recvToSendIdx != -1) ? recvToSendIdx
+                                : ((i == 0) ? localCopyIdx : p2pNodeIdx)));
+      if (nextP2pIdx != -1) {
+        runnerState->dagNodes[recvOutIdx].children[0] = nextP2pIdx;
+      }
+      prevAgRecvOutIdx = recvOutIdx;
+      lastAgRecvOutIdx = recvOutIdx;
+    }
+    if (ringSteps != 0) {
+      bankReleaseNodes[sliceBanks[0]] = lastAgRecvOutIdx;
+      bankReleaseNodes[sliceBanks[1]] = lastAgRecvOutIdx;
     }
   }
 
