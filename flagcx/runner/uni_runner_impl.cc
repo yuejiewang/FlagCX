@@ -321,7 +321,8 @@ resolveUniRunnerTransportBankLayout(const uniRunnerTransportBufferView *view,
   layout->usableBytes =
       layout->bankBytes * static_cast<size_t>(layout->bankCount);
   if (layout->usableBytes > view->bytes) {
-    WARN(
+    TRACE(
+        FLAGCX_UNIRUNNER,
         "uniRunner transport bank layout exceeds transport buffer: "
         "transport=%d bankBytes=%zu bankCount=%d usableBytes=%zu viewBytes=%zu",
         view->transport, layout->bankBytes, layout->bankCount,
@@ -362,11 +363,41 @@ static inline void getUniRunnerSliceBankPair(int slice, int bankCount,
   *bank1 = (base + 1) % bankCount;
 }
 
+static int collectUniRunnerTransportReleaseParents(
+    const int *resources, int nResources,
+    const std::vector<int> &resourceReleaseNodes, int *parents,
+    int maxParents) {
+  int parentCount = 0;
+  for (int i = 0; i < nResources; i++) {
+    int resourceIdx = resources[i];
+    if (resourceIdx < 0 ||
+        resourceIdx >= static_cast<int>(resourceReleaseNodes.size())) {
+      continue;
+    }
+    int releaseNodeIdx = resourceReleaseNodes[resourceIdx];
+    if (releaseNodeIdx < 0) {
+      continue;
+    }
+    bool alreadyAdded = false;
+    for (int p = 0; p < parentCount; p++) {
+      if (parents[p] == releaseNodeIdx) {
+        alreadyAdded = true;
+        break;
+      }
+    }
+    if (!alreadyAdded && parentCount < maxParents) {
+      parents[parentCount++] = releaseNodeIdx;
+    }
+  }
+  return parentCount;
+}
+
 static flagcxResult_t validateUniRunnerTransportBufferRange(
     const char *bufferName, int rank, int peer, int slice, int step,
     size_t resourceBytes, size_t offset, size_t bytes) {
   if (offset > resourceBytes || bytes > resourceBytes - offset) {
-    WARN(
+    TRACE(
+        FLAGCX_UNIRUNNER,
         "uniRunner transport buffer overflow: rank %d peer %d slice %d step %d "
         "buffer %s offset %zu bytes %zu capacity %zu",
         rank, peer, slice, step, bufferName ? bufferName : "unknown", offset,
@@ -1679,6 +1710,12 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
       "bankCount=%d usableBytes=%zu numSlices=%d numRedSlices=%d transport=%d",
       rank, count, bankLayout.bankBytes, bankLayout.bankCount,
       bankLayout.usableBytes, numSlices, numRedSlices, recvTransport.transport);
+  if (numSlices > bankLayout.bankCount) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "rank %d zero-copy slices (%d) exceed transport chunks (%d); "
+          "recycling transport resources with stream-flag dependencies",
+          rank, numSlices, bankLayout.bankCount);
+  }
 
   auto getChunkSliceLayout = [&](int chunk, int slice, size_t *sliceCount,
                                  size_t *globalOffset) {
@@ -1717,7 +1754,7 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
   }
 
   char *workBase = static_cast<char *>(recvTransport.base);
-  std::vector<int> bankReleaseNodes(bankLayout.bankCount, -1);
+  std::vector<int> transportResourceReleaseNodes(bankLayout.bankCount, -1);
   auto getBankBase = [&](int bank) {
     return workBase + static_cast<size_t>(bank) * bankLayout.bankBytes;
   };
@@ -1751,23 +1788,12 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
                                    sendBank, 0, initialSendCount));
 
     int preloadParents[2] = {-1, -1};
-    int preloadParentCount = 0;
-    for (int i = 0; i < 2; i++) {
-      int releaseNodeIdx = bankReleaseNodes[sliceBanks[i]];
-      if (releaseNodeIdx == -1) {
-        continue;
-      }
-      bool alreadyAdded = false;
-      for (int p = 0; p < preloadParentCount; p++) {
-        if (preloadParents[p] == releaseNodeIdx) {
-          alreadyAdded = true;
-          break;
-        }
-      }
-      if (!alreadyAdded) {
-        preloadParents[preloadParentCount++] = releaseNodeIdx;
-      }
-    }
+    // When slices outnumber transport chunks, later slices round-robin the
+    // same chunk banks. These parent edges become stream wait/write
+    // dependencies at launch time and prevent a bank from being reused before
+    // the prior slice has fully released it.
+    int preloadParentCount = collectUniRunnerTransportReleaseParents(
+        sliceBanks, 2, transportResourceReleaseNodes, preloadParents, 2);
 
     runnerState->dagNodes[preloadIdx].nodeIdx = preloadIdx;
     runnerState->dagNodes[preloadIdx].nodeType = uniRunnerDagNodeTypeCpy;
@@ -1793,8 +1819,8 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
     if (ringSteps != 0) {
       runnerState->dagNodes[preloadIdx].children[0] = sliceBase + 1;
     } else {
-      bankReleaseNodes[sliceBanks[0]] = preloadIdx;
-      bankReleaseNodes[sliceBanks[1]] = preloadIdx;
+      transportResourceReleaseNodes[sliceBanks[0]] = preloadIdx;
+      transportResourceReleaseNodes[sliceBanks[1]] = preloadIdx;
     }
 
     for (int i = 0; i < ringSteps; i++) {
@@ -2037,8 +2063,8 @@ flagcxResult_t initUniRunnerStateSlicedARZCPY(flagcxUniRunnerState *runnerState,
       lastAgRecvOutIdx = recvOutIdx;
     }
     if (ringSteps != 0) {
-      bankReleaseNodes[sliceBanks[0]] = lastAgRecvOutIdx;
-      bankReleaseNodes[sliceBanks[1]] = lastAgRecvOutIdx;
+      transportResourceReleaseNodes[sliceBanks[0]] = lastAgRecvOutIdx;
+      transportResourceReleaseNodes[sliceBanks[1]] = lastAgRecvOutIdx;
     }
   }
 
