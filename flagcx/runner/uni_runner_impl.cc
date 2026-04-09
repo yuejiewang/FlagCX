@@ -43,6 +43,9 @@ static flagcxResult_t setDagNodeParent(uniRunnerDagNode *node, int parentSlot,
                                        int parentIdx) {
   if (parentSlot < 0 || parentSlot >= node->numParents ||
       node->parents == NULL) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "Invalid parentSlot %d for node %d with numParents %d and parents %p",
+          parentSlot, node->nodeIdx, node->numParents, node->parents);
     return flagcxInternalError;
   }
   node->parents[parentSlot] = parentIdx;
@@ -64,13 +67,21 @@ static flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState) {
   for (int i = 0; i < numDagNodes; i++) {
     uniRunnerDagNode *node = &dagNodes[i];
     if (node->pendingParents != node->numParents) {
+      TRACE(FLAGCX_UNIRUNNER,
+            "Node %d has pendingParents %d but numParents %d", node->nodeIdx,
+            node->pendingParents, node->numParents);
       return flagcxInternalError;
     }
     if (node->numParents < 0 || node->numChildren < 0) {
+      TRACE(FLAGCX_UNIRUNNER,
+            "Node %d has invalid numParents %d or numChildren %d", node->nodeIdx,
+            node->numParents, node->numChildren);
       return flagcxInternalError;
     }
     if ((node->numParents > 0 && node->parents == NULL) ||
         (node->numChildren > 0 && node->children == NULL)) {
+      TRACE(FLAGCX_UNIRUNNER,
+            "Node %d has NULL parents or children", node->nodeIdx);
       return flagcxInternalError;
     }
     numEdges += static_cast<size_t>(node->numParents);
@@ -84,12 +95,17 @@ static flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState) {
     for (int p = 0; p < node->numParents; p++) {
       int parentIdx = node->parents[p];
       if (parentIdx < 0 || parentIdx >= numDagNodes || parentIdx == i) {
+        TRACE(FLAGCX_UNIRUNNER,
+              "Node %d has invalid parentIdx %d for numDagNodes %d", node->nodeIdx,
+              parentIdx, numDagNodes);
         return flagcxInternalError;
       }
       uint64_t edge =
           (static_cast<uint64_t>(static_cast<uint32_t>(parentIdx)) << 32) |
           static_cast<uint32_t>(i);
       if (!dagEdges.emplace(edge).second) {
+        TRACE(FLAGCX_UNIRUNNER,
+              "Duplicate edge from parentIdx %d to node %d", parentIdx, node->nodeIdx);
         return flagcxInternalError;
       }
     }
@@ -100,18 +116,31 @@ static flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState) {
     for (int c = 0; c < node->numChildren; c++) {
       int childIdx = node->children[c];
       if (childIdx < 0 || childIdx >= numDagNodes || childIdx == i) {
+        TRACE(FLAGCX_UNIRUNNER,
+              "Node %d has invalid childIdx %d for numDagNodes %d", node->nodeIdx,
+              childIdx, numDagNodes);
         return flagcxInternalError;
       }
       uint64_t edge = (static_cast<uint64_t>(static_cast<uint32_t>(i)) << 32) |
                       static_cast<uint32_t>(childIdx);
       std::unordered_set<uint64_t>::iterator it = dagEdges.find(edge);
       if (it == dagEdges.end()) {
+        TRACE(FLAGCX_UNIRUNNER,
+              "Edge from node %d to childIdx %d not found in parent edges", node->nodeIdx,
+              childIdx);
         return flagcxInternalError;
       }
       dagEdges.erase(it);
     }
   }
 
+  if (dagEdges.empty()) {
+    TRACE(FLAGCX_UNIRUNNER, "DAG validation successful with %d nodes and %zu edges",
+          numDagNodes, numEdges);
+  } else {
+    TRACE(FLAGCX_UNIRUNNER,
+          "DAG validation failed with %zu unmatched edges remaining", dagEdges.size());
+  }
   return dagEdges.empty() ? flagcxSuccess : flagcxInternalError;
 }
 
@@ -192,6 +221,11 @@ static flagcxResult_t ensureUniRunnerPeerConnection(flagcxHeteroComm_t comm,
   FLAGCXCHECK(connectUniRunnerPendingPeers(comm));
 
   flagcxConnector *conn = getUniRunnerPeerConnector(comm, peer, isSend);
+  if (!conn[0].connected) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "Peer %d connection not established after connectUniRunnerPendingPeers", peer);
+    return flagcxInternalError;
+  }
   return conn[0].connected == 1 ? flagcxSuccess : flagcxInternalError;
 }
 
@@ -238,6 +272,8 @@ getUniRunnerRecvTransportBuffer(flagcxHeteroComm_t comm, int peer,
 
   flagcxConnector *conn = comm->channels[0].peers[peer]->recv;
   if (conn[0].proxyConn.connection == NULL) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "Peer %d recv connection is NULL after ensureUniRunnerPeerConnection", peer);
     return flagcxInternalError;
   }
 
@@ -250,6 +286,8 @@ getUniRunnerRecvTransportBuffer(flagcxHeteroComm_t comm, int peer,
     recvNetResources *resources = reinterpret_cast<recvNetResources *>(
         conn[0].proxyConn.connection->transportResources);
     if (resources == NULL) {
+      TRACE(FLAGCX_UNIRUNNER,
+            "Peer %d recv transportResources is NULL for NET transport", peer);
       return flagcxInternalError;
     }
     view->base = resources->buffers[0];
@@ -263,6 +301,9 @@ getUniRunnerRecvTransportBuffer(flagcxHeteroComm_t comm, int peer,
   }
 
   if (view->base == NULL || view->bytes == 0) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "Peer %d recv transport buffer is invalid for transport %d: base %p bytes %zu",
+          peer, view->transport, view->base, view->bytes);
     return flagcxInternalError;
   }
   return flagcxSuccess;
@@ -283,6 +324,11 @@ registerUniRunnerWorkBuffer(flagcxUniRunnerState *runnerState,
   runnerState->transportWorkBufferRegHandle =
       reinterpret_cast<void *>(globalRegPool.getItem(
           reinterpret_cast<void *>(comm), static_cast<void *>(base)));
+  if (runnerState->transportWorkBufferRegHandle == NULL) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "Failed to register uniRunner transport work buffer with globalRegPool");
+    return flagcxInternalError;
+  }
   return runnerState->transportWorkBufferRegHandle != NULL
              ? flagcxSuccess
              : flagcxInternalError;
@@ -2732,6 +2778,9 @@ static flagcxResult_t submitUniRunnerTransportOp(
                               ? comm->channels[0].peers[opData->peerRank]->send
                               : comm->channels[0].peers[opData->peerRank]->recv;
   if (conn[0].proxyConn.connection == NULL) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "rank %d failed to get proxy connection for peer %d, isSend %d", comm->rank,
+          opData->peerRank, isSend);
     return flagcxInternalError;
   }
 
@@ -2949,6 +2998,9 @@ static flagcxResult_t notifyChildrenScheduled(flagcxUniRunnerState *runnerState,
   for (int i = 0; i < current->numChildren; i++) {
     uniRunnerDagNode *child = &runnerState->dagNodes[current->children[i]];
     if (child->pendingParents <= 0) {
+      TRACE(FLAGCX_UNIRUNNER,
+            "node %d child node %d already has pendingParents %d <= 0",
+            current->nodeIdx, current->children[i], child->pendingParents);
       return flagcxInternalError;
     }
     child->pendingParents--;
