@@ -3010,26 +3010,18 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
       return flagcxInvalidArgument;
     }
     int idx = -1;
-    uint64_t enqueueCtx = runnerState->nextRedFifoCtx;
     uint64_t capacity = runnerState->fifo->buffer[flagcxFifoIdxCapacity];
     size_t fifoSize = flagcxFifoIdxData * sizeof(uint64_t) +
                       capacity * sizeof(flagcxReduceTrigger);
-    for (uint64_t i = 0; i < runnerState->uniRunnerNContexts; i++) {
-      uint64_t ctx =
-          (runnerState->nextRedFifoCtx + i) % runnerState->uniRunnerNContexts;
-      uint64_t *ctxBuffer = reinterpret_cast<uint64_t *>(
-          reinterpret_cast<char *>(runnerState->fifo->buffer) + ctx * fifoSize);
-      FLAGCXCHECK(enqueue(
-          (void *)ctxBuffer, (uintptr_t)current->nodeData.red.input1,
-          (uintptr_t)current->nodeData.red.input2,
-          (uintptr_t)current->nodeData.red.output, current->nodeData.red.count,
-          current->nodeData.red.nthreads, current->nodeData.red.datatype,
-          current->nodeData.red.redOp, flagIn, flagOut, &idx));
-      if (idx != -1) {
-        enqueueCtx = ctx;
-        break;
-      }
-    }
+    uint64_t ctx = runnerState->nextRedFifoCtx;
+    uint64_t *ctxBuffer = reinterpret_cast<uint64_t *>(
+        reinterpret_cast<char *>(runnerState->fifo->buffer) + ctx * fifoSize);
+    FLAGCXCHECK(enqueue(
+        (void *)ctxBuffer, (uintptr_t)current->nodeData.red.input1,
+        (uintptr_t)current->nodeData.red.input2,
+        (uintptr_t)current->nodeData.red.output, current->nodeData.red.count,
+        current->nodeData.red.nthreads, current->nodeData.red.datatype,
+        current->nodeData.red.redOp, flagIn, flagOut, &idx));
     if (idx == -1) {
       sched_yield();
       break; // FIFO full, skip for now
@@ -3037,8 +3029,7 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
     // Dequeue
     flagcxIntruQueueDequeue(&runnerState->redReadyQueue);
     current->nodeData.red.triggerIdx = idx;
-    runnerState->nextRedFifoCtx =
-        (enqueueCtx + 1) % runnerState->uniRunnerNContexts;
+    runnerState->nextRedFifoCtx = (ctx + 1) % runnerState->uniRunnerNContexts;
     FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
   }
 
