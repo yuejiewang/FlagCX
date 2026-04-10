@@ -214,7 +214,7 @@ public:
   flagcxFifo() {}
   ~flagcxFifo() {}
   flagcxResult_t flagcxFifoInit();
-  flagcxResult_t flagcxRedFifoInit();
+  flagcxResult_t flagcxRedFifoInit(int nctx);
   flagcxResult_t flagcxFifoDestroy();
   flagcxResult_t flagcxRedFifoDestroy();
 };
@@ -233,11 +233,13 @@ FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
 FLAGCX_DEVICE_DECORATOR size_t
 getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype);
 
-FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer);
+FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer,
+                                                    size_t nctx);
 #endif // COMPILE_KERNEL
 
 void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
-                                  size_t nblocks, flagcxStream_t stream);
+                                  size_t nblocks, size_t nctx,
+                                  flagcxStream_t stream);
 
 // ==========================================================================
 // Device Communicator — Host-side lifecycle management

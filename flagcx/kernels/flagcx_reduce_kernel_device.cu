@@ -1,6 +1,6 @@
+#include "device_api/comm_traits.h"
 #include "flagcx.h"
 #include "flagcx_kernel.h"
-#include "device_api/comm_traits.h"
 
 #define SLOT_IDX 4
 #define FST_IDX 5
@@ -87,13 +87,15 @@ FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getFlagOut() {
   return value[5];
 }
 
-FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(uint64_t *buffer,
+FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
                                                       int *idx) {
   while (true) {
     uint64_t oldConsumed = DeviceAPI::Atomic::load(
-        buffer + flagcxFifoIdxConsumed, flagcxDeviceMemoryOrderAcquire);
+        const_cast<uint64_t *>(buffer + flagcxFifoIdxConsumed),
+        flagcxDeviceMemoryOrderAcquire);
     uint64_t curProduced = DeviceAPI::Atomic::load(
-        buffer + flagcxFifoIdxProduced, flagcxDeviceMemoryOrderAcquire);
+        const_cast<uint64_t *>(buffer + flagcxFifoIdxProduced),
+        flagcxDeviceMemoryOrderAcquire);
     if (oldConsumed >= curProduced) {
       // no-op, task dequeued by other consumers
       *idx = -1;
@@ -101,9 +103,9 @@ FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(uint64_t *buffer,
     }
     // set consumed from `oldConsumed` to `oldConsumed+1`
     uint64_t expected = oldConsumed;
-    if (DeviceAPI::Atomic::compareExchange(buffer + flagcxFifoIdxConsumed,
-                                           expected, oldConsumed + 1,
-                                           flagcxDeviceMemoryOrderAcqRel)) {
+    if (DeviceAPI::Atomic::compareExchange(
+            const_cast<uint64_t *>(buffer + flagcxFifoIdxConsumed), expected,
+            oldConsumed + 1, flagcxDeviceMemoryOrderAcqRel)) {
       *idx = oldConsumed;
       break;
     }
@@ -124,9 +126,16 @@ flagcxReduceKernel(uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
   }
 }
 
-FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
+FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer,
+                                                    size_t nctx) {
   FLAGCX_SHARED uint64_t shm[16];
-  uint64_t *vBuf = (uint64_t *)fifoBuffer;
+  uint64_t *baseBuf = (uint64_t *)fifoBuffer;
+  uint64_t capacity = baseBuf[flagcxFifoIdxCapacity];
+  size_t queueIdx = nctx > 1 ? FLAGCX_BLOCK_IDX_X % nctx : 0;
+  size_t fifoSize = flagcxFifoIdxData * sizeof(uint64_t) +
+                    capacity * sizeof(flagcxReduceTrigger);
+  uint64_t *vBuf = reinterpret_cast<uint64_t *>(
+      reinterpret_cast<char *>(baseBuf) + queueIdx * fifoSize);
   int emptyIter = 0; // backoff counter
   int cap = -1;
   int c = -1;
@@ -183,6 +192,15 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
         shm[REDOP_IDX] = t->getRedop();
         shm[FLAG_IN_IDX] = t->getFlagIn();
         shm[FLAG_OUT_IDX] = t->getFlagOut();
+        uint64_t flagOut = t->getFlagOut();
+        if (flagOut != 0) {
+          flagcxStreamFlagState flagState = loadStreamFlagState(flagOut);
+          if (flagState == flagcxStreamFlagIdle) {
+            DeviceAPI::Atomic::store(reinterpret_cast<uint64_t *>(flagOut),
+                                     (uint64_t)flagcxStreamFlagPend,
+                                     flagcxDeviceMemoryOrderRelease);
+          }
+        }
       }
     }
     FLAGCX_DEVICE_SYNC_THREADS();
@@ -196,20 +214,6 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
       continue;
     }
 
-    // RED nodes are submitted from the host before they are executable, so the
-    // kernel marks the output flag as pending once it has claimed the FIFO
-    // slot.
-    if (tid == 0 && shm[FLAG_OUT_IDX] != 0) {
-      uint64_t flagOut = shm[FLAG_OUT_IDX];
-      flagcxStreamFlagState flagState = loadStreamFlagState(flagOut);
-      if (flagState == flagcxStreamFlagIdle) {
-        DeviceAPI::Atomic::store(reinterpret_cast<uint64_t *>(flagOut),
-                                 (uint64_t)flagcxStreamFlagPend,
-                                 flagcxDeviceMemoryOrderRelease);
-      }
-    }
-    FLAGCX_DEVICE_SYNC_THREADS();
-
     uint64_t flagIn = shm[FLAG_IN_IDX];
     while (flagIn != 0) {
       flagcxStreamFlagState flagState = loadStreamFlagState(flagIn);
@@ -221,8 +225,6 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
         DeviceAPI::Intrin::spinBackoff(emptyIter);
         continue;
       }
-      emptyIter++;
-      DeviceAPI::Intrin::spinBackoff(emptyIter);
     }
 
     // (4) perform reduce task
@@ -248,7 +250,9 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
 }
 
 void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
-                                  size_t nblocks, flagcxStream_t stream) {
+                                  size_t nblocks, size_t nctx,
+                                  flagcxStream_t stream) {
   flagcxCollectiveKernel<<<nblocks, nthreads, 0,
-                           *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(fifoBuffer);
+                           *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(fifoBuffer,
+                                                                nctx);
 }

@@ -79,20 +79,20 @@ enqueue(void *fifoBuffer, uint64_t addr1, uint64_t addr2, uint64_t addr3,
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxFifo::flagcxRedFifoInit() {
-  TRACE(FLAGCX_INIT, "flagcxRedFifoInit called");
+flagcxResult_t flagcxFifo::flagcxRedFifoInit(int nctx) {
+  TRACE(FLAGCX_INIT, "flagcxRedFifoInit called, nctx=%d", nctx);
   uint64_t flagcxReduceFifoCapacity = flagcxParamReduceFifoCapacity();
-  FLAGCXCHECK(deviceAdaptor->deviceMalloc((void **)&buffer,
-                                          flagcxFifoIdxData * sizeof(uint64_t) +
-                                              flagcxReduceFifoCapacity *
-                                                  sizeof(flagcxReduceTrigger),
-                                          flagcxMemHost, NULL));
-  buffer[flagcxFifoIdxCapacity] = flagcxReduceFifoCapacity;
-  buffer[flagcxFifoIdxConsumed] = 0;
-  buffer[flagcxFifoIdxProduced] = 0;
-  buffer[flagcxFifoIdxTerminate] = 0;
-  memset((void *)(buffer + flagcxFifoIdxData), 0,
-         flagcxReduceFifoCapacity * sizeof(flagcxReduceTrigger));
+  size_t flagcxReduceFifoSize =
+      flagcxFifoIdxData * sizeof(uint64_t) +
+      flagcxReduceFifoCapacity * sizeof(flagcxReduceTrigger);
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+      (void **)&buffer, flagcxReduceFifoSize * nctx, flagcxMemHost, NULL));
+  memset((void *)buffer, 0, flagcxReduceFifoSize * nctx);
+  for (size_t i = 0; i < nctx; i++) {
+    uint64_t *ctxBuffer = reinterpret_cast<uint64_t *>(
+        reinterpret_cast<char *>(buffer) + i * flagcxReduceFifoSize);
+    ctxBuffer[flagcxFifoIdxCapacity] = flagcxReduceFifoCapacity;
+  }
   __sync_synchronize();
   return flagcxSuccess;
 }

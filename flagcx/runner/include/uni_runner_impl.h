@@ -133,6 +133,8 @@ typedef struct {
   uint64_t uniRunnerNSlices;
   uint64_t uniRunnerNThreads;
   uint64_t uniRunnerNBlocks;
+  uint64_t uniRunnerNContexts;
+  uint64_t nextRedFifoCtx;
   uint64_t uniRunnerNRedSlices;
   uint64_t uniRunnerRedSliceSize;
 

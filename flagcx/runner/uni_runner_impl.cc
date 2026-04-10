@@ -30,6 +30,7 @@
 FLAGCX_PARAM(UniRunnerNSlices, "UNIRUNNER_NSLICES", 1);
 FLAGCX_PARAM(UniRunnerNThreads, "UNIRUNNER_NTHREADS", 32);
 FLAGCX_PARAM(UniRunnerNBlocks, "UNIRUNNER_NBLOCKS", 1);
+FLAGCX_PARAM(UniRunnerNCTX, "UNIRUNNER_NCTX", 1);
 FLAGCX_PARAM(UniRunnerNRedSlices, "UNIRUNNER_NREDSLICES", 0);
 FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
 
@@ -3009,13 +3010,26 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
       return flagcxInvalidArgument;
     }
     int idx = -1;
-    FLAGCXCHECK(enqueue(
-        (void *)runnerState->fifo->buffer,
-        (uintptr_t)current->nodeData.red.input1,
-        (uintptr_t)current->nodeData.red.input2,
-        (uintptr_t)current->nodeData.red.output, current->nodeData.red.count,
-        current->nodeData.red.nthreads, current->nodeData.red.datatype,
-        current->nodeData.red.redOp, flagIn, flagOut, &idx));
+    uint64_t enqueueCtx = runnerState->nextRedFifoCtx;
+    uint64_t capacity = runnerState->fifo->buffer[flagcxFifoIdxCapacity];
+    size_t fifoSize = flagcxFifoIdxData * sizeof(uint64_t) +
+                      capacity * sizeof(flagcxReduceTrigger);
+    for (uint64_t i = 0; i < runnerState->uniRunnerNContexts; i++) {
+      uint64_t ctx =
+          (runnerState->nextRedFifoCtx + i) % runnerState->uniRunnerNContexts;
+      uint64_t *ctxBuffer = reinterpret_cast<uint64_t *>(
+          reinterpret_cast<char *>(runnerState->fifo->buffer) + ctx * fifoSize);
+      FLAGCXCHECK(enqueue(
+          (void *)ctxBuffer, (uintptr_t)current->nodeData.red.input1,
+          (uintptr_t)current->nodeData.red.input2,
+          (uintptr_t)current->nodeData.red.output, current->nodeData.red.count,
+          current->nodeData.red.nthreads, current->nodeData.red.datatype,
+          current->nodeData.red.redOp, flagIn, flagOut, &idx));
+      if (idx != -1) {
+        enqueueCtx = ctx;
+        break;
+      }
+    }
     if (idx == -1) {
       sched_yield();
       break; // FIFO full, skip for now
@@ -3023,6 +3037,8 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
     // Dequeue
     flagcxIntruQueueDequeue(&runnerState->redReadyQueue);
     current->nodeData.red.triggerIdx = idx;
+    runnerState->nextRedFifoCtx =
+        (enqueueCtx + 1) % runnerState->uniRunnerNContexts;
     FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
   }
 
@@ -3039,6 +3055,11 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->uniRunnerNSlices = flagcxParamUniRunnerNSlices();
   runnerState->uniRunnerNThreads = flagcxParamUniRunnerNThreads();
   runnerState->uniRunnerNBlocks = flagcxParamUniRunnerNBlocks();
+  runnerState->uniRunnerNContexts = std::min(
+      flagcxParamUniRunnerNCTX(), (int64_t)runnerState->uniRunnerNBlocks);
+  if (runnerState->uniRunnerNContexts <= 0)
+    runnerState->uniRunnerNContexts = 1;
+  runnerState->nextRedFifoCtx = 0;
   runnerState->uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
   runnerState->uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
 
@@ -3047,7 +3068,8 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
 
   // Create FIFO
   runnerState->fifo = new flagcxFifo();
-  FLAGCXCHECK(runnerState->fifo->flagcxRedFifoInit());
+  FLAGCXCHECK(
+      runnerState->fifo->flagcxRedFifoInit(runnerState->uniRunnerNContexts));
   // hcomm->proxyState->uniRunnerState.fifo->buffer is the host pointer
   // hcomm->uniRunnerFifoBuffer stores the device pointer to fifo buffer
   FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
@@ -3110,7 +3132,8 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   // Launch collective kernel
   flagcxLaunchCollectiveKernel(
       hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
-      runnerState->uniRunnerNBlocks, runnerState->redStream);
+      runnerState->uniRunnerNBlocks, runnerState->uniRunnerNContexts,
+      runnerState->redStream);
 #endif
 
   // Main scheduling loop using DAG-based queue scheduling
@@ -3121,8 +3144,16 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
       TRACE(
           FLAGCX_UNIRUNNER,
           "runUniRunner: all submitted work drained, terminating runner loop");
-      __atomic_store_n(fifo->buffer + flagcxFifoIdxTerminate, 1,
-                       __ATOMIC_RELEASE);
+      uint64_t capacity = runnerState->fifo->buffer[flagcxFifoIdxCapacity];
+      size_t fifoSize = flagcxFifoIdxData * sizeof(uint64_t) +
+                        capacity * sizeof(flagcxReduceTrigger);
+      for (uint64_t ctx = 0; ctx < runnerState->uniRunnerNContexts; ctx++) {
+        uint64_t *ctxBuffer = reinterpret_cast<uint64_t *>(
+            reinterpret_cast<char *>(runnerState->fifo->buffer) +
+            ctx * fifoSize);
+        __atomic_store_n(ctxBuffer + flagcxFifoIdxTerminate, 1,
+                         __ATOMIC_RELEASE);
+      }
       break;
     }
 
