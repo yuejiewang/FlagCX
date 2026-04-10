@@ -420,6 +420,12 @@ flagcxResult_t flagcxDevMemDestroy(flagcxComm_t comm, flagcxDevMem_t devMem);
 // so that cudaFree does not deadlock on device synchronization.
 flagcxResult_t flagcxCommCleanupIpcTable(flagcxComm_t comm);
 
+// Tear down inter-node signal relay stored on heteroComm.
+// Must be called before flagcxHeteroCommDestroy (which frees proxyState and
+// heteroComm). Internally drains FIFOs and performs a cross-rank barrier
+// before closing RDMA connections.
+flagcxResult_t flagcxCommRelayDestroy(flagcxComm_t comm);
+
 // Deferred device/host-pinned memory free.
 // Collects pointers during DevComm/DevMem cleanup.
 void flagcxCommDeferFree(flagcxComm_t comm, void *ptr, int memType);
