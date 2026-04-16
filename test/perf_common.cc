@@ -1,5 +1,7 @@
 #include "perf_common.h"
 #include <cstdio>
+#include <cuda_profiler_api.h>
+#include <cuda_runtime.h>
 
 void perfSetup(PerfContext &ctx, int argc, char **argv,
                PerfBufSizeFn bufSizeFn) {
@@ -124,6 +126,9 @@ void perfBenchmarkLoop(PerfContext &ctx, PerfCollFn collFn,
     fprintf(stderr, "Error: stepFactor must be > 1 (got %d)\n", ctx.stepFactor);
     return;
   }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  cudaProfilerStart();
   for (size_t size = ctx.minBytes; size <= ctx.maxBytes;
        size *= ctx.stepFactor) {
     size_t count = size / sizeof(float);
@@ -167,6 +172,9 @@ void perfBenchmarkLoop(PerfContext &ctx, PerfCollFn collFn,
       postIterFn(ctx, size, count);
     }
   }
+
+  cudaDeviceSynchronize();
+  cudaProfilerStop();
 }
 
 void perfRootBenchmarkLoop(PerfContext &ctx, PerfRootCollFn collFn,
