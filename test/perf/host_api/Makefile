@@ -9,14 +9,20 @@ TOOLS_SRC      := $(PROJECT_ROOT)/test/tools.cc
 PERF_COMMON_SRC := $(PROJECT_ROOT)/test/perf_common.cc
 COMMON_SRCS    := $(TOOLS_SRC) $(PERF_COMMON_SRC)
 
+DEVICE_INCLUDE = /usr/local/cuda/include
+DEVICE_LIB = /usr/local/cuda/lib64
+DEVICE_LINK = -lcudart -lcuda
+
 # Includes: flagcx (all subdirs), perf common headers, MPI, JSON
 # Some tests (core_sendrecv, ipc_sendrecv, put) include internal headers
 # from flagcx/core and flagcx/service directly, so we add those too.
 ALL_INCLUDES := $(FLAGCX_INCLUDES) $(PERF_INCLUDE) $(MPI_INCLUDE) \
     -I$(PROJECT_ROOT)/flagcx/core -I$(PROJECT_ROOT)/flagcx/service \
-    -I$(PROJECT_ROOT)
+    -I$(PROJECT_ROOT) -I$(DEVICE_INCLUDE)
 
-ALL_LINK := $(FLAGCX_LINK) $(MPI_LINK)
+ALL_LIB := -L$(DEVICE_LIB)
+
+ALL_LINK := $(FLAGCX_LINK) $(MPI_LINK) $(DEVICE_LINK)
 
 .PHONY: all clean
 
@@ -25,7 +31,7 @@ all: $(BINS)
 $(BINDIR)/perf_%: test_%.cpp $(COMMON_SRCS)
 	@mkdir -p $(BINDIR)
 	@echo "Compiling $@"
-	@$(CXX) $(CXXFLAGS) -o $@ $< $(COMMON_SRCS) $(ALL_INCLUDES) $(ALL_LINK)
+	@$(CXX) $(CXXFLAGS) -o $@ $< $(COMMON_SRCS) $(ALL_INCLUDES) $(ALL_LIB) $(ALL_LINK)
 
 clean:
 	@rm -rf $(BUILDDIR)
