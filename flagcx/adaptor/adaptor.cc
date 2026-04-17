@@ -160,6 +160,7 @@ extern struct flagcxNetAdaptor flagcxNetIbuc;
 #ifdef USE_UCX
 extern struct flagcxNetAdaptor flagcxNetUcx;
 #endif
+extern struct flagcxNetAdaptor flagcxNetIbP2p;
 
 // Unified network adaptor entry point
 struct flagcxNetAdaptor *getUnifiedNetAdaptor(int netType) {
