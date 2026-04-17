@@ -46,6 +46,15 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
           FLAGCXCHECK(flagcxCalloc(&resources, 1));
           conn->proxyConn.connection->transport = TRANSPORT_P2P;
           conn->proxyConn.connection->send = 0;
+          conn->proxyConn.connection->cudaDev = comm->cudaDev;
+          conn->proxyConn.connection->sameProcess =
+              (comm->peerInfo != NULL &&
+               comm->peerInfo[peer].hostHash ==
+                   comm->peerInfo[comm->rank].hostHash &&
+               comm->peerInfo[peer].pidHash ==
+                   comm->peerInfo[comm->rank].pidHash)
+                  ? 1
+                  : 0;
           conn->proxyConn.connection->transportResources = (void *)resources;
           if (peer != comm->rank) {
             struct flagcxP2pRequest req = {(size_t(flagcxP2pBufferSize)), 0};
@@ -125,6 +134,15 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
           FLAGCXCHECK(flagcxCalloc(&resources, 1));
           conn->proxyConn.connection->transport = TRANSPORT_P2P;
           conn->proxyConn.connection->send = 1;
+          conn->proxyConn.connection->cudaDev = comm->cudaDev;
+          conn->proxyConn.connection->sameProcess =
+              (comm->peerInfo != NULL &&
+               comm->peerInfo[peer].hostHash ==
+                   comm->peerInfo[comm->rank].hostHash &&
+               comm->peerInfo[peer].pidHash ==
+                   comm->peerInfo[comm->rank].pidHash)
+                  ? 1
+                  : 0;
           conn->proxyConn.connection->transportResources = (void *)resources;
           if (peer != comm->rank) {
             struct flagcxP2pConnectInfo connectInfo = {0};

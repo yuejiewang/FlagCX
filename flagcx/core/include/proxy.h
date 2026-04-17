@@ -144,7 +144,8 @@ struct flagcxProxyArgs {
   uint64_t p2pPeerOpHash = -1;
   size_t p2pSlotIdx = 0;
   size_t p2pPeerSlotIdx = 0;
-  void *p2pRmtAddr = nullptr; // Remote address for P2P zero-copy
+  void *p2pRmtAddr = nullptr; // remote addr for zero-copy P2P (send side reads,
+                              // recv side writes)
 
   union flagcxProxyOpSpecifics specifics;
 };
@@ -336,7 +337,8 @@ struct flagcxProxyState {
   pthread_mutex_t mutex;
   pthread_cond_t cond;
   union flagcxSocketAddress *peerAddresses;
-  struct flagcxSocket peerSock;
+  struct flagcxSocket *peerSocks; // Array[nRanks], indexed by rank
+  int nPeerSocks;                 // Number of allocated peerSocks entries
   struct flagcxProxyOps proxyOps[MAXCHANNELS];
 
   struct flagcxProxyOps *prodProgChannelHead; /*producer*/
@@ -374,6 +376,7 @@ enum proxyConnectState {
 struct flagcxProxyConnection {
   int send, transport, shared;
   int tpLocalRank, sameProcess;
+  int cudaDev;
   struct flagcxSocket *sock;
   struct flagcxTransportComm *tcomm;
   struct flagcxProxyArgs *proxyAppend;
