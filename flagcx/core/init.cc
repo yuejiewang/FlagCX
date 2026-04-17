@@ -469,6 +469,13 @@ flagcxResult_t flagcxHeteroCommDestroy(flagcxHeteroComm_t comm) {
   FLAGCXCHECK(flagcxProxyStop(comm));
   // Destroy: join thread, free proxy resources
   FLAGCXCHECK(flagcxProxyDestroy(comm));
+  if (comm->proxyState->uniRunnerState.streamFlagsPool != NULL ||
+      comm->proxyState->uniRunnerState.streamFlags != NULL ||
+      comm->proxyState->uniRunnerState.streamFlagsCapacity != 0) {
+    FLAGCXCHECK(deviceAdaptor->setDevice(comm->cudaDev));
+    FLAGCXCHECK(
+        cleanupUniRunnerPersistentState(&comm->proxyState->uniRunnerState));
+  }
   for (int i = 0; i < MAXCHANNELS; i++) {
     for (int r = 0; r < comm->nRanks; r++) {
       free(comm->channels[i].peers[r]);
