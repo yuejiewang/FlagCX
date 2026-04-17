@@ -503,6 +503,13 @@ flagcxResult_t flagcxHeteroCommDestroy(flagcxHeteroComm_t comm) {
   // Clean up P2P IPC handles while proxy is still alive and peerSocks valid
   FLAGCXCHECK(globalRegPool.removeAllP2pHandles(comm));
   flagcxProxyDestroy(comm);
+  if (comm->proxyState->uniRunnerState.streamFlagsPool != NULL ||
+      comm->proxyState->uniRunnerState.streamFlags != NULL ||
+      comm->proxyState->uniRunnerState.streamFlagsCapacity != 0) {
+    FLAGCXCHECK(deviceAdaptor->setDevice(comm->cudaDev));
+    FLAGCXCHECK(
+        cleanupUniRunnerPersistentState(&comm->proxyState->uniRunnerState));
+  }
   for (int i = 0; i < MAXCHANNELS; i++) {
     for (int r = 0; r < comm->nRanks; r++) {
       free(comm->channels[i].peers[r]);

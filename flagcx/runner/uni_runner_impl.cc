@@ -487,8 +487,110 @@ static flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState) {
 
 static inline void *getDagNodeFlag(flagcxUniRunnerState *runnerState,
                                    int nodeIdx) {
-  return static_cast<void *>(static_cast<char *>(runnerState->streamFlags) +
-                             nodeIdx * sizeof(uint64_t));
+  assert(nodeIdx >= 0 &&
+         static_cast<size_t>(nodeIdx) < runnerState->streamFlagsSize);
+  return runnerState->streamFlags[nodeIdx];
+}
+
+static void refreshStreamFlagAddressQueue(flagcxUniRunnerState *runnerState) {
+  if (runnerState->streamFlagsPool == NULL ||
+      runnerState->streamFlags == NULL) {
+    return;
+  }
+
+  char *base = static_cast<char *>(runnerState->streamFlagsPool);
+  for (size_t i = 0; i < runnerState->streamFlagsCapacity; ++i) {
+    runnerState->streamFlags[i] =
+        static_cast<void *>(base + i * sizeof(uint64_t));
+  }
+}
+
+static flagcxResult_t
+resizeStreamFlagAddressQueue(flagcxUniRunnerState *runnerState,
+                             size_t newCapacity) {
+  if (newCapacity <= runnerState->streamFlagsCapacity) {
+    return flagcxSuccess;
+  }
+
+  if (runnerState->streamFlagsCapacity == 0) {
+    if (runnerState->streamFlags != NULL) {
+      free(runnerState->streamFlags);
+      runnerState->streamFlags = NULL;
+    }
+    FLAGCXCHECK(flagcxCalloc(&runnerState->streamFlags, newCapacity));
+  } else {
+    FLAGCXCHECK(flagcxRealloc(&runnerState->streamFlags,
+                              runnerState->streamFlagsCapacity, newCapacity));
+  }
+
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+ensureStreamFlagQueueCapacity(flagcxUniRunnerState *runnerState,
+                              size_t requiredFlags) {
+  if (requiredFlags > runnerState->streamFlagsCapacity) {
+    size_t newCapacity = runnerState->streamFlagsCapacity == 0
+                             ? 1
+                             : runnerState->streamFlagsCapacity;
+    while (newCapacity < requiredFlags) {
+      newCapacity *= 2;
+    }
+
+    FLAGCXCHECK(resizeStreamFlagAddressQueue(runnerState, newCapacity));
+
+    void *newPool = NULL;
+    FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+        &newPool, newCapacity * sizeof(uint64_t), flagcxMemDevice, NULL));
+    if (runnerState->streamFlagsPool != NULL) {
+      FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->streamFlagsPool,
+                                            flagcxMemDevice, NULL));
+    }
+
+    runnerState->streamFlagsPool = newPool;
+    runnerState->streamFlagsCapacity = newCapacity;
+    refreshStreamFlagAddressQueue(runnerState);
+  }
+
+  return flagcxSuccess;
+}
+
+static flagcxResult_t prepareDagStreamFlags(flagcxUniRunnerState *runnerState) {
+  size_t activeFlags = runnerState->numDagNodes > 0
+                           ? static_cast<size_t>(runnerState->numDagNodes)
+                           : 0;
+  FLAGCXCHECK(ensureStreamFlagQueueCapacity(runnerState, activeFlags));
+  runnerState->streamFlagsSize = activeFlags;
+
+  if (runnerState->streamFlagsSize != 0) {
+    FLAGCXCHECK(deviceAdaptor->deviceMemset(runnerState->streamFlagsPool, 0,
+                                            runnerState->streamFlagsSize *
+                                                sizeof(uint64_t),
+                                            flagcxMemDevice, NULL));
+  }
+
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+destroyStreamFlagQueue(flagcxUniRunnerState *runnerState) {
+  if (runnerState == NULL) {
+    return flagcxSuccess;
+  }
+
+  if (runnerState->streamFlagsPool != NULL) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->streamFlagsPool,
+                                          flagcxMemDevice, NULL));
+    runnerState->streamFlagsPool = NULL;
+  }
+
+  if (runnerState->streamFlags != NULL) {
+    free(runnerState->streamFlags);
+    runnerState->streamFlags = NULL;
+  }
+  runnerState->streamFlagsSize = 0;
+  runnerState->streamFlagsCapacity = 0;
+  return flagcxSuccess;
 }
 
 static inline flagcxStream_t
@@ -2932,7 +3034,7 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   runnerState->dagNodes = NULL;
   runnerState->numDagNodes = 0;
-  runnerState->streamFlags = NULL;
+  runnerState->streamFlagsSize = 0;
 
   runnerState->uniRunnerNSlices = flagcxParamUniRunnerNSlices();
   runnerState->uniRunnerNThreads = flagcxParamUniRunnerNThreads();
@@ -2977,17 +3079,13 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
   FLAGCXCHECK(cleanupDagScheduler(&hcomm->proxyState->uniRunnerState));
 
   // Outstanding stream waits/writes may still touch streamFlags when
-  // runUniRunner exits early on an error path, so synchronize before releasing
-  // the device memory.
+  // runUniRunner exits early on an error path, so synchronize before marking
+  // the reusable flag-address queue inactive for this invocation.
   FLAGCXCHECK(deviceAdaptor->streamSynchronize(redStream));
   FLAGCXCHECK(deviceAdaptor->streamSynchronize(cpyStream));
   FLAGCXCHECK(deviceAdaptor->streamSynchronize(commStream));
 
-  if (hcomm->proxyState->uniRunnerState.streamFlags != NULL) {
-    FLAGCXCHECK(deviceAdaptor->deviceFree(
-        hcomm->proxyState->uniRunnerState.streamFlags, flagcxMemDevice, NULL));
-    hcomm->proxyState->uniRunnerState.streamFlags = NULL;
-  }
+  hcomm->proxyState->uniRunnerState.streamFlagsSize = 0;
 
   // Destroy streams
   FLAGCXCHECK(deviceAdaptor->streamDestroy(redStream));
@@ -3006,14 +3104,7 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   flagcxFifo_t fifo = hcomm->proxyState->uniRunnerState.fifo;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
-  if (runnerState->numDagNodes > 0) {
-    FLAGCXCHECK(deviceAdaptor->deviceMalloc(
-        &runnerState->streamFlags, runnerState->numDagNodes * sizeof(uint64_t),
-        flagcxMemDevice, NULL));
-    FLAGCXCHECK(deviceAdaptor->deviceMemset(
-        runnerState->streamFlags, 0,
-        runnerState->numDagNodes * sizeof(uint64_t), flagcxMemDevice, NULL));
-  }
+  FLAGCXCHECK(prepareDagStreamFlags(runnerState));
 
 #ifdef COMPILE_KERNEL_HOST
   // Launch collective kernel
@@ -3042,4 +3133,10 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   deviceAdaptor->streamSynchronize(runnerState->commStream);
 
   return flagcxSuccess;
+}
+
+flagcxResult_t
+cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState) {
+  FLAGCXCHECK(cleanupDagScheduler(runnerState));
+  return destroyStreamFlagQueue(runnerState);
 }
