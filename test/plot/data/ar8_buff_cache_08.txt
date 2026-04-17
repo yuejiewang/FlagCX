@@ -1,0 +1,17 @@
+Comm size: 65536 bytes; Elapsed time: 0.010161 sec; Algo bandwidth: 0.006450 GB/s; Bus bandwidth: 0.011287 GB/s
+Comm size: 131072 bytes; Elapsed time: 0.010454 sec; Algo bandwidth: 0.012538 GB/s; Bus bandwidth: 0.021941 GB/s
+Comm size: 262144 bytes; Elapsed time: 0.010020 sec; Algo bandwidth: 0.026163 GB/s; Bus bandwidth: 0.045786 GB/s
+Comm size: 524288 bytes; Elapsed time: 0.009852 sec; Algo bandwidth: 0.053217 GB/s; Bus bandwidth: 0.093130 GB/s
+Comm size: 1048576 bytes; Elapsed time: 0.009980 sec; Algo bandwidth: 0.105072 GB/s; Bus bandwidth: 0.183875 GB/s
+Comm size: 2097152 bytes; Elapsed time: 0.009886 sec; Algo bandwidth: 0.212129 GB/s; Bus bandwidth: 0.371225 GB/s
+Comm size: 4194304 bytes; Elapsed time: 0.010269 sec; Algo bandwidth: 0.408440 GB/s; Bus bandwidth: 0.714769 GB/s
+Comm size: 8388608 bytes; Elapsed time: 0.010206 sec; Algo bandwidth: 0.821890 GB/s; Bus bandwidth: 1.438308 GB/s
+Comm size: 16777216 bytes; Elapsed time: 0.011448 sec; Algo bandwidth: 1.465472 GB/s; Bus bandwidth: 2.564577 GB/s
+Comm size: 33554432 bytes; Elapsed time: 0.013521 sec; Algo bandwidth: 2.481733 GB/s; Bus bandwidth: 4.343033 GB/s
+Comm size: 67108864 bytes; Elapsed time: 0.017911 sec; Algo bandwidth: 3.746864 GB/s; Bus bandwidth: 6.557012 GB/s
+Comm size: 134217728 bytes; Elapsed time: 0.018730 sec; Algo bandwidth: 7.165813 GB/s; Bus bandwidth: 12.540173 GB/s
+Comm size: 268435456 bytes; Elapsed time: 0.020898 sec; Algo bandwidth: 12.844795 GB/s; Bus bandwidth: 22.478391 GB/s
+Comm size: 536870912 bytes; Elapsed time: 0.023730 sec; Algo bandwidth: 22.624185 GB/s; Bus bandwidth: 39.592323 GB/s
+Comm size: 1073741824 bytes; Elapsed time: 0.033256 sec; Algo bandwidth: 32.287193 GB/s; Bus bandwidth: 56.502587 GB/s
+Comm size: 2147483648 bytes; Elapsed time: 0.052473 sec; Algo bandwidth: 40.925231 GB/s; Bus bandwidth: 71.619154 GB/s
+Comm size: 4294967296 bytes; Elapsed time: 0.083135 sec; Algo bandwidth: 51.662691 GB/s; Bus bandwidth: 90.409710 GB/s
