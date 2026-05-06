@@ -87,6 +87,8 @@ inline const char *uniRunnerDagAlgoTypeToString(uniRunnerDagAlgoType algoType) {
       return "ring_rs";
     case uniRunnerDagAlgoTreeRed:
       return "tree_red";
+    case uniRunnerDagAlgoParalAR:
+      return "paral_ar";
     default:
       return "unknown";
   }
@@ -110,6 +112,8 @@ inline bool uniRunnerDagAlgoTypeFromString(const std::string &text,
     *algoType = uniRunnerDagAlgoRingRS;
   } else if (text == "tree_red") {
     *algoType = uniRunnerDagAlgoTreeRed;
+  } else if (text == "paral_ar") {
+    *algoType = uniRunnerDagAlgoParalAR;
   } else {
     return false;
   }

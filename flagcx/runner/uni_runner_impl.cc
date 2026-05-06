@@ -1443,10 +1443,11 @@ buildUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
 }
 
 static flagcxResult_t
-buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
-                            const void *sendbuff, void *recvbuff, size_t count,
-                            flagcxDataType_t datatype, flagcxRedOp_t op,
-                            flagcxComm_t comm) {
+buildUniRunnerStateSlicedARImpl(flagcxUniRunnerState *runnerState,
+                                const void *sendbuff, void *recvbuff,
+                                size_t count, flagcxDataType_t datatype,
+                                flagcxRedOp_t op, flagcxComm_t comm,
+                                bool parallelSlices) {
   int rank = comm->rank;
   int nranks = comm->nranks;
 
@@ -1490,11 +1491,12 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   }
   int numSlices = runnerState->uniRunnerNSlices;
   int numRedSlices = runnerState->uniRunnerNRedSlices;
+  const char *algoName = parallelSlices ? "ParalAR" : "SlicedAR";
 
   TRACE(FLAGCX_UNIRUNNER,
-        "rank %d initUniRunnerStateSlicedAR called, count=%lu, numSlices=%d, "
+        "rank %d initUniRunnerState%s called, count=%lu, numSlices=%d, "
         "numRedSlices=%d",
-        comm->rank, count, numSlices, numRedSlices);
+        comm->rank, algoName, count, numSlices, numRedSlices);
 
   int nextRank = (rank + 1) % nranks;
   int prevRank = (rank - 1 + nranks) % nranks;
@@ -1601,51 +1603,81 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
           static_cast<void *>(static_cast<char *>(recvbuff) + rxOffset);
 
       // Set up p2p node dependency
-      if (p2pNodeIdx == 0) {
-        runnerState->dagNodes[p2pNodeIdx].numParents = 0;
-        flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
-                                &runnerState->dagNodes[p2pNodeIdx]);
-      } else {
+      if (parallelSlices) {
         if (i == 0) {
-          runnerState->dagNodes[p2pNodeIdx].numParents = 1;
+          runnerState->dagNodes[p2pNodeIdx].numParents = 0;
         } else {
-          runnerState->dagNodes[p2pNodeIdx].numParents = 1 + numRedSlices;
+          runnerState->dagNodes[p2pNodeIdx].numParents = numRedSlices;
+          runnerState->numPendingNodes++;
         }
-        runnerState->numPendingNodes++;
+        runnerState->dagNodes[p2pNodeIdx].numChildren = numRedSlices;
+      } else {
+        if (p2pNodeIdx == 0) {
+          runnerState->dagNodes[p2pNodeIdx].numParents = 0;
+        } else {
+          if (i == 0) {
+            runnerState->dagNodes[p2pNodeIdx].numParents = 1;
+          } else {
+            runnerState->dagNodes[p2pNodeIdx].numParents = 1 + numRedSlices;
+          }
+          runnerState->numPendingNodes++;
+        }
+        runnerState->dagNodes[p2pNodeIdx].numChildren = 1 + numRedSlices;
       }
-      runnerState->dagNodes[p2pNodeIdx].numChildren = 1 + numRedSlices;
       FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[p2pNodeIdx]));
-      if (p2pNodeIdx != 0) {
-        int parentIdx = p2pNodeIdx - nodesPerSlice;
-        if (i > 0 && s == 0) {
-          parentIdx =
-              (numSlices - 1) * nodesPerSlice + (i - 1) * (1 + numRedSlices);
-        }
-        FLAGCXCHECK(
-            setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], 0, parentIdx));
-        if (i > 0) {
+      if (parallelSlices) {
+        if (i == 0) {
+          flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
+                                  &runnerState->dagNodes[p2pNodeIdx]);
+        } else {
           for (int r = 0; r < numRedSlices; r++) {
-            FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx],
-                                         r + 1, p2pNodeIdx - numRedSlices + r));
+            FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], r,
+                                         p2pNodeIdx - numRedSlices + r));
           }
         }
-      }
-      if (s == numSlices - 1) {
-        runnerState->dagNodes[p2pNodeIdx].children[0] =
-            (i + 1) * (1 + numRedSlices);
-        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 0: %d", rank,
-              p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
+        for (int r = 0; r < numRedSlices; r++) {
+          runnerState->dagNodes[p2pNodeIdx].children[r] = p2pNodeIdx + 1 + r;
+          TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child %d: %d", rank,
+                p2pNodeIdx, r, runnerState->dagNodes[p2pNodeIdx].children[r]);
+        }
       } else {
-        runnerState->dagNodes[p2pNodeIdx].children[0] =
-            p2pNodeIdx + nodesPerSlice;
-        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 0: %d", rank,
-              p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
-      }
-      for (int r = 0; r < numRedSlices; r++) {
-        runnerState->dagNodes[p2pNodeIdx].children[r + 1] = p2pNodeIdx + 1 + r;
-        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child %d: %d", rank,
-              p2pNodeIdx, r + 1,
-              runnerState->dagNodes[p2pNodeIdx].children[r + 1]);
+        if (p2pNodeIdx == 0) {
+          flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
+                                  &runnerState->dagNodes[p2pNodeIdx]);
+        } else {
+          int parentIdx = p2pNodeIdx - nodesPerSlice;
+          if (i > 0 && s == 0) {
+            parentIdx = (numSlices - 1) * nodesPerSlice +
+                        (i - 1) * (1 + numRedSlices);
+          }
+          FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], 0,
+                                       parentIdx));
+          if (i > 0) {
+            for (int r = 0; r < numRedSlices; r++) {
+              FLAGCXCHECK(
+                  setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], r + 1,
+                                   p2pNodeIdx - numRedSlices + r));
+            }
+          }
+        }
+        if (s == numSlices - 1) {
+          runnerState->dagNodes[p2pNodeIdx].children[0] =
+              (i + 1) * (1 + numRedSlices);
+          TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 0: %d", rank,
+                p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
+        } else {
+          runnerState->dagNodes[p2pNodeIdx].children[0] =
+              p2pNodeIdx + nodesPerSlice;
+          TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 0: %d", rank,
+                p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
+        }
+        for (int r = 0; r < numRedSlices; r++) {
+          runnerState->dagNodes[p2pNodeIdx].children[r + 1] =
+              p2pNodeIdx + 1 + r;
+          TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child %d: %d", rank,
+                p2pNodeIdx, r + 1,
+                runnerState->dagNodes[p2pNodeIdx].children[r + 1]);
+        }
       }
 
       // Reduce Node
@@ -1756,55 +1788,83 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
 
       // Set up all-gather phase p2p node dependency
       runnerState->numPendingNodes++;
-      if (i == 0) {
-        runnerState->dagNodes[p2pNodeIdx].numParents = 1 + numRedSlices;
+      if (parallelSlices) {
+        if (i == 0) {
+          runnerState->dagNodes[p2pNodeIdx].numParents = numRedSlices;
+        } else {
+          runnerState->dagNodes[p2pNodeIdx].numParents = 1;
+        }
+        runnerState->dagNodes[p2pNodeIdx].numChildren =
+            (i == nranks - 2) ? 0 : 1;
       } else {
-        runnerState->dagNodes[p2pNodeIdx].numParents = 1;
-      }
-      if (p2pNodeIdx == numNodes - 1) {
-        runnerState->dagNodes[p2pNodeIdx].numChildren = 0;
-      } else {
-        runnerState->dagNodes[p2pNodeIdx].numChildren = 1;
+        if (i == 0) {
+          runnerState->dagNodes[p2pNodeIdx].numParents = 1 + numRedSlices;
+        } else {
+          runnerState->dagNodes[p2pNodeIdx].numParents = 1;
+        }
+        if (p2pNodeIdx == numNodes - 1) {
+          runnerState->dagNodes[p2pNodeIdx].numChildren = 0;
+        } else {
+          runnerState->dagNodes[p2pNodeIdx].numChildren = 1;
+        }
       }
       FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[p2pNodeIdx]));
-      int parentIdx = p2pNodeIdx - nodesPerSlice;
-      if (s == 0) {
+      if (parallelSlices) {
         if (i == 0) {
-          parentIdx = (numSlices - 1) * nodesPerSlice +
-                      (nranks - 2) * (1 + numRedSlices);
+          for (int r = 0; r < numRedSlices; r++) {
+            FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], r,
+                                         p2pNodeIdx - numRedSlices + r));
+          }
         } else {
-          parentIdx = (numSlices - 1) * nodesPerSlice +
-                      (nranks - 1) * (1 + numRedSlices) + i - 1;
+          FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], 0,
+                                       p2pNodeIdx - 1));
         }
-      }
-      FLAGCXCHECK(
-          setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], 0, parentIdx));
-      if (i == 0) {
-        for (int r = 0; r < numRedSlices; r++) {
-          FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx],
-                                       r + 1, p2pNodeIdx - numRedSlices + r));
-        }
-      }
-      if (s == numSlices - 1) {
-        if (p2pNodeIdx != numNodes - 1) {
-          runnerState->dagNodes[p2pNodeIdx].children[0] =
-              (1 + numRedSlices) * (nranks - 1) + i + 1;
-          TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 1: %d", rank,
+        if (i != nranks - 2) {
+          runnerState->dagNodes[p2pNodeIdx].children[0] = p2pNodeIdx + 1;
+          TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 0: %d", rank,
                 p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
         }
       } else {
-        runnerState->dagNodes[p2pNodeIdx].children[0] =
-            p2pNodeIdx + nodesPerSlice;
-        TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 1: %d", rank,
-              p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
+        int parentIdx = p2pNodeIdx - nodesPerSlice;
+        if (s == 0) {
+          if (i == 0) {
+            parentIdx = (numSlices - 1) * nodesPerSlice +
+                        (nranks - 2) * (1 + numRedSlices);
+          } else {
+            parentIdx = (numSlices - 1) * nodesPerSlice +
+                        (nranks - 1) * (1 + numRedSlices) + i - 1;
+          }
+        }
+        FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], 0,
+                                     parentIdx));
+        if (i == 0) {
+          for (int r = 0; r < numRedSlices; r++) {
+            FLAGCXCHECK(
+                setDagNodeParent(&runnerState->dagNodes[p2pNodeIdx], r + 1,
+                                 p2pNodeIdx - numRedSlices + r));
+          }
+        }
+        if (s == numSlices - 1) {
+          if (p2pNodeIdx != numNodes - 1) {
+            runnerState->dagNodes[p2pNodeIdx].children[0] =
+                (1 + numRedSlices) * (nranks - 1) + i + 1;
+            TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 1: %d", rank,
+                  p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
+          }
+        } else {
+          runnerState->dagNodes[p2pNodeIdx].children[0] =
+              p2pNodeIdx + nodesPerSlice;
+          TRACE(FLAGCX_UNIRUNNER, "rank %d p2pNode %d child 1: %d", rank,
+                p2pNodeIdx, runnerState->dagNodes[p2pNodeIdx].children[0]);
+        }
       }
     }
   }
 
   TRACE(FLAGCX_UNIRUNNER,
-        "DAG scheduler initialized with %d-rank Sliced AllReduce topology (%d "
-        "slices, %d redSlices)",
-        nranks, numSlices, numRedSlices);
+        "DAG scheduler initialized with %d-rank %s topology (%d slices, %d "
+        "redSlices)",
+        nranks, algoName, numSlices, numRedSlices);
   // print dependency graph
   for (int i = 0; i < runnerState->numDagNodes; i++) {
     TRACE(
@@ -1823,6 +1883,24 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   }
 
   return validateDagNodes(runnerState);
+}
+
+static flagcxResult_t
+buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
+                            const void *sendbuff, void *recvbuff, size_t count,
+                            flagcxDataType_t datatype, flagcxRedOp_t op,
+                            flagcxComm_t comm) {
+  return buildUniRunnerStateSlicedARImpl(runnerState, sendbuff, recvbuff,
+                                         count, datatype, op, comm, false);
+}
+
+static flagcxResult_t
+buildUniRunnerStateParalAR(flagcxUniRunnerState *runnerState,
+                           const void *sendbuff, void *recvbuff, size_t count,
+                           flagcxDataType_t datatype, flagcxRedOp_t op,
+                           flagcxComm_t comm) {
+  return buildUniRunnerStateSlicedARImpl(runnerState, sendbuff, recvbuff,
+                                         count, datatype, op, comm, true);
 }
 
 static flagcxResult_t buildUniRunnerStateRingRS(
@@ -2795,6 +2873,30 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff, count,
                                        datatype, op, comm);
+  });
+}
+
+flagcxResult_t initUniRunnerStateParalAR(flagcxUniRunnerState *runnerState,
+                                         const void *sendbuff, void *recvbuff,
+                                         size_t count,
+                                         flagcxDataType_t datatype,
+                                         flagcxRedOp_t op, flagcxComm_t comm) {
+  size_t typeSize = getFlagcxDataTypeSize(datatype);
+  runnerState->uniRunnerNRedSlices =
+      resolveEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
+
+  uniRunnerDagRuntimeBindings bindings;
+  bindings.inputBase = sendbuff;
+  bindings.outputBase = recvbuff;
+  bindings.inputBytes = count * typeSize;
+  bindings.outputBytes = count * typeSize;
+
+  uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
+      uniRunnerDagAlgoParalAR, flagcxCommOpAllReduce, count, datatype, op, -1,
+      0, runnerState, comm, sendbuff, recvbuff, NULL);
+  return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
+    return buildUniRunnerStateParalAR(runnerState, sendbuff, recvbuff, count,
+                                      datatype, op, comm);
   });
 }
 

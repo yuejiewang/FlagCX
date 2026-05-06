@@ -9,6 +9,7 @@
 
 FLAGCX_PARAM(UniRunnerUseLocRed, "UNIRUNNER_USE_LOCRED", 0);
 FLAGCX_PARAM(UniRunnerUseRingAG, "UNIRUNNER_USE_RINGAG", 0);
+FLAGCX_PARAM(UniRunnerUseParalAR, "UNIRUNNER_USE_PARALAR", 0);
 FLAGCX_PARAM(UniRunnerUseSlicedAR, "UNIRUNNER_USE_SLICEDAR", 0);
 FLAGCX_PARAM(UniRunnerUseGroupedAG, "UNIRUNNER_USE_GROUPEDAG", 1);
 FLAGCX_PARAM(UniRunnerGroupSize, "UNIRUNNER_GROUPSIZE", 0);
@@ -132,6 +133,11 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
     /* initialize uniRunnerState for p2p test */
     FLAGCXCHECKGOTO(initUniRunnerStateRingAG(runnerState, sendbuff, recvbuff,
                                              count, datatype, op, comm),
+                    res, out);
+  } else if (flagcxParamUniRunnerUseParalAR()) {
+    /* initialize uniRunnerState for parallel sliced AllReduce */
+    FLAGCXCHECKGOTO(initUniRunnerStateParalAR(runnerState, sendbuff, recvbuff,
+                                              count, datatype, op, comm),
                     res, out);
   } else if (flagcxParamUniRunnerUseSlicedAR()) {
     /* initialize uniRunnerState for sliced AllReduce */
