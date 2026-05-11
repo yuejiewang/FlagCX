@@ -473,7 +473,7 @@ flagcxResult_t flagcxHeteroCommDestroy(flagcxHeteroComm_t comm) {
   FLAGCXCHECK(flagcxProxyDestroy(comm));
   if (comm->proxyState->uniRunnerState.streamFlagsPool != NULL ||
       comm->proxyState->uniRunnerState.streamFlags != NULL ||
-      comm->proxyState->uniRunnerState.streamFlagsCapacity != 0) {
+      comm->proxyState->uniRunnerState.streamFlagsSize != 0) {
     FLAGCXCHECK(deviceAdaptor->setDevice(comm->cudaDev));
     FLAGCXCHECK(
         cleanupUniRunnerPersistentState(&comm->proxyState->uniRunnerState));

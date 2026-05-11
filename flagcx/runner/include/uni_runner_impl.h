@@ -136,12 +136,11 @@ typedef struct {
   uint64_t uniRunnerNRedSlices;
   uint64_t uniRunnerRedSliceSize;
 
-  // Stream completion flags backed by a reusable contiguous device pool. The
-  // host-side queue stores per-node addresses within that pool.
+  // Stream completion flags for the current DAG invocation. The host-side
+  // array stores per-node addresses within the device allocation.
   void *streamFlagsPool;
   void **streamFlags;
   size_t streamFlagsSize;
-  size_t streamFlagsCapacity;
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
