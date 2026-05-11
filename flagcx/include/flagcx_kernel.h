@@ -23,9 +23,8 @@ typedef enum {
   flagcxDevicePrimGet = 10
 } flagcxDevicePrim;
 
-// Unified buffer index enumeration for fifo
-// Layout: [capacity][consumed][produced][terminate][data...]
-// Note: flagcxFifoIdxTerminate is only used by flagcxReduceTrigger fifo
+// Unified device-trigger fifo layout: [capacity][consumed][produced]
+// [terminate][data...]. The device-trigger path still uses terminate.
 typedef enum {
   flagcxFifoIdxCapacity = 0,
   flagcxFifoIdxConsumed = 1,
@@ -33,6 +32,14 @@ typedef enum {
   flagcxFifoIdxTerminate = 3,
   flagcxFifoIdxData = 4
 } flagcxFifoIndex;
+
+// Static reduce-trigger buffer layout in device memory.
+// Layout: [capacity][alignment padding][data...]
+typedef enum {
+  flagcxRedFifoIdxCapacity = 0,
+  flagcxRedFifoIdxPadding = 1,
+  flagcxRedFifoIdxData = 2
+} flagcxRedFifoIndex;
 
 typedef enum {
   flagcxReduceTriggerAvailable = 0,
@@ -204,17 +211,16 @@ struct alignas(16) flagcxReduceTrigger {
 typedef flagcxReduceTrigger *flagcxReduceTrigger_t;
 
 struct flagcxFifo {
-  // Unified fifo layout: [capacity][consumed][produced][terminate][data...]
-  // flagcxDeviceTrigger fifo: terminate slot is reserved but unused
-  // flagcxReduceTrigger fifo: terminate slot is used
-  // See flagcxFifoIndex enumeration for index values
+  // flagcxDeviceTrigger fifo layout: [capacity][consumed][produced]
+  // [terminate][data...]
+  // flagcxReduceTrigger layout: [capacity][alignment padding][data...]
   uint64_t *buffer;
 
 public:
-  flagcxFifo() {}
+  flagcxFifo() : buffer(NULL) {}
   ~flagcxFifo() {}
   flagcxResult_t flagcxFifoInit();
-  flagcxResult_t flagcxRedFifoInit();
+  flagcxResult_t flagcxRedFifoInit(size_t numTriggers);
   flagcxResult_t flagcxFifoDestroy();
   flagcxResult_t flagcxRedFifoDestroy();
 };
@@ -222,14 +228,7 @@ typedef struct flagcxFifo *flagcxFifo_t;
 
 FLAGCX_HOST_DECORATOR flagcxResult_t dequeue(void *fifoBuffer,
                                              flagcxDeviceTrigger_t trigger);
-FLAGCX_HOST_DECORATOR flagcxResult_t
-enqueue(void *fifoBuffer, uint64_t addr1, uint64_t addr2, uint64_t addr3,
-        size_t count, size_t nthreads, flagcxDataType_t datatype,
-        flagcxRedOp_t redop, uint64_t flagIn, uint64_t flagOut, int *idx);
 #ifdef COMPILE_KERNEL
-FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
-                                                      int *idx);
-
 FLAGCX_DEVICE_DECORATOR size_t
 getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype);
 

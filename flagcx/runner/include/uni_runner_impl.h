@@ -82,7 +82,7 @@ struct uniRunnerRedNodeData {
   flagcxRedOp_t redOp;
 
   // Trigger and state tracking
-  int triggerIdx; // Trigger index in FIFO
+  size_t triggerIdx; // Trigger index in the static device trigger buffer
 };
 
 // Copy node data (operation-specific fields only)
