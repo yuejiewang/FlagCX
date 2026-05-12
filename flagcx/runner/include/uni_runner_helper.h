@@ -1,6 +1,7 @@
 #ifndef FLAGCX_UNIRUNNER_HELPER_H_
 #define FLAGCX_UNIRUNNER_HELPER_H_
 
+#include "adaptor.h"
 #include "uni_runner_impl.h"
 
 #include <cstddef>
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -295,6 +297,251 @@ inline bool uniRunnerDevicePrimFromString(const std::string &text,
     return false;
   }
   return true;
+}
+
+inline const char *uniRunnerTraceDagNodeTypeName(
+    uniRunnerDagNodeType nodeType) {
+  switch (nodeType) {
+    case uniRunnerDagNodeTypeP2p:
+      return "P2P";
+    case uniRunnerDagNodeTypeRed:
+      return "RED";
+    case uniRunnerDagNodeTypeCpy:
+      return "CPY";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+inline const char *uniRunnerTraceStreamFlagStateName(uint64_t flagValue) {
+  switch (static_cast<flagcxStreamFlagState>(flagValue)) {
+    case flagcxStreamFlagIdle:
+      return "Idle";
+    case flagcxStreamFlagPend:
+      return "Pend";
+    case flagcxStreamFlagDone:
+      return "Done";
+    default:
+      return "Unknown";
+  }
+}
+
+inline const char *uniRunnerTraceReduceTriggerStateName(uint64_t triggerState) {
+  switch (static_cast<flagcxReduceTriggerState>(triggerState)) {
+    case flagcxReduceTriggerAvailable:
+      return "Available";
+    case flagcxReduceTriggerEnqueued:
+      return "Enqueued";
+    case flagcxReduceTriggerInprogress:
+      return "Inprogress";
+    case flagcxReduceTriggerComplete:
+      return "Complete";
+    default:
+      return "Unknown";
+  }
+}
+
+inline uint64_t
+uniRunnerTraceReduceTriggerStateBits(const flagcxReduceTrigger &trigger) {
+  return (trigger.value[3] >> flagcxReduceTriggerOffState) &
+         flagcxTriggerMask(flagcxReduceTriggerBitsState);
+}
+
+inline int uniRunnerTraceFindDagNodeIdxForTriggerIdx(
+    flagcxUniRunnerState *runnerState, size_t triggerIdx) {
+  for (int nodeIdx = 0; nodeIdx < runnerState->numDagNodes; ++nodeIdx) {
+    uniRunnerDagNode *node = &runnerState->dagNodes[nodeIdx];
+    if (node->nodeType == uniRunnerDagNodeTypeRed &&
+        node->nodeData.red.triggerIdx == triggerIdx) {
+      return nodeIdx;
+    }
+  }
+  return -1;
+}
+
+inline int uniRunnerTraceGetDagNodeIdxFromFlagAddr(
+    flagcxUniRunnerState *runnerState, uint64_t flagAddr) {
+  if (flagAddr == 0 || runnerState->streamFlagsPool == NULL ||
+      runnerState->streamFlagsSize == 0) {
+    return -1;
+  }
+  uintptr_t base = reinterpret_cast<uintptr_t>(runnerState->streamFlagsPool);
+  uintptr_t addr = static_cast<uintptr_t>(flagAddr);
+  if (addr < base) {
+    return -1;
+  }
+  uintptr_t delta = addr - base;
+  if (delta % sizeof(uint64_t) != 0) {
+    return -1;
+  }
+  size_t idx = delta / sizeof(uint64_t);
+  return idx < runnerState->streamFlagsSize ? static_cast<int>(idx) : -1;
+}
+
+inline flagcxResult_t uniRunnerTraceRuntimeState(
+    flagcxHeteroComm_t comm, flagcxUniRunnerState *runnerState,
+    size_t numRedTriggers, const char *streamName, int pollCount) {
+  std::vector<uint64_t> streamFlags;
+  if (runnerState->streamFlagsPool != NULL &&
+      runnerState->streamFlagsSize != 0) {
+    streamFlags.resize(runnerState->streamFlagsSize, 0);
+    FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+        streamFlags.data(), runnerState->streamFlagsPool,
+        runnerState->streamFlagsSize * sizeof(uint64_t),
+        flagcxMemcpyDeviceToHost, NULL, NULL));
+  }
+
+  size_t idleFlags = 0;
+  size_t pendFlags = 0;
+  size_t doneFlags = 0;
+  size_t otherFlags = 0;
+  for (uint64_t flagValue : streamFlags) {
+    if (flagValue == flagcxStreamFlagIdle) {
+      idleFlags++;
+    } else if (flagValue == flagcxStreamFlagPend) {
+      pendFlags++;
+    } else if (flagValue == flagcxStreamFlagDone) {
+      doneFlags++;
+    } else {
+      otherFlags++;
+    }
+  }
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d %s still in progress after %d polls: streamFlags idle=%zu "
+        "pend=%zu done=%zu other=%zu",
+        comm->rank, streamName, pollCount, idleFlags, pendFlags, doneFlags,
+        otherFlags);
+
+  int loggedNodes = 0;
+  for (int nodeIdx = 0;
+       nodeIdx < runnerState->numDagNodes && loggedNodes < 16 &&
+       nodeIdx < static_cast<int>(streamFlags.size());
+       ++nodeIdx) {
+    uint64_t flagValue = streamFlags[nodeIdx];
+    if (flagValue == flagcxStreamFlagDone) {
+      continue;
+    }
+    uniRunnerDagNode *node = &runnerState->dagNodes[nodeIdx];
+    long long triggerIdxLog = -1;
+    if (node->nodeType == uniRunnerDagNodeTypeRed) {
+      triggerIdxLog = static_cast<long long>(node->nodeData.red.triggerIdx);
+    }
+    TRACE(FLAGCX_UNIRUNNER,
+          "rank %d pending node %d type=%s flag=%s(%llu) parents=%d "
+          "children=%d trigger=%lld",
+          comm->rank, nodeIdx, uniRunnerTraceDagNodeTypeName(node->nodeType),
+          uniRunnerTraceStreamFlagStateName(flagValue),
+          static_cast<unsigned long long>(flagValue), node->numParents,
+          node->numChildren, triggerIdxLog);
+    loggedNodes++;
+  }
+
+  if (numRedTriggers == 0 || comm == NULL || comm->uniRunnerFifoBuffer == NULL) {
+    return flagcxSuccess;
+  }
+
+  std::vector<flagcxReduceTrigger> triggers(numRedTriggers);
+  FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+      triggers.data(),
+      static_cast<char *>(comm->uniRunnerFifoBuffer) +
+          flagcxRedFifoIdxData * sizeof(uint64_t),
+      numRedTriggers * sizeof(flagcxReduceTrigger), flagcxMemcpyDeviceToHost,
+      NULL, NULL));
+
+  size_t availableTriggers = 0;
+  size_t enqueuedTriggers = 0;
+  size_t inprogressTriggers = 0;
+  size_t completeTriggers = 0;
+  size_t otherTriggers = 0;
+  for (const flagcxReduceTrigger &trigger : triggers) {
+    uint64_t triggerState = uniRunnerTraceReduceTriggerStateBits(trigger);
+    if (triggerState == flagcxReduceTriggerAvailable) {
+      availableTriggers++;
+    } else if (triggerState == flagcxReduceTriggerEnqueued) {
+      enqueuedTriggers++;
+    } else if (triggerState == flagcxReduceTriggerInprogress) {
+      inprogressTriggers++;
+    } else if (triggerState == flagcxReduceTriggerComplete) {
+      completeTriggers++;
+    } else {
+      otherTriggers++;
+    }
+  }
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d %s red trigger states: available=%zu enqueued=%zu "
+        "inprogress=%zu complete=%zu other=%zu",
+        comm->rank, streamName, availableTriggers, enqueuedTriggers,
+        inprogressTriggers, completeTriggers, otherTriggers);
+
+  int loggedTriggers = 0;
+  for (size_t triggerIdx = 0;
+       triggerIdx < numRedTriggers && loggedTriggers < 16; ++triggerIdx) {
+    const flagcxReduceTrigger &trigger = triggers[triggerIdx];
+    uint64_t triggerState = uniRunnerTraceReduceTriggerStateBits(trigger);
+    if (triggerState == flagcxReduceTriggerAvailable) {
+      continue;
+    }
+
+    uint64_t flagInAddr = trigger.value[4];
+    uint64_t flagOutAddr = trigger.value[5];
+    int flagInNodeIdx =
+        uniRunnerTraceGetDagNodeIdxFromFlagAddr(runnerState, flagInAddr);
+    int flagOutNodeIdx =
+        uniRunnerTraceGetDagNodeIdxFromFlagAddr(runnerState, flagOutAddr);
+    long long flagInValue = -1;
+    long long flagOutValue = -1;
+    if (flagInNodeIdx >= 0 &&
+        static_cast<size_t>(flagInNodeIdx) < streamFlags.size()) {
+      flagInValue = static_cast<long long>(streamFlags[flagInNodeIdx]);
+    }
+    if (flagOutNodeIdx >= 0 &&
+        static_cast<size_t>(flagOutNodeIdx) < streamFlags.size()) {
+      flagOutValue = static_cast<long long>(streamFlags[flagOutNodeIdx]);
+    }
+
+    TRACE(FLAGCX_UNIRUNNER,
+          "rank %d pending red trigger %zu node=%d state=%s(%llu) "
+          "flagInNode=%d flagIn=%s(%lld) flagOutNode=%d flagOut=%s(%lld)",
+          comm->rank, triggerIdx,
+          uniRunnerTraceFindDagNodeIdxForTriggerIdx(runnerState, triggerIdx),
+          uniRunnerTraceReduceTriggerStateName(triggerState),
+          static_cast<unsigned long long>(triggerState), flagInNodeIdx,
+          flagInValue >= 0 ? uniRunnerTraceStreamFlagStateName(flagInValue)
+                           : "NA",
+          flagInValue, flagOutNodeIdx,
+          flagOutValue >= 0 ? uniRunnerTraceStreamFlagStateName(flagOutValue)
+                            : "NA",
+          flagOutValue);
+    loggedTriggers++;
+  }
+
+  return flagcxSuccess;
+}
+
+inline flagcxResult_t uniRunnerWaitForStreamWithDiagnostics(
+    flagcxHeteroComm_t comm, flagcxUniRunnerState *runnerState,
+    flagcxStream_t stream, const char *streamName, size_t numRedTriggers) {
+  constexpr int kPollSleepUs = 100000;
+  constexpr int kDumpEveryPolls = 10;
+  int pollCount = 0;
+  while (true) {
+    flagcxResult_t queryRes = deviceAdaptor->streamQuery(stream);
+    if (queryRes == flagcxSuccess) {
+      return deviceAdaptor->streamSynchronize(stream);
+    }
+    if (queryRes != flagcxInProgress) {
+      TRACE(FLAGCX_UNIRUNNER,
+            "rank %d %s query failed after %d polls with result=%d",
+            comm->rank, streamName, pollCount, queryRes);
+      return queryRes;
+    }
+    pollCount++;
+    if (pollCount % kDumpEveryPolls == 0) {
+      FLAGCXCHECK(uniRunnerTraceRuntimeState(comm, runnerState, numRedTriggers,
+                                             streamName, pollCount));
+    }
+    usleep(kPollSleepUs);
+  }
 }
 
 inline Json uniRunnerDagBufferRefToJson(const uniRunnerDagBufferRef &ref) {

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <assert.h>
 #include <cerrno>
+#include <cstdio>
 #include <cstdint>
 #include <math.h>
 #include <mutex>
@@ -22,7 +23,6 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
-#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -3158,26 +3158,33 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
 
 #ifdef COMPILE_KERNEL_HOST
   if (numRedTriggers != 0) {
-    TRACE(FLAGCX_UNIRUNNER,
-          "runUniRunner: launching red kernel buffer=%p nthreads=%zu "
-          "nblocks=%zu",
-          hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
-          runnerState->uniRunnerNBlocks);
+    WARN("runUniRunner: before red kernel launch buffer=%p nthreads=%zu "
+         "nblocks=%zu redStream=%p",
+         hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
+         runnerState->uniRunnerNBlocks, runnerState->redStream);
+    if (flagcxDebugFile != NULL) fflush(flagcxDebugFile);
+    fflush(stderr);
     flagcxLaunchCollectiveKernel(
         hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
         runnerState->uniRunnerNBlocks, runnerState->redStream);
-    TRACE(FLAGCX_UNIRUNNER, "runUniRunner: launched red kernel buffer=%p",
-          hcomm->uniRunnerFifoBuffer);
+    WARN("runUniRunner: after red kernel launch buffer=%p redStream=%p",
+         hcomm->uniRunnerFifoBuffer, runnerState->redStream);
+    if (flagcxDebugFile != NULL) fflush(flagcxDebugFile);
+    fflush(stderr);
   }
 #endif
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner: synchronizing redStream");
-  deviceAdaptor->streamSynchronize(runnerState->redStream);
+  FLAGCXCHECK(uniRunnerWaitForStreamWithDiagnostics(
+      hcomm, runnerState, runnerState->redStream, "redStream", numRedTriggers));
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner: redStream synchronized");
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner: synchronizing cpyStream");
-  deviceAdaptor->streamSynchronize(runnerState->cpyStream);
+  FLAGCXCHECK(uniRunnerWaitForStreamWithDiagnostics(
+      hcomm, runnerState, runnerState->cpyStream, "cpyStream", numRedTriggers));
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner: cpyStream synchronized");
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner: synchronizing commStream");
-  deviceAdaptor->streamSynchronize(runnerState->commStream);
+  FLAGCXCHECK(uniRunnerWaitForStreamWithDiagnostics(
+      hcomm, runnerState, runnerState->commStream, "commStream",
+      numRedTriggers));
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner: commStream synchronized");
 
   return flagcxSuccess;
