@@ -2982,11 +2982,21 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
   while (!flagcxIntruQueueEmpty(&runnerState->redReadyQueue)) {
     struct uniRunnerDagNode *current =
         flagcxIntruQueueHead(&runnerState->redReadyQueue);
+    int parentIdx = current->numParents == 0 ? -1 : current->parents[0];
+    int parentType = -1;
+    size_t parentTriggerIdx = static_cast<size_t>(-1);
     uint64_t flagIn =
         current->numParents == 0
             ? 0
-            : (uintptr_t)getDagNodeFlag(runnerState, current->parents[0]);
+            : (uintptr_t)getDagNodeFlag(runnerState, parentIdx);
     uint64_t flagOut = (uintptr_t)getDagNodeFlag(runnerState, current->nodeIdx);
+    if (parentIdx >= 0) {
+      uniRunnerDagNode *parent = &runnerState->dagNodes[parentIdx];
+      parentType = static_cast<int>(parent->nodeType);
+      if (parent->nodeType == uniRunnerDagNodeTypeRed) {
+        parentTriggerIdx = parent->nodeData.red.triggerIdx;
+      }
+    }
     // The current algorithms only create single-parent RED nodes. Multi-parent
     // dependencies are handled for P2P/CPY nodes by emitting one stream wait
     // per parent; RED nodes would need an explicit fan-in flag if that ever
@@ -3002,6 +3012,11 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
     // RED trigger indices are assigned in host scheduling order so the device
     // dequeue cursor always observes dependency-respecting FIFO order.
     current->nodeData.red.triggerIdx = triggerIdx;
+    TRACE(FLAGCX_UNIRUNNER,
+          "rank %d stage red trigger %zu node %d parent %d parentType %d "
+          "parentTrigger %zu flagIn %p flagOut %p",
+          comm->rank, triggerIdx, current->nodeIdx, parentIdx, parentType,
+          parentTriggerIdx, (void *)flagIn, (void *)flagOut);
     redTriggers[triggerIdx].setValue(
         (uintptr_t)current->nodeData.red.input1,
         (uintptr_t)current->nodeData.red.input2,
@@ -3096,10 +3111,15 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   size_t numRedTriggers = countDagReduceTriggers(runnerState);
   size_t nextRedTriggerIdx = 0;
   std::vector<flagcxReduceTrigger> redTriggers(numRedTriggers);
+  TRACE(FLAGCX_UNIRUNNER,
+        "runUniRunner: numDagNodes=%d numRedTriggers=%zu redBuffer=%p",
+        runnerState->numDagNodes, numRedTriggers, hcomm->uniRunnerFifoBuffer);
 
   FLAGCXCHECK(prepareDagStreamFlags(runnerState));
   FLAGCXCHECK(runnerState->fifo->flagcxRedFifoInit(numRedTriggers));
   hcomm->uniRunnerFifoBuffer = runnerState->fifo->buffer;
+  TRACE(FLAGCX_UNIRUNNER, "runUniRunner: red fifo initialized buffer=%p",
+        hcomm->uniRunnerFifoBuffer);
 
   // Main scheduling loop using DAG-based queue scheduling
   while (true) {
@@ -3121,23 +3141,44 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   }
 
   if (numRedTriggers != 0) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "runUniRunner: begin red trigger H2D copy buffer=%p triggerCount=%zu "
+          "bytes=%zu",
+          hcomm->uniRunnerFifoBuffer, numRedTriggers,
+          numRedTriggers * sizeof(flagcxReduceTrigger));
     FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
         static_cast<char *>(hcomm->uniRunnerFifoBuffer) +
             flagcxRedFifoIdxData * sizeof(uint64_t),
         redTriggers.data(), numRedTriggers * sizeof(flagcxReduceTrigger),
         flagcxMemcpyHostToDevice, NULL, NULL));
+    TRACE(FLAGCX_UNIRUNNER,
+          "runUniRunner: finished red trigger H2D copy buffer=%p",
+          hcomm->uniRunnerFifoBuffer);
   }
 
 #ifdef COMPILE_KERNEL_HOST
   if (numRedTriggers != 0) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "runUniRunner: launching red kernel buffer=%p nthreads=%zu "
+          "nblocks=%zu",
+          hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
+          runnerState->uniRunnerNBlocks);
     flagcxLaunchCollectiveKernel(
         hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
         runnerState->uniRunnerNBlocks, runnerState->redStream);
+    TRACE(FLAGCX_UNIRUNNER, "runUniRunner: launched red kernel buffer=%p",
+          hcomm->uniRunnerFifoBuffer);
   }
 #endif
+  TRACE(FLAGCX_UNIRUNNER, "runUniRunner: synchronizing redStream");
   deviceAdaptor->streamSynchronize(runnerState->redStream);
+  TRACE(FLAGCX_UNIRUNNER, "runUniRunner: redStream synchronized");
+  TRACE(FLAGCX_UNIRUNNER, "runUniRunner: synchronizing cpyStream");
   deviceAdaptor->streamSynchronize(runnerState->cpyStream);
+  TRACE(FLAGCX_UNIRUNNER, "runUniRunner: cpyStream synchronized");
+  TRACE(FLAGCX_UNIRUNNER, "runUniRunner: synchronizing commStream");
   deviceAdaptor->streamSynchronize(runnerState->commStream);
+  TRACE(FLAGCX_UNIRUNNER, "runUniRunner: commStream synchronized");
 
   return flagcxSuccess;
 }
