@@ -1,6 +1,9 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 #include "device_api/comm_traits.h"
+#include "debug.h"
+
+#include <cstdio>
 
 #define SLOT_IDX 4
 #define FST_IDX 5
@@ -105,6 +108,22 @@ flagcxReduceKernel(uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
   }
 }
 
+static inline void flushCollectiveLaunchLogs() {
+  if (flagcxDebugFile != NULL) fflush(flagcxDebugFile);
+  fflush(stderr);
+}
+
+static inline void *getCollectiveNativeStreamHandle(flagcxStream_t stream) {
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+  return stream == NULL
+             ? NULL
+             : reinterpret_cast<void *>(*(FLAGCX_DEVICE_STREAM_PTR)stream);
+#else
+  (void)stream;
+  return NULL;
+#endif
+}
+
 FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
   FLAGCX_SHARED uint64_t shm[16];
   uint64_t *vBuf = (uint64_t *)fifoBuffer;
@@ -204,6 +223,29 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
 
 void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
                                   size_t nblocks, flagcxStream_t stream) {
+  void *nativeStream = getCollectiveNativeStreamHandle(stream);
+  WARN("flagcxLaunchCollectiveKernel: enter fifoBuffer=%p nthreads=%zu "
+       "nblocks=%zu stream=%p nativeStream=%p",
+       fifoBuffer, nthreads, nblocks, stream, nativeStream);
+  flushCollectiveLaunchLogs();
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+  cudaError_t preLaunchErr = cudaPeekAtLastError();
+  WARN("flagcxLaunchCollectiveKernel: pre-launch cudaPeekAtLastError=%d (%s)",
+       static_cast<int>(preLaunchErr), cudaGetErrorString(preLaunchErr));
+  flushCollectiveLaunchLogs();
+#endif
   flagcxCollectiveKernel<<<nblocks, nthreads, 0,
                            *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(fifoBuffer);
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+  cudaError_t postLaunchErr = cudaPeekAtLastError();
+  WARN("flagcxLaunchCollectiveKernel: post-launch fifoBuffer=%p stream=%p "
+       "nativeStream=%p cudaPeekAtLastError=%d (%s)",
+       fifoBuffer, stream, nativeStream, static_cast<int>(postLaunchErr),
+       cudaGetErrorString(postLaunchErr));
+#else
+  WARN("flagcxLaunchCollectiveKernel: launched fifoBuffer=%p stream=%p "
+       "nativeStream=%p",
+       fifoBuffer, stream, nativeStream);
+#endif
+  flushCollectiveLaunchLogs();
 }

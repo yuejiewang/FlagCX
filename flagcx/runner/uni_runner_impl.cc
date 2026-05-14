@@ -1,6 +1,7 @@
 #include "uni_runner_impl.h"
 #include "adaptor.h"
 #include "comm.h"
+#include "device_utils.h"
 #include "flagcx_hetero.h"
 #include "info.h"
 #include "net.h"
@@ -50,6 +51,34 @@ std::mutex gUniRunnerDagCacheMutex;
 std::unordered_map<size_t, std::vector<std::shared_ptr<uniRunnerDagTemplate>>>
     gUniRunnerDagCache;
 std::unordered_set<std::string> gUniRunnerDagLoadedPaths;
+
+struct uniRunnerLaunchDiagStats {
+  size_t commWaits = 0;
+  size_t commPendWrites = 0;
+  size_t commDoneWrites = 0;
+  size_t cpyWaits = 0;
+  size_t cpyPendWrites = 0;
+  size_t cpyDoneWrites = 0;
+  size_t p2pNodesLaunched = 0;
+  size_t cpyNodesLaunched = 0;
+  size_t redTriggersStaged = 0;
+};
+
+static inline void flushUniRunnerDiagLogs() {
+  if (flagcxDebugFile != NULL) fflush(flagcxDebugFile);
+  fflush(stderr);
+}
+
+static inline void *getUniRunnerNativeStreamHandle(flagcxStream_t stream) {
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+  return stream == NULL
+             ? NULL
+             : reinterpret_cast<void *>(*(FLAGCX_DEVICE_STREAM_PTR)stream);
+#else
+  (void)stream;
+  return NULL;
+#endif
+}
 
 static size_t hashCombine(size_t seed, size_t value) {
   return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2));
@@ -2835,7 +2864,8 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
 }
 
 static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
-                                   flagcxHeteroComm_t comm) {
+                                   flagcxHeteroComm_t comm,
+                                   uniRunnerLaunchDiagStats *diagStats) {
   // Dequeue
   uniRunnerDagNode *current =
       flagcxIntruQueueDequeue(&runnerState->p2pReadyQueue);
@@ -2844,11 +2874,17 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
       getDagNodeExecutionStream(runnerState, current);
 
   if (current->nodeType == uniRunnerDagNodeTypeP2p) {
+    if (diagStats != NULL) {
+      diagStats->p2pNodesLaunched++;
+    }
     // Mark the node as submitted before wiring its completion dependency.
     TRACE(FLAGCX_UNIRUNNER, "rank %d p2p op %d streamWrite flag %d: PEND",
           comm->rank, current->nodeIdx, current->nodeIdx);
     FLAGCXCHECK(deviceAdaptor->streamWriteValue64(runnerState->commStream, flag,
                                                   flagcxStreamFlagPend, 0));
+    if (diagStats != NULL) {
+      diagStats->commPendWrites++;
+    }
     for (int i = 0; i < current->numParents; i++) {
       int parentIdx = current->parents[i];
       uniRunnerDagNode *parent = &runnerState->dagNodes[parentIdx];
@@ -2861,6 +2897,9 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
       void *parentFlag = getDagNodeFlag(runnerState, parentIdx);
       FLAGCXCHECK(deviceAdaptor->streamWaitValue64(
           runnerState->commStream, parentFlag, flagcxStreamFlagDone, 0));
+      if (diagStats != NULL) {
+        diagStats->commWaits++;
+      }
       TRACE(FLAGCX_UNIRUNNER, "rank %d p2p op %d streamWait flag %d: DONE",
             comm->rank, current->nodeIdx, parentIdx);
     }
@@ -2888,11 +2927,20 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
           comm->rank, current->nodeIdx, current->nodeIdx);
     FLAGCXCHECK(deviceAdaptor->streamWriteValue64(runnerState->commStream, flag,
                                                   flagcxStreamFlagDone, 0));
+    if (diagStats != NULL) {
+      diagStats->commDoneWrites++;
+    }
   } else if (current->nodeType == uniRunnerDagNodeTypeCpy) {
+    if (diagStats != NULL) {
+      diagStats->cpyNodesLaunched++;
+    }
     TRACE(FLAGCX_UNIRUNNER, "rank %d cpy op %d streamWrite flag %d: PEND",
           comm->rank, current->nodeIdx, current->nodeIdx);
     FLAGCXCHECK(deviceAdaptor->streamWriteValue64(runnerState->cpyStream, flag,
                                                   flagcxStreamFlagPend, 0));
+    if (diagStats != NULL) {
+      diagStats->cpyPendWrites++;
+    }
     for (int i = 0; i < current->numParents; i++) {
       int parentIdx = current->parents[i];
       uniRunnerDagNode *parent = &runnerState->dagNodes[parentIdx];
@@ -2905,6 +2953,9 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
       void *parentFlag = getDagNodeFlag(runnerState, parentIdx);
       FLAGCXCHECK(deviceAdaptor->streamWaitValue64(
           runnerState->cpyStream, parentFlag, flagcxStreamFlagDone, 0));
+      if (diagStats != NULL) {
+        diagStats->cpyWaits++;
+      }
       TRACE(FLAGCX_UNIRUNNER, "rank %d cpy op %d streamWait flag %d: DONE",
             comm->rank, current->nodeIdx, parentIdx);
     }
@@ -2921,6 +2972,9 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
           comm->rank, current->nodeIdx, current->nodeIdx);
     FLAGCXCHECK(deviceAdaptor->streamWriteValue64(runnerState->cpyStream, flag,
                                                   flagcxStreamFlagDone, 0));
+    if (diagStats != NULL) {
+      diagStats->cpyDoneWrites++;
+    }
   } else {
     return flagcxSystemError;
   }
@@ -2969,12 +3023,13 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
                                         flagcxHeteroComm_t comm,
                                         flagcxReduceTrigger *redTriggers,
                                         size_t *nextRedTriggerIdx,
-                                        size_t numRedTriggers) {
+                                        size_t numRedTriggers,
+                                        uniRunnerLaunchDiagStats *diagStats) {
   // process p2pReadyQueue
   while (!flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue)) {
     uniRunnerDagNode *current =
         flagcxIntruQueueHead(&runnerState->p2pReadyQueue);
-    FLAGCXCHECK(launchP2pOps(runnerState, comm));
+    FLAGCXCHECK(launchP2pOps(runnerState, comm, diagStats));
     FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
   }
 
@@ -3024,6 +3079,9 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
         current->nodeData.red.nthreads, current->nodeData.red.datatype,
         current->nodeData.red.redOp, flagcxReduceTriggerEnqueued, flagIn,
         flagOut);
+    if (diagStats != NULL) {
+      diagStats->redTriggersStaged++;
+    }
     (*nextRedTriggerIdx)++;
     flagcxIntruQueueDequeue(&runnerState->redReadyQueue);
     FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
@@ -3107,6 +3165,7 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
 flagcxResult_t runUniRunner(flagcxComm_t comm) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  uniRunnerLaunchDiagStats diagStats;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
   size_t numRedTriggers = countDagReduceTriggers(runnerState);
   size_t nextRedTriggerIdx = 0;
@@ -3133,7 +3192,8 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
     }
 
     FLAGCXCHECK(processReadyQueue(runnerState, hcomm, redTriggers.data(),
-                                  &nextRedTriggerIdx, numRedTriggers));
+                                  &nextRedTriggerIdx, numRedTriggers,
+                                  &diagStats));
   }
 
   if (nextRedTriggerIdx != numRedTriggers) {
@@ -3158,19 +3218,43 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
 
 #ifdef COMPILE_KERNEL_HOST
   if (numRedTriggers != 0) {
+    int currentDev = -1;
+    flagcxResult_t getDeviceRes = deviceAdaptor->getDevice(&currentDev);
+    flagcxResult_t redStreamQueryRes =
+        deviceAdaptor->streamQuery(runnerState->redStream);
+    WARN("runUniRunner: pre-launch diag expectedDev=%d getDeviceRes=%d "
+         "currentDev=%d redBuffer=%p fifoBuffer=%p redTriggersHost=%p "
+         "streamFlagsPool=%p streamFlagsSize=%zu redStream=%p nativeRedStream=%p "
+         "cpyStream=%p nativeCpyStream=%p commStream=%p nativeCommStream=%p "
+         "redStreamQuery=%d numRedTriggers=%zu stagedRedTriggers=%zu "
+         "p2pNodes=%zu cpyNodes=%zu commWaits=%zu commPendWrites=%zu "
+         "commDoneWrites=%zu cpyWaits=%zu cpyPendWrites=%zu cpyDoneWrites=%zu",
+         hcomm->cudaDev, getDeviceRes, currentDev, hcomm->uniRunnerFifoBuffer,
+         runnerState->fifo != NULL ? runnerState->fifo->buffer : NULL,
+         redTriggers.data(), runnerState->streamFlagsPool,
+         runnerState->streamFlagsSize, runnerState->redStream,
+         getUniRunnerNativeStreamHandle(runnerState->redStream),
+         runnerState->cpyStream,
+         getUniRunnerNativeStreamHandle(runnerState->cpyStream),
+         runnerState->commStream,
+         getUniRunnerNativeStreamHandle(runnerState->commStream),
+         redStreamQueryRes, numRedTriggers, diagStats.redTriggersStaged,
+         diagStats.p2pNodesLaunched, diagStats.cpyNodesLaunched,
+         diagStats.commWaits, diagStats.commPendWrites,
+         diagStats.commDoneWrites, diagStats.cpyWaits,
+         diagStats.cpyPendWrites, diagStats.cpyDoneWrites);
+    flushUniRunnerDiagLogs();
     WARN("runUniRunner: before red kernel launch buffer=%p nthreads=%zu "
          "nblocks=%zu redStream=%p",
          hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
          runnerState->uniRunnerNBlocks, runnerState->redStream);
-    if (flagcxDebugFile != NULL) fflush(flagcxDebugFile);
-    fflush(stderr);
+    flushUniRunnerDiagLogs();
     flagcxLaunchCollectiveKernel(
         hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
         runnerState->uniRunnerNBlocks, runnerState->redStream);
     WARN("runUniRunner: after red kernel launch buffer=%p redStream=%p",
          hcomm->uniRunnerFifoBuffer, runnerState->redStream);
-    if (flagcxDebugFile != NULL) fflush(flagcxDebugFile);
-    fflush(stderr);
+    flushUniRunnerDiagLogs();
   }
 #endif
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner: synchronizing redStream");
