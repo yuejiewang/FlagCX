@@ -136,12 +136,12 @@ typedef struct {
   uint64_t uniRunnerNRedSlices;
   uint64_t uniRunnerRedSliceSize;
 
-  // Stream completion flags backed by a reusable contiguous device pool. The
-  // host-side queue stores per-node addresses within that pool.
+  // Per-invocation stream completion flags. streamFlags is indexed by nodeIdx
+  // and entries are NULL for nodes that do not participate in cross-stream or
+  // RED dependencies.
   void *streamFlagsPool;
   void **streamFlags;
   size_t streamFlagsSize;
-  size_t streamFlagsCapacity;
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
