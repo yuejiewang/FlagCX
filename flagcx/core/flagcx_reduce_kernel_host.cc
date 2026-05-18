@@ -1,8 +1,6 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 
-FLAGCX_PARAM(ReduceFifoCapacity, "REDUCE_FIFO_CAPACITY", FLAGCX_FIFO_CAPACITY);
-
 FLAGCX_HOST_DECORATOR void flagcxReduceTrigger::setValue(
     uint64_t fst, uint64_t snd, uint64_t out, size_t count, size_t nthreads,
     flagcxDataType_t datatype, flagcxRedOp_t redOp,
@@ -26,79 +24,23 @@ FLAGCX_HOST_DECORATOR void flagcxReduceTrigger::setValue(
   memcpy(this->value, tmp, sizeof(tmp));
 }
 
-FLAGCX_HOST_DECORATOR uint64_t flagcxReduceTrigger::pollState() {
-  uint64_t currVal = __atomic_load_n(&this->value[3], __ATOMIC_ACQUIRE);
-  return currVal >> flagcxReduceTriggerOffState &
-         flagcxTriggerMask(flagcxReduceTriggerBitsState);
-}
-
-FLAGCX_HOST_DECORATOR void flagcxReduceTrigger::setState(int state) {
-  uint64_t currVal = __atomic_load_n(&this->value[3], __ATOMIC_ACQUIRE);
-  currVal &= ~(flagcxTriggerMask(flagcxReduceTriggerBitsState)
-               << flagcxReduceTriggerOffState);
-  currVal |= (state & flagcxTriggerMask(flagcxReduceTriggerBitsState))
-             << flagcxReduceTriggerOffState;
-  __atomic_store_n(&this->value[3], currVal, __ATOMIC_RELEASE);
-  TRACE(FLAGCX_KERNEL, "setState called, new state=%llu",
-        currVal >> flagcxReduceTriggerOffState &
-            flagcxTriggerMask(flagcxReduceTriggerBitsState));
-}
-
-FLAGCX_HOST_DECORATOR flagcxResult_t
-enqueue(void *fifoBuffer, uint64_t addr1, uint64_t addr2, uint64_t addr3,
-        size_t count, size_t nthreads, flagcxDataType_t datatype,
-        flagcxRedOp_t redop, uint64_t flagIn, uint64_t flagOut, int *ret) {
-  int idx = -1;
-  uint64_t *buffer = (uint64_t *)fifoBuffer;
-  int capacity = buffer[flagcxFifoIdxCapacity];
-  int distance = buffer[flagcxFifoIdxProduced] - buffer[flagcxFifoIdxConsumed];
-  // red buffer full, wait for kernel to consume
-  if (distance >= capacity) {
-    *ret = -1;
-    sched_yield();
-    return flagcxSuccess;
-  }
-  idx = buffer[flagcxFifoIdxProduced] % capacity;
-  flagcxReduceTrigger *trigger =
-      ((flagcxReduceTrigger *)(buffer + flagcxFifoIdxData)) + idx;
-
-  // kernel reduce work in progress
-  if (trigger->pollState() != flagcxReduceTriggerAvailable) {
-    *ret = -1;
-    sched_yield();
-    return flagcxSuccess;
-  }
-  trigger->setValue(addr1, addr2, addr3, count, nthreads, datatype, redop,
-                    flagcxReduceTriggerEnqueued, flagIn, flagOut);
-  __atomic_fetch_add(buffer + flagcxFifoIdxProduced, 1ul, __ATOMIC_RELEASE);
-  *ret = idx;
-  TRACE(FLAGCX_KERNEL,
-        "enqueue red: count=%lu, nthreads=%lu, datatype=%d, redop=%d, idx=%d",
-        count, nthreads, datatype, redop, idx);
-
-  return flagcxSuccess;
-}
-
-flagcxResult_t flagcxFifo::flagcxRedFifoInit() {
+flagcxResult_t flagcxFifo::flagcxRedFifoInit(size_t capacity) {
   TRACE(FLAGCX_INIT, "flagcxRedFifoInit called");
-  uint64_t flagcxReduceFifoCapacity = flagcxParamReduceFifoCapacity();
-  FLAGCXCHECK(deviceAdaptor->deviceMalloc((void **)&buffer,
-                                          flagcxFifoIdxData * sizeof(uint64_t) +
-                                              flagcxReduceFifoCapacity *
-                                                  sizeof(flagcxReduceTrigger),
-                                          flagcxMemHost, NULL));
-  buffer[flagcxFifoIdxCapacity] = flagcxReduceFifoCapacity;
-  buffer[flagcxFifoIdxConsumed] = 0;
-  buffer[flagcxFifoIdxProduced] = 0;
-  buffer[flagcxFifoIdxTerminate] = 0;
-  memset((void *)(buffer + flagcxFifoIdxData), 0,
-         flagcxReduceFifoCapacity * sizeof(flagcxReduceTrigger));
-  __sync_synchronize();
+  size_t bytes = flagcxRedFifoIdxData * sizeof(uint64_t) +
+                 capacity * sizeof(flagcxReduceTrigger);
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc((void **)&buffer, bytes,
+                                          flagcxMemDevice, NULL));
+  FLAGCXCHECK(
+      deviceAdaptor->deviceMemset(buffer, 0, bytes, flagcxMemDevice, NULL));
   return flagcxSuccess;
 }
 
 flagcxResult_t flagcxFifo::flagcxRedFifoDestroy() {
   INFO(FLAGCX_KERNEL, "flagcxRedFifoDestroy called");
-  FLAGCXCHECK(deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL));
+  if (buffer != NULL) {
+    FLAGCXCHECK(
+        deviceAdaptor->deviceFree((void *)buffer, flagcxMemDevice, NULL));
+    buffer = NULL;
+  }
   return flagcxSuccess;
 }
