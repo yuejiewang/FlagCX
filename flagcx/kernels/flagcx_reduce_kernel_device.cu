@@ -1,6 +1,6 @@
-#include "device_api/comm_traits.h"
 #include "flagcx.h"
 #include "flagcx_kernel.h"
+#include "device_api/comm_traits.h"
 
 #define SLOT_IDX 4
 #define FST_IDX 5
