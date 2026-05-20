@@ -134,6 +134,9 @@ struct flagcxProxyArgs {
   std::shared_ptr<flagcxSemaphore> semaphore;
   int opId;
   int step;
+  void *streamValueDonePtr = nullptr;
+  int streamValueDoneCount = 0;
+  int streamValueDoneWritten = 0;
 
   // user buffer registration
   void *regHandle = nullptr;

@@ -199,6 +199,8 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
           if (res == flagcxSuccess) {
             args->transmitted = args->chunkSteps;
             __atomic_store_n(&regInfoPtr->copyDone, 1, __ATOMIC_RELEASE);
+            FLAGCXCHECK(flagcxStreamValueSignalChunks(
+                args, resources->proxyInfo.stream, args->transmitted));
           }
         }
       } else {
@@ -209,6 +211,8 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
           }
           if (slotIsComplete(slotPtr)) {
             __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+            FLAGCXCHECK(flagcxStreamValueSignalChunks(
+                args, resources->proxyInfo.stream, args->chunkSteps));
             args->semaphore->subCounter(args->opId);
             args->done = 1;
           }
@@ -228,6 +232,8 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
           args->copied = args->chunkSteps;
           args->transmitted = args->chunkSteps;
           args->totalCopySize = size;
+          FLAGCXCHECK(flagcxStreamValueSignalChunks(
+              args, resources->proxyInfo.stream, args->transmitted));
         }
       } else {
         if (args->done != 1) {
@@ -237,6 +243,8 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
           }
           if (slotIsComplete(slotPtr)) {
             __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+            FLAGCXCHECK(flagcxStreamValueSignalChunks(
+                args, resources->proxyInfo.stream, args->chunkSteps));
             args->semaphore->subCounter(args->opId);
             args->done = 1;
           }
@@ -284,6 +292,8 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
         // Update sendHead in the shared slot
         volatile uint64_t *sendHead = &slotPtr->sendHead;
         __atomic_store_n(sendHead, args->transmitted, __ATOMIC_RELEASE);
+        FLAGCXCHECK(flagcxStreamValueSignalChunks(
+            args, resources->proxyInfo.stream, args->transmitted));
       }
     }
   } else {
@@ -294,6 +304,8 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
       }
       if (slotIsComplete(slotPtr)) {
         __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+        FLAGCXCHECK(flagcxStreamValueSignalChunks(
+            args, resources->proxyInfo.stream, args->chunkSteps));
         args->semaphore->subCounter(args->opId);
         args->done = 1;
       }
@@ -355,6 +367,8 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
           args->copied = args->chunkSteps;
           args->transmitted = args->chunkSteps;
           args->totalCopySize = size;
+          FLAGCXCHECK(flagcxStreamValueSignalChunks(
+              args, resources->proxyInfo.stream, args->transmitted));
         }
       } else {
         if (args->done != 1) {
@@ -364,6 +378,8 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
           }
           if (slotIsComplete(slotPtr)) {
             __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+            FLAGCXCHECK(flagcxStreamValueSignalChunks(
+                args, resources->proxyInfo.stream, args->chunkSteps));
             args->semaphore->subCounter(args->opId);
             args->done = 1;
           }
@@ -391,6 +407,8 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
           if (res == flagcxSuccess) {
             args->transmitted = args->chunkSteps;
             __atomic_store_n(&regInfoPtr->copyDone, 1, __ATOMIC_RELEASE);
+            FLAGCXCHECK(flagcxStreamValueSignalChunks(
+                args, resources->proxyInfo.stream, args->transmitted));
           }
         }
       } else {
@@ -401,6 +419,8 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
           }
           if (slotIsComplete(slotPtr)) {
             __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+            FLAGCXCHECK(flagcxStreamValueSignalChunks(
+                args, resources->proxyInfo.stream, args->chunkSteps));
             args->semaphore->subCounter(args->opId);
             args->done = 1;
           }
@@ -448,6 +468,8 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
         volatile uint64_t *recvTail = &slotPtr->recvTail;
         __atomic_store_n(recvTail, args->transmitted + flagcxP2pChunks,
                          __ATOMIC_RELEASE);
+        FLAGCXCHECK(flagcxStreamValueSignalChunks(
+            args, resources->proxyInfo.stream, args->transmitted));
       }
     }
   } else {
@@ -458,6 +480,8 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
       }
       if (slotIsComplete(slotPtr)) {
         __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+        FLAGCXCHECK(flagcxStreamValueSignalChunks(
+            args, resources->proxyInfo.stream, args->chunkSteps));
         args->semaphore->subCounter(args->opId);
         args->done = 1;
       }
@@ -495,10 +519,14 @@ flagcxResult_t flagcxP2pProxySelfCopy(struct flagcxP2pResources *resources,
           resources->proxyInfo.events[args->transmitted]);
       if (res == flagcxSuccess) {
         args->transmitted++;
+        FLAGCXCHECK(flagcxStreamValueSignalChunks(
+            args, resources->proxyInfo.stream, args->transmitted));
       }
     }
   } else {
     if (args->done != 1) {
+      FLAGCXCHECK(flagcxStreamValueSignalChunks(
+          args, resources->proxyInfo.stream, args->chunkSteps));
       args->semaphore->subCounter(args->opId);
       args->done = 1;
     }

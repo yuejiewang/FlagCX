@@ -222,10 +222,14 @@ flagcxResult_t flagcxProxySend(sendNetResources *resources, void *data,
       resources->netAdaptor->test(req, &done, &sizes);
       if (done) {
         args->transmitted++;
+        FLAGCXCHECK(flagcxStreamValueSignalChunks(
+            args, resources->cpStream, args->transmitted));
       }
     }
   } else {
     if (args->done != 1) {
+      FLAGCXCHECK(flagcxStreamValueSignalChunks(args, resources->cpStream,
+                                                args->chunkSteps));
       args->semaphore->subCounter(args->opId);
       args->done = 1;
     }
@@ -355,13 +359,19 @@ flagcxResult_t flagcxProxyRecv(recvNetResources *resources, void *data,
         if (deviceAdaptor->eventQuery(resources->cpEvents[step]) ==
             flagcxSuccess) {
           args->copied++;
+          FLAGCXCHECK(flagcxStreamValueSignalChunks(
+              args, resources->cpStream, args->copied));
         }
       } else {
         args->copied++;
+        FLAGCXCHECK(flagcxStreamValueSignalChunks(args, resources->cpStream,
+                                                  args->copied));
       }
     }
   } else {
     if (args->done != 1) {
+      FLAGCXCHECK(flagcxStreamValueSignalChunks(args, resources->cpStream,
+                                                args->chunkSteps));
       args->semaphore->subCounter(args->opId);
       args->done = 1;
     }

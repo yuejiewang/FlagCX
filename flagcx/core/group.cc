@@ -31,6 +31,7 @@ __thread struct flagcxIntruQueue<struct flagcxAsyncJob, &flagcxAsyncJob::next>
     flagcxAsyncJobs;
 
 FLAGCX_PARAM(P2pScheduleDisable, "P2P_SCHEDULE_DISABLE", 0);
+FLAGCX_PARAM(StreamValueGroupEnable, "STREAM_VALUE_GROUP_ENABLE", 0);
 
 flagcxResult_t flagcxHeteroGroupStart() {
   flagcxResult_t ret = flagcxSuccess;
@@ -99,19 +100,46 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
   // DefaultSchedule: |op0{s0}|op1{s0}|...|opN{s0}|
   int defaultOpId = 0;
   int defaultStep = 0;
+  bool useStreamValueGroup = flagcxParamStreamValueGroupEnable() != 0;
   // Each groupLaunch we create a semaphore to track the
   // p2p ops and a stream to launch host or device func
   std::shared_ptr<flagcxSemaphore> semaphore;
-  if (deviceAsyncKernel) {
+  std::shared_ptr<flagcxStreamValueSemaphore> streamValueSemaphore;
+  if (useStreamValueGroup) {
+    streamValueSemaphore = std::make_shared<flagcxStreamValueSemaphore>();
+    semaphore = streamValueSemaphore;
+  } else if (deviceAsyncKernel) {
     semaphore = std::make_shared<flagcxDeviceSemaphore>();
   } else {
     semaphore = std::make_shared<flagcxHostSemaphore>();
   }
   flagcxStream_t launchStream = nullptr;
   flagcxEvent_t launchEvent = nullptr;
+  int totalProxyOps = 0;
+  int totalChunkSteps = 0;
   // temporary stored proxy ops in step order
   std::map<int, std::vector<std::pair<flagcxHeteroComm *, flagcxProxyOp *>>>
       proxyOps;
+  auto recordLaunchDependency = [&](flagcxProxyOp *op) -> flagcxResult_t {
+    if (useStreamValueGroup && op->stream == nullptr) {
+      WARN("stream-value group requires non-null streams");
+      return flagcxInvalidUsage;
+    }
+    if (!useStreamValueGroup) {
+      op->event = semaphore->getEvent();
+      FLAGCXCHECK(deviceAdaptor->eventRecord(op->event, op->stream));
+    }
+    if (launchStream == nullptr) {
+      launchStream = op->stream;
+      if (!useStreamValueGroup)
+        launchEvent = op->event;
+    } else if (!useStreamValueGroup) {
+      FLAGCXCHECK(deviceAdaptor->streamWaitEvent(launchStream, op->event));
+    }
+    totalProxyOps++;
+    totalChunkSteps += op->args.chunkSteps;
+    return flagcxSuccess;
+  };
 
   if (groupCommPreconnectHeadMain != nullptr) {
     struct flagcxHeteroComm *comm = groupCommPreconnectHeadMain;
@@ -194,7 +222,6 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                                      ->send[0]
                                      .proxyConn.connection;
                 op->stream = sendTasks[i]->stream;
-                op->event = semaphore->getEvent();
                 op->args.chunkSteps = 1; // single step
                 op->args.semaphore = semaphore;
                 op->args.opId = sendTasks[i]->opId == INT_MAX
@@ -205,14 +232,7 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                                     : sendTasks[i]->step;
                 semaphore->addCounter(op->args.opId);
                 defaultOpId++;
-                FLAGCXCHECK(deviceAdaptor->eventRecord(op->event, op->stream));
-                if (launchStream == nullptr) {
-                  launchStream = op->stream;
-                  launchEvent = op->event;
-                } else {
-                  FLAGCXCHECK(
-                      deviceAdaptor->streamWaitEvent(launchStream, op->event));
-                }
+                FLAGCXCHECKGOTO(recordLaunchDependency(op), ret, fail);
                 if (proxyOps.find(op->args.step) == proxyOps.end()) {
                   proxyOps[op->args.step] = std::vector<
                       std::pair<flagcxHeteroComm *, flagcxProxyOp *>>();
@@ -323,18 +343,10 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                 p2p->step == -1
                     ? (p2pScheduleDisable ? defaultStep : roundRecvStep)
                     : p2p->step;
-            op->event = semaphore->getEvent();
             semaphore->addCounter(op->args.opId);
             defaultOpId++;
             roundRecvStep++;
-            FLAGCXCHECK(deviceAdaptor->eventRecord(op->event, op->stream));
-            if (launchStream == nullptr) {
-              launchStream = op->stream;
-              launchEvent = op->event;
-            } else {
-              FLAGCXCHECK(
-                  deviceAdaptor->streamWaitEvent(launchStream, op->event));
-            }
+            FLAGCXCHECKGOTO(recordLaunchDependency(op), ret, fail);
             if (proxyOps.find(op->args.step) == proxyOps.end()) {
               proxyOps[op->args.step] =
                   std::vector<std::pair<flagcxHeteroComm *, flagcxProxyOp *>>();
@@ -414,18 +426,10 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                 p2p->step == -1
                     ? (p2pScheduleDisable ? defaultStep : roundSendStep)
                     : p2p->step;
-            op->event = semaphore->getEvent();
             semaphore->addCounter(op->args.opId);
             defaultOpId++;
             roundSendStep++;
-            FLAGCXCHECK(deviceAdaptor->eventRecord(op->event, op->stream));
-            if (launchStream == nullptr) {
-              launchStream = op->stream;
-              launchEvent = op->event;
-            } else {
-              FLAGCXCHECK(
-                  deviceAdaptor->streamWaitEvent(launchStream, op->event));
-            }
+            FLAGCXCHECKGOTO(recordLaunchDependency(op), ret, fail);
             if (proxyOps.find(op->args.step) == proxyOps.end()) {
               proxyOps[op->args.step] =
                   std::vector<std::pair<flagcxHeteroComm *, flagcxProxyOp *>>();
@@ -440,6 +444,21 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
     } while (comm != nullptr);
   }
 
+  if (useStreamValueGroup && launchStream != nullptr && totalProxyOps > 0) {
+    int doneIdx = 0;
+    FLAGCXCHECKGOTO(
+        streamValueSemaphore->prepare(totalProxyOps, totalChunkSteps), ret,
+        fail);
+    for (auto it = proxyOps.begin(); it != proxyOps.end(); ++it) {
+      for (auto pair : it->second) {
+        FLAGCXCHECKGOTO(
+            streamValueSemaphore->bindDoneRange(&pair.second->args, doneIdx),
+            ret, fail);
+        doneIdx += pair.second->args.chunkSteps;
+      }
+    }
+  }
+
   // Save all proxy ops in step order
   for (auto it = proxyOps.begin(); it != proxyOps.end(); ++it) {
     for (auto pair : it->second) {
@@ -447,7 +466,20 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
     }
   }
 
-  if (launchStream != nullptr && launchEvent != nullptr) {
+  if (useStreamValueGroup && launchStream != nullptr && totalProxyOps > 0) {
+    int readyIdx = 0;
+    for (auto it = proxyOps.begin(); it != proxyOps.end(); ++it) {
+      for (auto pair : it->second) {
+        FLAGCXCHECKGOTO(streamValueSemaphore->enqueueReady(
+                            pair.second->stream, launchStream, readyIdx++),
+                        ret, fail);
+      }
+    }
+    FLAGCXCHECKGOTO(streamValueSemaphore->enqueueCompletion(launchStream), ret,
+                    fail);
+  }
+
+  if (!useStreamValueGroup && launchStream != nullptr && launchEvent != nullptr) {
     if (deviceAsyncKernel) {
       FLAGCXCHECK(deviceAdaptor->launchDeviceFunc(
           launchStream, deviceAsyncKernel, (void *)semaphore->getSignals()));

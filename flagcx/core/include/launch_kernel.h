@@ -17,7 +17,10 @@
 #include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unordered_map>
 #include <unistd.h>
+
+struct flagcxProxyArgs;
 
 struct flagcxSemaphore {
   flagcxSemaphore() = default;
@@ -32,6 +35,7 @@ struct flagcxSemaphore {
   virtual int pollStart(int opId = 0, int step = 0) = 0;
   virtual int pollEnd() = 0;
   virtual void wait() = 0;
+  virtual bool usesStreamValue() const { return false; }
 };
 
 #define FLAGCX_OPS_PER_SEMAPHORE 64
@@ -223,6 +227,95 @@ struct flagcxDeviceSemaphore : public flagcxSemaphore {
   // host-side wait is intentionally no-op and not needed
   void wait() override {}
 };
+
+struct flagcxStreamValueSemaphore : public flagcxSemaphore {
+  int counter;
+  std::unordered_map<int, int> stepInfo;
+  std::vector<std::pair<int, int>> steps; // [curStep, nSteps]
+  uint64_t *signals;
+  void *dSignals;
+  int readyCount;
+  int doneCount;
+  flagcxEvent_t completionEvent;
+  bool completionRecorded;
+
+  flagcxStreamValueSemaphore() {
+    counter = 0;
+    signals = nullptr;
+    dSignals = nullptr;
+    readyCount = 0;
+    doneCount = 0;
+    completionEvent = nullptr;
+    completionRecorded = false;
+    stepInfo.reserve(FLAGCX_OPS_PER_SEMAPHORE);
+    steps.reserve(FLAGCX_OPS_PER_SEMAPHORE);
+  }
+  ~flagcxStreamValueSemaphore() override {
+    if (completionEvent != nullptr) {
+      deviceAdaptor->eventDestroy(completionEvent);
+    }
+    if (signals != nullptr) {
+      deviceAdaptor->deviceFree((void *)signals, flagcxMemHost, nullptr);
+    }
+  }
+
+  flagcxResult_t prepare(int readyCount_, int doneCount_);
+  flagcxResult_t enqueueReady(flagcxStream_t stream, flagcxStream_t launchStream,
+                              int readyIdx);
+  flagcxResult_t bindDoneRange(struct flagcxProxyArgs *args, int doneIdx);
+  flagcxResult_t enqueueCompletion(flagcxStream_t launchStream);
+
+  flagcxEvent_t getEvent() override { return completionEvent; }
+  void signalStart() override {}
+  void *getSignals() override { return dSignals; }
+  void subCounter(int opId = 0) override {
+    auto it = stepInfo.find(opId);
+    assert(it != stepInfo.end());
+    int idx = it->second;
+    int prev = __atomic_fetch_add(&steps[idx].first, 1, __ATOMIC_ACQ_REL);
+    if (prev + 1 == __atomic_load_n(&steps[idx].second, __ATOMIC_ACQUIRE)) {
+      __atomic_fetch_sub(&counter, 1, __ATOMIC_RELEASE);
+    }
+  }
+  void addCounter(int opId = 0) override {
+    auto it = stepInfo.find(opId);
+    if (it != stepInfo.end()) {
+      __atomic_fetch_add(&steps[it->second].second, 1, __ATOMIC_RELEASE);
+    } else {
+      steps.emplace_back(0, 1);
+      stepInfo[opId] = (int)steps.size() - 1;
+      __atomic_fetch_add(&counter, 1, __ATOMIC_RELEASE);
+    }
+  }
+  int getCounter() override {
+    return __atomic_load_n(&counter, __ATOMIC_ACQUIRE);
+  }
+  int pollStart(int opId = 0, int step = 0) override {
+    auto it = stepInfo.find(opId);
+    assert(it != stepInfo.end());
+    if (signals == nullptr)
+      return 0;
+    return (__atomic_load_n(signals, __ATOMIC_ACQUIRE) >= 1 &&
+            __atomic_load_n(&steps[it->second].first, __ATOMIC_ACQUIRE) >=
+                step);
+  }
+  int pollEnd() override;
+  void wait() override {}
+  bool usesStreamValue() const override { return true; }
+
+private:
+  static constexpr int kArmedIdx = 0;
+  int readyBaseIdx() const { return 1; }
+  int doneBaseIdx() const { return 1 + readyCount; }
+  void *devicePtrAt(int idx) const {
+    return static_cast<void *>(static_cast<char *>(dSignals) +
+                               idx * sizeof(uint64_t));
+  }
+};
+
+flagcxResult_t flagcxStreamValueSignalChunks(struct flagcxProxyArgs *args,
+                                             flagcxStream_t stream,
+                                             int completedChunks);
 
 void cpuAsyncKernel(void *args);
 extern flagcxLaunchFunc_t deviceAsyncKernel;
