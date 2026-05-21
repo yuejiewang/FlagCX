@@ -142,6 +142,13 @@ typedef struct {
   void *streamFlagsPool;
   void **streamFlags;
   size_t streamFlagsSize;
+
+  // Host-pinned debug stages for RED triggers. redDebugStagesDev is the device
+  // alias the kernel writes to, and redDebugStagesHost is the host pointer the
+  // polling diagnostics read from.
+  uint32_t *redDebugStagesHost;
+  uint32_t *redDebugStagesDev;
+  size_t redDebugStageCount;
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);

@@ -85,6 +85,14 @@ FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getFlagOut() {
 }
 
 FLAGCX_DEVICE_INLINE_DECORATOR void
+storeRedDebugStage(uint32_t *debugStages, uint64_t slot,
+                   flagcxRedDebugStage stage) {
+  if (debugStages != NULL) {
+    debugStages[slot] = static_cast<uint32_t>(stage);
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void
 flagcxReduceKernel(uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
                    uint64_t nthreads, uint64_t datatype, uint64_t redOp) {
   // to be implemented by vendors
@@ -97,7 +105,8 @@ flagcxReduceKernel(uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
   }
 }
 
-FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
+FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer,
+                                                    uint32_t *debugStages) {
   FLAGCX_SHARED uint64_t shm[16];
   uint64_t *vBuf = (uint64_t *)fifoBuffer;
   int emptyIter = 0;
@@ -113,6 +122,7 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
   for (uint64_t taskIdx = blockIdx.x; taskIdx < cap; taskIdx += gridDim.x) {
     if (tid == 0) {
       slot = taskIdx;
+      storeRedDebugStage(debugStages, slot, flagcxRedDebugStageTriggerLoaded);
       shm[SLOT_IDX] = slot;
       flagcxReduceTrigger *t =
           (flagcxReduceTrigger *)(vBuf + flagcxRedFifoIdxData) + slot;
@@ -137,11 +147,17 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
                                  (uint64_t)flagcxStreamFlagPend,
                                  flagcxDeviceMemoryOrderRelease);
       }
+      storeRedDebugStage(debugStages, slot,
+                         flagcxRedDebugStageFlagOutPending);
     }
     FLAGCX_DEVICE_SYNC_THREADS();
 
     uint64_t flagIn = shm[FLAG_IN_IDX];
     while (flagIn != 0) {
+      if (tid == 0) {
+        storeRedDebugStage(debugStages, slot,
+                           flagcxRedDebugStageWaitingFlagIn);
+      }
       flagcxStreamFlagState flagState = loadStreamFlagState(flagIn);
       if (isStreamFlagStateDone(flagState)) {
         break;
@@ -154,6 +170,10 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
       emptyIter++;
       DeviceAPI::Intrin::spinBackoff(emptyIter);
     }
+    if (tid == 0) {
+      storeRedDebugStage(debugStages, slot,
+                         flagcxRedDebugStageReadyToReduce);
+    }
 
     emptyIter = 0;
     uint64_t fst = shm[FST_IDX];
@@ -165,19 +185,25 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
     uint64_t redop = shm[REDOP_IDX];
     flagcxReduceKernel(fst, snd, out, count, nthreads, datatype, redop);
     FLAGCX_DEVICE_SYNC_THREADS();
+    if (tid == 0) {
+      storeRedDebugStage(debugStages, slot, flagcxRedDebugStageReduceDone);
+    }
     FLAGCX_DEVICE_THREAD_FENCE();
 
     if (tid == 0) {
       flagcxReduceTrigger *t =
           (flagcxReduceTrigger *)(vBuf + flagcxRedFifoIdxData) + slot;
       t->setComplete();
+      storeRedDebugStage(debugStages, slot, flagcxRedDebugStageComplete);
     }
     FLAGCX_DEVICE_SYNC_THREADS();
   }
 }
 
-void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
-                                  size_t nblocks, flagcxStream_t stream) {
+void flagcxLaunchCollectiveKernel(void *fifoBuffer, uint32_t *debugStages,
+                                  size_t nthreads, size_t nblocks,
+                                  flagcxStream_t stream) {
   flagcxCollectiveKernel<<<nblocks, nthreads, 0,
-                           *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(fifoBuffer);
+                           *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(fifoBuffer,
+                                                                 debugStages);
 }

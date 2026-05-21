@@ -209,6 +209,9 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
           }
           if (slotIsComplete(slotPtr)) {
             __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+            TRACE(FLAGCX_P2P,
+                  "P2P send complete (WRITE mode) opId=%d step=%d size=%lu",
+                  args->opId, args->step, size);
             args->semaphore->subCounter(args->opId);
             args->done = 1;
           }
@@ -237,6 +240,9 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
           }
           if (slotIsComplete(slotPtr)) {
             __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+            TRACE(FLAGCX_P2P,
+                  "P2P send complete (READ mode) opId=%d step=%d size=%lu",
+                  args->opId, args->step, size);
             args->semaphore->subCounter(args->opId);
             args->done = 1;
           }
@@ -294,6 +300,8 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
       }
       if (slotIsComplete(slotPtr)) {
         __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+        TRACE(FLAGCX_P2P, "P2P send complete (FIFO mode) opId=%d step=%d size=%lu",
+              args->opId, args->step, size);
         args->semaphore->subCounter(args->opId);
         args->done = 1;
       }
@@ -364,6 +372,9 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
           }
           if (slotIsComplete(slotPtr)) {
             __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+            TRACE(FLAGCX_P2P,
+                  "P2P recv complete (WRITE mode) opId=%d step=%d size=%lu",
+                  args->opId, args->step, size);
             args->semaphore->subCounter(args->opId);
             args->done = 1;
           }
@@ -401,6 +412,9 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
           }
           if (slotIsComplete(slotPtr)) {
             __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+            TRACE(FLAGCX_P2P,
+                  "P2P recv complete (READ mode) opId=%d step=%d size=%lu",
+                  args->opId, args->step, size);
             args->semaphore->subCounter(args->opId);
             args->done = 1;
           }
@@ -458,6 +472,8 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
       }
       if (slotIsComplete(slotPtr)) {
         __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELEASE);
+        TRACE(FLAGCX_P2P, "P2P recv complete (FIFO mode) opId=%d step=%d size=%lu",
+              args->opId, args->step, size);
         args->semaphore->subCounter(args->opId);
         args->done = 1;
       }
@@ -499,6 +515,8 @@ flagcxResult_t flagcxP2pProxySelfCopy(struct flagcxP2pResources *resources,
     }
   } else {
     if (args->done != 1) {
+      TRACE(FLAGCX_P2P, "P2P self-copy complete opId=%d step=%d size=%lu",
+            args->opId, args->step, size);
       args->semaphore->subCounter(args->opId);
       args->done = 1;
     }

@@ -52,6 +52,16 @@ typedef enum {
   flagcxStreamFlagDone = 2
 } flagcxStreamFlagState;
 
+typedef enum {
+  flagcxRedDebugStageUninitialized = 0,
+  flagcxRedDebugStageTriggerLoaded = 1,
+  flagcxRedDebugStageFlagOutPending = 2,
+  flagcxRedDebugStageWaitingFlagIn = 3,
+  flagcxRedDebugStageReadyToReduce = 4,
+  flagcxRedDebugStageReduceDone = 5,
+  flagcxRedDebugStageComplete = 6
+} flagcxRedDebugStage;
+
 // ==========================================================================
 // flagcxDeviceTrigger bit layout (24 bytes = 3 × uint64_t: fst, snd, trd)
 //
@@ -226,11 +236,13 @@ FLAGCX_HOST_DECORATOR flagcxResult_t dequeue(void *fifoBuffer,
 FLAGCX_DEVICE_DECORATOR
     size_t getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype);
 
-FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer);
+FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer,
+                                                    uint32_t *debugStages);
 #endif // COMPILE_KERNEL
 
-void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
-                                  size_t nblocks, flagcxStream_t stream);
+void flagcxLaunchCollectiveKernel(void *fifoBuffer, uint32_t *debugStages,
+                                  size_t nthreads, size_t nblocks,
+                                  flagcxStream_t stream);
 
 // ==========================================================================
 // Device Communicator — Host-side lifecycle management

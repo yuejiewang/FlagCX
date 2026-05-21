@@ -226,6 +226,8 @@ flagcxResult_t flagcxProxySend(sendNetResources *resources, void *data,
     }
   } else {
     if (args->done != 1) {
+      TRACE(FLAGCX_NET, "NET send complete opId=%d step=%d size=%lu",
+            args->opId, args->step, size);
       args->semaphore->subCounter(args->opId);
       args->done = 1;
     }
@@ -362,6 +364,8 @@ flagcxResult_t flagcxProxyRecv(recvNetResources *resources, void *data,
     }
   } else {
     if (args->done != 1) {
+      TRACE(FLAGCX_NET, "NET recv complete opId=%d step=%d size=%lu",
+            args->opId, args->step, size);
       args->semaphore->subCounter(args->opId);
       args->done = 1;
     }

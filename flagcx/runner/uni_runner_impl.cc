@@ -531,6 +531,128 @@ static inline bool dagNodeNeedsStreamFlag(flagcxUniRunnerState *runnerState,
   return false;
 }
 
+static const char *redDebugStageToString(uint32_t stage) {
+  switch (stage) {
+    case flagcxRedDebugStageUninitialized:
+      return "UNINITIALIZED";
+    case flagcxRedDebugStageTriggerLoaded:
+      return "TRIGGER_LOADED";
+    case flagcxRedDebugStageFlagOutPending:
+      return "FLAG_OUT_PEND";
+    case flagcxRedDebugStageWaitingFlagIn:
+      return "WAIT_FLAG_IN";
+    case flagcxRedDebugStageReadyToReduce:
+      return "READY_TO_REDUCE";
+    case flagcxRedDebugStageReduceDone:
+      return "REDUCE_DONE";
+    case flagcxRedDebugStageComplete:
+      return "COMPLETE";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+static int findRedNodeIdxByTriggerIdx(const flagcxUniRunnerState *runnerState,
+                                      size_t triggerIdx) {
+  if (runnerState == NULL || runnerState->dagNodes == NULL) {
+    return -1;
+  }
+  for (int nodeIdx = 0; nodeIdx < runnerState->numDagNodes; nodeIdx++) {
+    const uniRunnerDagNode *node = &runnerState->dagNodes[nodeIdx];
+    if (node->nodeType == uniRunnerDagNodeTypeRed &&
+        node->nodeData.red.triggerIdx == static_cast<int>(triggerIdx)) {
+      return nodeIdx;
+    }
+  }
+  return -1;
+}
+
+static void dumpRedDebugStages(const flagcxUniRunnerState *runnerState, int rank,
+                               const char *label, bool includeComplete) {
+  if (runnerState == NULL || runnerState->redDebugStagesHost == NULL ||
+      runnerState->redDebugStageCount == 0) {
+    return;
+  }
+
+  size_t stageCounts[flagcxRedDebugStageComplete + 1] = {};
+  size_t unknownStages = 0;
+  std::string sample;
+  size_t sampleCount = 0;
+  constexpr size_t kSampleLimit = 8;
+
+  for (size_t triggerIdx = 0; triggerIdx < runnerState->redDebugStageCount;
+       triggerIdx++) {
+    uint32_t stage = runnerState->redDebugStagesHost[triggerIdx];
+    if (stage <= flagcxRedDebugStageComplete) {
+      stageCounts[stage]++;
+    } else {
+      unknownStages++;
+    }
+    if (sampleCount >= kSampleLimit) {
+      continue;
+    }
+    if (!includeComplete && stage == flagcxRedDebugStageComplete) {
+      continue;
+    }
+    if (!sample.empty()) {
+      sample += " | ";
+    }
+    sample += "t" + std::to_string(triggerIdx);
+    int nodeIdx = findRedNodeIdxByTriggerIdx(runnerState, triggerIdx);
+    if (nodeIdx >= 0) {
+      sample += "(node=" + std::to_string(nodeIdx) + ")";
+    }
+    sample += "=" + std::string(redDebugStageToString(stage));
+    sampleCount++;
+  }
+
+  TRACE(
+      FLAGCX_UNIRUNNER,
+      "rank %d RED debug stages [%s]: total=%zu uninit=%zu loaded=%zu outPend=%zu "
+      "waitIn=%zu ready=%zu reduced=%zu complete=%zu unknown=%zu sample=%s",
+      rank, label, runnerState->redDebugStageCount,
+      stageCounts[flagcxRedDebugStageUninitialized],
+      stageCounts[flagcxRedDebugStageTriggerLoaded],
+      stageCounts[flagcxRedDebugStageFlagOutPending],
+      stageCounts[flagcxRedDebugStageWaitingFlagIn],
+      stageCounts[flagcxRedDebugStageReadyToReduce],
+      stageCounts[flagcxRedDebugStageReduceDone],
+      stageCounts[flagcxRedDebugStageComplete], unknownStages,
+      sample.empty() ? "<none>" : sample.c_str());
+}
+
+static flagcxResult_t destroyRedDebugStages(flagcxUniRunnerState *runnerState) {
+  if (runnerState == NULL) {
+    return flagcxSuccess;
+  }
+  if (runnerState->redDebugStagesHost != NULL) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->redDebugStagesHost,
+                                          flagcxMemHost, NULL));
+    runnerState->redDebugStagesHost = NULL;
+  }
+  runnerState->redDebugStagesDev = NULL;
+  runnerState->redDebugStageCount = 0;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t prepareRedDebugStages(flagcxUniRunnerState *runnerState,
+                                            size_t numRedNodes) {
+  FLAGCXCHECK(destroyRedDebugStages(runnerState));
+  if (numRedNodes == 0) {
+    return flagcxSuccess;
+  }
+
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+      reinterpret_cast<void **>(&runnerState->redDebugStagesHost),
+      numRedNodes * sizeof(uint32_t), flagcxMemHost, NULL));
+  memset(runnerState->redDebugStagesHost, 0, numRedNodes * sizeof(uint32_t));
+  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
+      reinterpret_cast<void **>(&runnerState->redDebugStagesDev),
+      runnerState->redDebugStagesHost));
+  runnerState->redDebugStageCount = numRedNodes;
+  return flagcxSuccess;
+}
+
 static flagcxResult_t
 destroyStreamFlagQueue(flagcxUniRunnerState *runnerState) {
   if (runnerState == NULL) {
@@ -2664,6 +2786,21 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
   void *flag = getDagNodeFlag(runnerState, current->nodeIdx);
   flagcxStream_t currentStream =
       getDagNodeExecutionStream(runnerState, current);
+  std::string parentStr;
+  for (int i = 0; i < current->numParents; i++) {
+    if (!parentStr.empty()) {
+      parentStr += " ";
+    }
+    parentStr += std::to_string(current->parents[i]);
+  }
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d launch node %d type=%s parents[%d]=%s flag=%p stream=%p",
+        comm->rank, current->nodeIdx,
+        current->nodeType == uniRunnerDagNodeTypeP2p
+            ? "P2P"
+            : (current->nodeType == uniRunnerDagNodeTypeCpy ? "CPY" : "OTHER"),
+        current->numParents, parentStr.empty() ? "<none>" : parentStr.c_str(),
+        flag, currentStream);
 
   if (current->nodeType == uniRunnerDagNodeTypeP2p) {
     if (flag != NULL) {
@@ -2695,9 +2832,18 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
     struct uniRunnerP2pOpData *ops = current->nodeData.p2p.ops;
 
     // Start Group P2P
+    TRACE(FLAGCX_UNIRUNNER, "rank %d p2p node %d GroupStart numOps=%d",
+          comm->rank, current->nodeIdx, current->nodeData.p2p.numOps);
     FLAGCXCHECK(flagcxHeteroGroupStart());
     for (int i = 0; i < current->nodeData.p2p.numOps; i++) {
       struct uniRunnerP2pOpData *op = &ops[i];
+      TRACE(FLAGCX_UNIRUNNER,
+            "rank %d p2p node %d op[%d]=%s peer=%d count=%lu addr=%p",
+            comm->rank, current->nodeIdx, i,
+            op->type == flagcxDevicePrimSend
+                ? "SEND"
+                : (op->type == flagcxDevicePrimRecv ? "RECV" : "OTHER"),
+            op->peerRank, op->count, op->addr);
       if (op->type == flagcxDevicePrimSend) {
         FLAGCXCHECK(flagcxHeteroSend(op->addr, op->count, op->datatype,
                                      op->peerRank, comm,
@@ -2709,6 +2855,8 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
       }
     }
     FLAGCXCHECK(flagcxHeteroGroupEnd());
+    TRACE(FLAGCX_UNIRUNNER, "rank %d p2p node %d GroupEnd returned",
+          comm->rank, current->nodeIdx);
 
     if (flag != NULL) {
       TRACE(FLAGCX_UNIRUNNER, "rank %d p2p op %d streamWrite flag %d: DONE",
@@ -2748,6 +2896,11 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
         current->nodeData.cpy.count *
             getFlagcxDataTypeSize(current->nodeData.cpy.datatype),
         flagcxMemcpyDeviceToDevice, runnerState->cpyStream, NULL));
+    TRACE(FLAGCX_UNIRUNNER,
+          "rank %d cpy node %d memcpy src=%p dst=%p count=%lu dtype=%d",
+          comm->rank, current->nodeIdx, current->nodeData.cpy.src,
+          current->nodeData.cpy.dst, current->nodeData.cpy.count,
+          current->nodeData.cpy.datatype);
 
     if (flag != NULL) {
       TRACE(FLAGCX_UNIRUNNER, "rank %d cpy op %d streamWrite flag %d: DONE",
@@ -2810,6 +2963,7 @@ static flagcxResult_t prepareDagExecution(flagcxUniRunnerState *runnerState,
   FLAGCXCHECK(prepareDagStreamFlags(runnerState));
 
   size_t numRedNodes = countDagRedNodes(runnerState);
+  FLAGCXCHECK(prepareRedDebugStages(runnerState, numRedNodes));
   size_t redFifoWords =
       flagcxRedFifoIdxData +
       numRedNodes * (sizeof(flagcxReduceTrigger) / sizeof(uint64_t));
@@ -2868,6 +3022,15 @@ static flagcxResult_t prepareDagExecution(flagcxUniRunnerState *runnerState,
           current->nodeData.red.datatype, current->nodeData.red.redOp,
           flagcxReduceTriggerEnqueued, flagIn, flagOut);
       current->nodeData.red.triggerIdx = static_cast<int>(nextRedIdx);
+      TRACE(FLAGCX_UNIRUNNER,
+            "rank %d prepare RED trigger idx=%zu node=%d parent=%d flagIn=%p "
+            "flagOut=%p count=%lu in1=%p in2=%p out=%p",
+            comm->rank, nextRedIdx, current->nodeIdx,
+            current->numParents == 1 ? current->parents[0] : -1,
+            reinterpret_cast<void *>(static_cast<uintptr_t>(flagIn)),
+            reinterpret_cast<void *>(static_cast<uintptr_t>(flagOut)),
+            current->nodeData.red.count, current->nodeData.red.input1,
+            current->nodeData.red.input2, current->nodeData.red.output);
       nextRedIdx++;
       FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
     }
@@ -2889,6 +3052,7 @@ static flagcxResult_t prepareDagExecution(flagcxUniRunnerState *runnerState,
       runnerState->fifo->buffer, hostRedFifo, redFifoBytes,
       flagcxMemcpyHostToDevice, NULL, NULL));
   hcomm->uniRunnerFifoBuffer = runnerState->fifo->buffer;
+  dumpRedDebugStages(runnerState, comm->rank, "after_prepare", false);
   return flagcxSuccess;
 }
 
@@ -2915,6 +3079,56 @@ initUniRunnerStateCached(flagcxUniRunnerState *runnerState,
   FLAGCXCHECK(buildFn());
   FLAGCXCHECK(cacheBuiltUniRunnerDag(runnerState, key, bindings));
   return prepareDagExecution(runnerState, comm);
+}
+
+static flagcxResult_t waitForUniRunnerStream(flagcxUniRunnerState *runnerState,
+                                             flagcxHeteroComm_t hcomm,
+                                             flagcxStream_t stream,
+                                             const char *streamName) {
+  if (stream == NULL) {
+    return flagcxSuccess;
+  }
+  if (deviceAdaptor->streamQuery == NULL) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "rank %d %s streamQuery unavailable, fallback to synchronize",
+          hcomm->rank, streamName);
+    return deviceAdaptor->streamSynchronize(stream);
+  }
+
+  uint64_t pollCount = 0;
+  uint64_t nextLogPoll = 1;
+  while (true) {
+    flagcxResult_t queryRes = deviceAdaptor->streamQuery(stream);
+    if (queryRes == flagcxSuccess) {
+      TRACE(FLAGCX_UNIRUNNER, "rank %d %s completed after %lu polls",
+            hcomm->rank, streamName, pollCount);
+      dumpRedDebugStages(runnerState, hcomm->rank, streamName, true);
+      return flagcxSuccess;
+    }
+    if (queryRes != flagcxInProgress) {
+      TRACE(FLAGCX_UNIRUNNER,
+            "rank %d %s streamQuery returned unexpected result=%d after %lu polls",
+            hcomm->rank, streamName, queryRes, pollCount);
+      dumpRedDebugStages(runnerState, hcomm->rank, streamName, true);
+      return queryRes;
+    }
+
+    if (pollCount == nextLogPoll) {
+      TRACE(FLAGCX_UNIRUNNER, "rank %d waiting on %s poll=%lu", hcomm->rank,
+            streamName, pollCount);
+      dumpRedDebugStages(runnerState, hcomm->rank, streamName, false);
+      if (nextLogPoll < (1ull << 20)) {
+        nextLogPoll *= 4;
+      } else {
+        nextLogPoll += (1ull << 20);
+      }
+    }
+
+    if ((pollCount & 0x3ff) == 0) {
+      sched_yield();
+    }
+    pollCount++;
+  }
 }
 
 flagcxResult_t initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
@@ -3085,6 +3299,9 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->streamFlags = NULL;
   runnerState->streamFlagsPool = NULL;
   runnerState->streamFlagsSize = 0;
+  runnerState->redDebugStagesHost = NULL;
+  runnerState->redDebugStagesDev = NULL;
+  runnerState->redDebugStageCount = 0;
   runnerState->fifo = NULL;
   runnerState->commStream = stream;
   runnerState->redStream = NULL;
@@ -3135,6 +3352,7 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
     FLAGCXCHECK(deviceAdaptor->streamSynchronize(commStream));
   }
 
+  FLAGCXCHECK(destroyRedDebugStages(runnerState));
   FLAGCXCHECK(destroyStreamFlagQueue(runnerState));
 
   // Destroy streams
@@ -3162,18 +3380,34 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
+  dumpRedDebugStages(runnerState, comm->rank, "before_launch", false);
 
 #ifdef COMPILE_KERNEL_HOST
   if (runnerState->fifo != NULL && hcomm->uniRunnerFifoBuffer != NULL) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "rank %d launch RED kernel fifo=%p debugStages=%p nthreads=%lu "
+          "nblocks=%lu",
+          comm->rank, hcomm->uniRunnerFifoBuffer, runnerState->redDebugStagesDev,
+          runnerState->uniRunnerNThreads, runnerState->uniRunnerNBlocks);
     flagcxLaunchCollectiveKernel(
-        hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
-        runnerState->uniRunnerNBlocks, runnerState->redStream);
+        hcomm->uniRunnerFifoBuffer, runnerState->redDebugStagesDev,
+        runnerState->uniRunnerNThreads, runnerState->uniRunnerNBlocks,
+        runnerState->redStream);
   }
 #endif
 
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->redStream));
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->cpyStream));
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->commStream));
+  TRACE(FLAGCX_UNIRUNNER, "rank %d wait redStream begin", comm->rank);
+  FLAGCXCHECK(
+      waitForUniRunnerStream(runnerState, hcomm, runnerState->redStream,
+                             "redStream"));
+  TRACE(FLAGCX_UNIRUNNER, "rank %d wait cpyStream begin", comm->rank);
+  FLAGCXCHECK(
+      waitForUniRunnerStream(runnerState, hcomm, runnerState->cpyStream,
+                             "cpyStream"));
+  TRACE(FLAGCX_UNIRUNNER, "rank %d wait commStream begin", comm->rank);
+  FLAGCXCHECK(
+      waitForUniRunnerStream(runnerState, hcomm, runnerState->commStream,
+                             "commStream"));
 
   return flagcxSuccess;
 }
@@ -3186,5 +3420,6 @@ cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState) {
     runnerState->fifo = NULL;
   }
   FLAGCXCHECK(cleanupDagScheduler(runnerState));
+  FLAGCXCHECK(destroyRedDebugStages(runnerState));
   return destroyStreamFlagQueue(runnerState);
 }
