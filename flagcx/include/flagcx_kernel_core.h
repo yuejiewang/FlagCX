@@ -41,7 +41,8 @@ typedef enum {
 
 // Unified buffer index enumeration for fifo
 // Layout: [capacity][consumed][produced][terminate][data...]
-// Note: flagcxFifoIdxTerminate is only used by flagcxReduceTrigger fifo
+// Device trigger fifo uses the full ring-buffer header. The uniRunner RED
+// trigger buffer only uses capacity as the static trigger count.
 typedef enum {
   flagcxFifoIdxCapacity = 0,
   flagcxFifoIdxConsumed = 1,
@@ -198,7 +199,7 @@ struct flagcxDeviceTrigger {
 typedef flagcxDeviceTrigger *flagcxDeviceTrigger_t;
 
 struct alignas(16) flagcxReduceTrigger {
-  uint64_t value[4];
+  uint64_t value[6];
 
 #ifdef COMPILE_KERNEL
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getInput1();
@@ -209,15 +210,14 @@ struct alignas(16) flagcxReduceTrigger {
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getDatatype();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getRedop();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getState();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getFlagIn();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getFlagOut();
   FLAGCX_DEVICE_INLINE_DECORATOR void setComplete();
 #endif
-  FLAGCX_HOST_DECORATOR void setValue(uint64_t fst, uint64_t snd, uint64_t out,
-                                      size_t count, size_t nthreads,
-                                      flagcxDataType_t datatype,
-                                      flagcxRedOp_t redOp,
-                                      flagcxReduceTriggerState state);
-  FLAGCX_HOST_DECORATOR uint64_t pollState();
-  FLAGCX_HOST_DECORATOR void setState(int state);
+  FLAGCX_HOST_DECORATOR void
+  setValue(uint64_t fst, uint64_t snd, uint64_t out, size_t count,
+           size_t nthreads, flagcxDataType_t datatype, flagcxRedOp_t redOp,
+           flagcxReduceTriggerState state, uint64_t flagIn, uint64_t flagOut);
 };
 typedef flagcxReduceTrigger *flagcxReduceTrigger_t;
 

@@ -125,6 +125,7 @@ typedef struct {
   struct uniRunnerDagNode *dagNodes; // Array of all DAG nodes
   int numDagNodes;
   int numPendingNodes;
+  size_t numRedTriggers;
   flagcxIntruQueue<struct uniRunnerDagNode, &uniRunnerDagNode::next>
       p2pReadyQueue;
   flagcxIntruQueue<struct uniRunnerDagNode, &uniRunnerDagNode::next>

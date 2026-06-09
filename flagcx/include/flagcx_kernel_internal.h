@@ -6,7 +6,7 @@
  * This header contains host-only content that requires adaptor.h and
  * other host infrastructure. It includes:
  *   - flagcxFifo struct and methods
- *   - Host-side FIFO functions (dequeue, enqueue)
+ *   - Host-side FIFO functions
  *   - Device communicator lifecycle (flagcxDevCommCreate, etc.)
  *   - Device memory lifecycle (flagcxDevMemCreate, etc.)
  *   - Test kernels and AlltoAll implementations
@@ -24,16 +24,17 @@
 
 struct flagcxFifo {
   // Unified fifo layout: [capacity][consumed][produced][terminate][data...]
-  // flagcxDeviceTrigger fifo: terminate slot is reserved but unused
-  // flagcxReduceTrigger fifo: terminate slot is used
+  // flagcxDeviceTrigger fifo uses the full ring-buffer header.
+  // uniRunner RED trigger buffers only use capacity as the static trigger
+  // count; the remaining header words are reserved.
   // See flagcxFifoIndex enumeration for index values
   uint64_t *buffer;
 
 public:
-  flagcxFifo() {}
+  flagcxFifo() : buffer(NULL) {}
   ~flagcxFifo() {}
   flagcxResult_t flagcxFifoInit();
-  flagcxResult_t flagcxRedFifoInit();
+  flagcxResult_t flagcxRedFifoInit(size_t numTriggers);
   flagcxResult_t flagcxFifoDestroy();
   flagcxResult_t flagcxRedFifoDestroy();
 };
@@ -41,15 +42,7 @@ typedef struct flagcxFifo *flagcxFifo_t;
 
 FLAGCX_HOST_DECORATOR flagcxResult_t dequeue(void *fifoBuffer,
                                              flagcxDeviceTrigger_t trigger);
-FLAGCX_HOST_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr1,
-                                             uint64_t addr2, uint64_t addr3,
-                                             size_t count, size_t nthreads,
-                                             flagcxDataType_t datatype,
-                                             flagcxRedOp_t redop, int *idx);
 #ifdef COMPILE_KERNEL
-FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
-                                                      int *idx);
-
 FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer);
 #endif // COMPILE_KERNEL
 
