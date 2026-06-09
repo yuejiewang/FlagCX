@@ -492,6 +492,10 @@ static inline void *getDagNodeFlag(flagcxUniRunnerState *runnerState,
   return runnerState->streamFlags[nodeIdx];
 }
 
+static void resetDagSchedulerRuntimeState(flagcxUniRunnerState *runnerState);
+static flagcxResult_t notifyChildrenScheduled(flagcxUniRunnerState *runnerState,
+                                              uniRunnerDagNode *current);
+
 static flagcxResult_t
 precomputeUniRunnerRedTriggers(flagcxUniRunnerState *runnerState) {
   runnerState->numRedTriggers = 0;
@@ -511,6 +515,59 @@ precomputeUniRunnerRedTriggers(flagcxUniRunnerState *runnerState) {
         static_cast<int>(runnerState->numRedTriggers++);
   }
 
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+precomputeUniRunnerHostLaunchOrder(flagcxUniRunnerState *runnerState) {
+  if (runnerState->hostLaunchOrder != NULL) {
+    free(runnerState->hostLaunchOrder);
+    runnerState->hostLaunchOrder = NULL;
+  }
+  runnerState->numHostLaunchNodes = 0;
+  if (runnerState->dagNodes == NULL || runnerState->numDagNodes == 0) {
+    return flagcxSuccess;
+  }
+
+  FLAGCXCHECK(flagcxCalloc(
+      &runnerState->hostLaunchOrder, runnerState->numDagNodes * sizeof(int)));
+
+  int expectedHostLaunchNodes = 0;
+  for (int i = 0; i < runnerState->numDagNodes; i++) {
+    if (runnerState->dagNodes[i].nodeType != uniRunnerDagNodeTypeRed) {
+      expectedHostLaunchNodes++;
+    }
+  }
+
+  while (!flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue) ||
+         !flagcxIntruQueueEmpty(&runnerState->redReadyQueue)) {
+    while (!flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue)) {
+      uniRunnerDagNode *current =
+          flagcxIntruQueueDequeue(&runnerState->p2pReadyQueue);
+      runnerState->hostLaunchOrder[runnerState->numHostLaunchNodes++] =
+          static_cast<int>(current - runnerState->dagNodes);
+      FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
+    }
+
+    while (!flagcxIntruQueueEmpty(&runnerState->redReadyQueue)) {
+      uniRunnerDagNode *current =
+          flagcxIntruQueueDequeue(&runnerState->redReadyQueue);
+      FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
+    }
+  }
+
+  if (runnerState->numPendingNodes != 0 ||
+      runnerState->numHostLaunchNodes != expectedHostLaunchNodes) {
+    return flagcxInternalError;
+  }
+
+  return flagcxSuccess;
+}
+
+static flagcxResult_t precomputeUniRunnerDag(flagcxUniRunnerState *runnerState) {
+  FLAGCXCHECK(precomputeUniRunnerRedTriggers(runnerState));
+  FLAGCXCHECK(precomputeUniRunnerHostLaunchOrder(runnerState));
+  resetDagSchedulerRuntimeState(runnerState);
   return flagcxSuccess;
 }
 
@@ -2697,9 +2754,14 @@ static flagcxResult_t cleanupDagScheduler(flagcxUniRunnerState *runnerState) {
     free(runnerState->dagNodes);
     runnerState->dagNodes = NULL;
   }
+  if (runnerState->hostLaunchOrder != NULL) {
+    free(runnerState->hostLaunchOrder);
+    runnerState->hostLaunchOrder = NULL;
+  }
   runnerState->numDagNodes = 0;
   runnerState->numPendingNodes = 0;
   runnerState->numRedTriggers = 0;
+  runnerState->numHostLaunchNodes = 0;
   return flagcxSuccess;
 }
 
@@ -2711,7 +2773,7 @@ static flagcxResult_t initUniRunnerStateCached(
   flagcxResult_t cacheLoadRes =
       tryLoadCachedUniRunnerDag(runnerState, key, bindings, &cacheHit);
   if (cacheLoadRes == flagcxSuccess && cacheHit) {
-    return precomputeUniRunnerRedTriggers(runnerState);
+    return precomputeUniRunnerDag(runnerState);
   }
   if (cacheLoadRes != flagcxSuccess) {
     TRACE(FLAGCX_UNIRUNNER,
@@ -2722,7 +2784,7 @@ static flagcxResult_t initUniRunnerStateCached(
   }
 
   FLAGCXCHECK(buildFn());
-  FLAGCXCHECK(precomputeUniRunnerRedTriggers(runnerState));
+  FLAGCXCHECK(precomputeUniRunnerDag(runnerState));
   FLAGCXCHECK(cacheBuiltUniRunnerDag(runnerState, key, bindings));
   return flagcxSuccess;
 }
@@ -2887,11 +2949,9 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
   });
 }
 
-static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
-                                   flagcxHeteroComm_t comm) {
-  // Dequeue
-  uniRunnerDagNode *current =
-      flagcxIntruQueueDequeue(&runnerState->p2pReadyQueue);
+static flagcxResult_t launchDagNode(flagcxUniRunnerState *runnerState,
+                                    flagcxHeteroComm_t comm,
+                                    uniRunnerDagNode *current) {
   void *flag = getDagNodeFlag(runnerState, current->nodeIdx);
   flagcxStream_t currentStream =
       getDagNodeExecutionStream(runnerState, current);
@@ -3013,31 +3073,6 @@ static flagcxResult_t notifyChildrenScheduled(flagcxUniRunnerState *runnerState,
   return flagcxSuccess;
 }
 
-// Process ready queue: submit ready nodes to the corresponding execution
-// stream, or mark precomputed RED nodes as host-submitted so their children can
-// be released. Child readiness is host-scheduled immediately after submission;
-// same-stream execution dependencies rely on launch order, while cross-stream
-// dependencies are enforced via stream flags.
-static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
-                                        flagcxHeteroComm_t comm) {
-  // process p2pReadyQueue
-  while (!flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue)) {
-    uniRunnerDagNode *current =
-        flagcxIntruQueueHead(&runnerState->p2pReadyQueue);
-    FLAGCXCHECK(launchP2pOps(runnerState, comm));
-    FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
-  }
-
-  // process redReadyQueue
-  while (!flagcxIntruQueueEmpty(&runnerState->redReadyQueue)) {
-    struct uniRunnerDagNode *current =
-        flagcxIntruQueueDequeue(&runnerState->redReadyQueue);
-    FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
-  }
-
-  return flagcxSuccess;
-}
-
 static flagcxResult_t
 prepareUniRunnerRedTriggerBuffer(flagcxComm_t comm) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
@@ -3096,6 +3131,8 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->dagNodes = NULL;
   runnerState->numDagNodes = 0;
   runnerState->numRedTriggers = 0;
+  runnerState->hostLaunchOrder = NULL;
+  runnerState->numHostLaunchNodes = 0;
   runnerState->streamFlagsSize = 0;
   hcomm->uniRunnerFifoBuffer = NULL;
 
@@ -3174,18 +3211,10 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   }
 #endif
 
-  // Main scheduling loop using DAG-based queue scheduling
-  while (true) {
-    if (flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue) &&
-        flagcxIntruQueueEmpty(&runnerState->redReadyQueue) &&
-        runnerState->numPendingNodes == 0) {
-      TRACE(
-          FLAGCX_UNIRUNNER,
-          "runUniRunner: all submitted work drained, terminating runner loop");
-      break;
-    }
-
-    FLAGCXCHECK(processReadyQueue(runnerState, hcomm));
+  for (int i = 0; i < runnerState->numHostLaunchNodes; i++) {
+    int nodeIdx = runnerState->hostLaunchOrder[i];
+    FLAGCXCHECK(launchDagNode(runnerState, hcomm,
+                              &runnerState->dagNodes[nodeIdx]));
   }
   deviceAdaptor->streamSynchronize(runnerState->redStream);
   deviceAdaptor->streamSynchronize(runnerState->cpyStream);

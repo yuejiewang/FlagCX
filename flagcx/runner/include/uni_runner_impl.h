@@ -126,6 +126,8 @@ typedef struct {
   int numDagNodes;
   int numPendingNodes;
   size_t numRedTriggers;
+  int *hostLaunchOrder; // Non-RED dagNodes array indices in host submission order
+  int numHostLaunchNodes;
   flagcxIntruQueue<struct uniRunnerDagNode, &uniRunnerDagNode::next>
       p2pReadyQueue;
   flagcxIntruQueue<struct uniRunnerDagNode, &uniRunnerDagNode::next>
