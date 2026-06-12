@@ -13,6 +13,7 @@
 #include "reg_pool.h"
 #include "socket.h"
 #include "utils.h"
+#include <cstdint>
 #include <memory>
 #include <pthread.h>
 
@@ -20,8 +21,21 @@
 typedef enum {
   uniRunnerDagNodeTypeP2p = 0,
   uniRunnerDagNodeTypeRed = 1,
-  uniRunnerDagNodeTypeCpy = 2
+  uniRunnerDagNodeTypeCpy = 2,
+  uniRunnerDagNodeTypeDevApiCpy = 3
 } uniRunnerDagNodeType;
+
+typedef enum {
+  uniRunnerDagBufferTypeNone = 0,
+  uniRunnerDagBufferTypeInput = 1,
+  uniRunnerDagBufferTypeOutput = 2,
+  uniRunnerDagBufferTypeScratch = 3
+} uniRunnerDagBufferType;
+
+struct uniRunnerDagBufferRef {
+  uniRunnerDagBufferType bufferType = uniRunnerDagBufferTypeNone;
+  int64_t offsetBytes = 0;
+};
 
 // Static DAG template algorithm identifiers used by the uniRunner cache.
 typedef enum {
@@ -32,7 +46,8 @@ typedef enum {
   uniRunnerDagAlgoRingAR = 4,
   uniRunnerDagAlgoSlicedAR = 5,
   uniRunnerDagAlgoRingRS = 6,
-  uniRunnerDagAlgoTreeRed = 7
+  uniRunnerDagAlgoTreeRed = 7,
+  uniRunnerDagAlgoDevSlicedAR = 8
 } uniRunnerDagAlgoType;
 
 // Cache key describing a reusable uniRunner DAG template.
@@ -69,6 +84,19 @@ struct uniRunnerP2pOpData {
 struct uniRunnerP2pNodeData {
   struct uniRunnerP2pOpData *ops; // Array of P2P operations
   int numOps;                     // Number of operations
+};
+
+struct uniRunnerDevApiCpyOpData {
+  uniRunnerDagBufferRef buffer; // Peer-visible source buffer
+  size_t count;
+  int peerRank;
+  flagcxDataType_t datatype;
+};
+
+struct uniRunnerDevApiCpyNodeData {
+  struct uniRunnerDevApiCpyOpData *ops; // Host-side op metadata
+  int numOps;                           // Number of operations
+  void *opsDev;                         // Device-side kernel op array
 };
 
 // Reduce node data (operation-specific fields only)
@@ -111,6 +139,7 @@ struct uniRunnerDagNode {
     struct uniRunnerP2pNodeData p2p;
     struct uniRunnerRedNodeData red;
     struct uniRunnerCpyNodeData cpy;
+    struct uniRunnerDevApiCpyNodeData devApiCpy;
   } nodeData;
 };
 
@@ -120,6 +149,7 @@ typedef struct {
   flagcxStream_t commStream;
   flagcxStream_t redStream;
   flagcxStream_t cpyStream;
+  flagcxStream_t ctrlStream;
 
   // new: DAG and scheduling queues
   struct uniRunnerDagNode *dagNodes; // Array of all DAG nodes
@@ -135,6 +165,14 @@ typedef struct {
   uint64_t uniRunnerNBlocks;
   uint64_t uniRunnerNRedSlices;
   uint64_t uniRunnerRedSliceSize;
+  bool hasDevApiNodes;
+
+  const void *inputBase;
+  void *outputBase;
+  void *scratchBase;
+  size_t inputBytes;
+  size_t outputBytes;
+  size_t scratchBytes;
 
   // Stream completion flags backed by a reusable contiguous device pool. The
   // host-side queue stores per-node addresses within that pool.
@@ -142,6 +180,22 @@ typedef struct {
   void **streamFlags;
   size_t streamFlagsSize;
   size_t streamFlagsCapacity;
+
+  // Entry flags are used to aggregate multi-parent cross-stream dependencies
+  // before a kernel-executed node is allowed to run.
+  void *entryFlagsPool;
+  void **entryFlags;
+  size_t entryFlagsSize;
+  size_t entryFlagsCapacity;
+
+  // DeviceAPI runtime resources for kernel-side copy nodes.
+  bool devApiOwnsDevComm;
+  flagcxDevComm_t devApiDevComm;
+  flagcxDevComm_t devApiSavedCommHandle;
+  flagcxDevMem_t devApiInputMem;
+  flagcxDevMem_t devApiOutputMem;
+  flagcxDevMem_t devApiScratchMem;
+  void *devApiRuntimeDevPtr;
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
@@ -167,6 +221,12 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
                                           size_t count,
                                           flagcxDataType_t datatype,
                                           flagcxRedOp_t op, flagcxComm_t comm);
+flagcxResult_t initUniRunnerStateDevSlicedAR(flagcxUniRunnerState *runnerState,
+                                             const void *sendbuff,
+                                             void *recvbuff, size_t count,
+                                             flagcxDataType_t datatype,
+                                             flagcxRedOp_t op,
+                                             flagcxComm_t comm);
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,

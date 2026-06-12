@@ -22,7 +22,27 @@ FLAGCX_HOST_DECORATOR void flagcxReduceTrigger::setValue(
            (redOp & flagcxTriggerMask(flagcxReduceTriggerBitsRedop))
                << flagcxReduceTriggerOffRedop |
            (state & flagcxTriggerMask(flagcxReduceTriggerBitsState))
-               << flagcxReduceTriggerOffState;
+               << flagcxReduceTriggerOffState |
+           (flagcxCollectiveTriggerTypeRed &
+            flagcxTriggerMask(flagcxReduceTriggerBitsType))
+               << flagcxReduceTriggerOffType;
+  memcpy(this->value, tmp, sizeof(tmp));
+}
+
+FLAGCX_HOST_DECORATOR void flagcxReduceTrigger::setDevApiValue(
+    uint64_t opsPtr, size_t numOps, flagcxReduceTriggerState state,
+    uint64_t flagIn, uint64_t flagOut) {
+  uint64_t tmp[6];
+  tmp[0] = opsPtr;
+  tmp[1] = numOps;
+  tmp[2] = 0;
+  tmp[4] = flagIn;
+  tmp[5] = flagOut;
+  tmp[3] = (state & flagcxTriggerMask(flagcxReduceTriggerBitsState))
+               << flagcxReduceTriggerOffState |
+           (flagcxCollectiveTriggerTypeDevApi &
+            flagcxTriggerMask(flagcxReduceTriggerBitsType))
+               << flagcxReduceTriggerOffType;
   memcpy(this->value, tmp, sizeof(tmp));
 }
 
@@ -76,6 +96,34 @@ enqueue(void *fifoBuffer, uint64_t addr1, uint64_t addr2, uint64_t addr3,
         "enqueue red: count=%lu, nthreads=%lu, datatype=%d, redop=%d, idx=%d",
         count, nthreads, datatype, redop, idx);
 
+  return flagcxSuccess;
+}
+
+FLAGCX_HOST_DECORATOR flagcxResult_t
+enqueueDevApi(void *fifoBuffer, uint64_t opsPtr, size_t numOps,
+                 uint64_t flagIn, uint64_t flagOut, int *ret) {
+  int idx = -1;
+  uint64_t *buffer = (uint64_t *)fifoBuffer;
+  int capacity = buffer[flagcxFifoIdxCapacity];
+  int distance = buffer[flagcxFifoIdxProduced] - buffer[flagcxFifoIdxConsumed];
+  if (distance >= capacity) {
+    *ret = -1;
+    sched_yield();
+    return flagcxSuccess;
+  }
+  idx = buffer[flagcxFifoIdxProduced] % capacity;
+  flagcxReduceTrigger *trigger =
+      ((flagcxReduceTrigger *)(buffer + flagcxFifoIdxData)) + idx;
+  if (trigger->pollState() != flagcxReduceTriggerAvailable) {
+    *ret = -1;
+    sched_yield();
+    return flagcxSuccess;
+  }
+  trigger->setDevApiValue(opsPtr, numOps, flagcxReduceTriggerEnqueued,
+                             flagIn, flagOut);
+  __atomic_fetch_add(buffer + flagcxFifoIdxProduced, 1ul, __ATOMIC_RELEASE);
+  *ret = idx;
+  TRACE(FLAGCX_KERNEL, "enqueue devapi: numOps=%lu, idx=%d", numOps, idx);
   return flagcxSuccess;
 }
 

@@ -14,19 +14,7 @@
 
 using Json = nlohmann::json;
 
-inline constexpr int kUniRunnerDagCacheFormatVersion = 1;
-
-enum uniRunnerDagBufferType {
-  uniRunnerDagBufferTypeNone = 0,
-  uniRunnerDagBufferTypeInput = 1,
-  uniRunnerDagBufferTypeOutput = 2,
-  uniRunnerDagBufferTypeScratch = 3
-};
-
-struct uniRunnerDagBufferRef {
-  uniRunnerDagBufferType bufferType = uniRunnerDagBufferTypeNone;
-  int64_t offsetBytes = 0;
-};
+inline constexpr int kUniRunnerDagCacheFormatVersion = 4;
 
 struct uniRunnerDagP2pOpDesc {
   uniRunnerDagBufferRef buffer;
@@ -87,6 +75,8 @@ inline const char *uniRunnerDagAlgoTypeToString(uniRunnerDagAlgoType algoType) {
       return "ring_rs";
     case uniRunnerDagAlgoTreeRed:
       return "tree_red";
+    case uniRunnerDagAlgoDevSlicedAR:
+      return "dev_sliced_ar";
     default:
       return "unknown";
   }
@@ -110,6 +100,8 @@ inline bool uniRunnerDagAlgoTypeFromString(const std::string &text,
     *algoType = uniRunnerDagAlgoRingRS;
   } else if (text == "tree_red") {
     *algoType = uniRunnerDagAlgoTreeRed;
+  } else if (text == "dev_sliced_ar") {
+    *algoType = uniRunnerDagAlgoDevSlicedAR;
   } else {
     return false;
   }
@@ -187,6 +179,8 @@ inline const char *uniRunnerDagNodeTypeToString(uniRunnerDagNodeType nodeType) {
       return "red";
     case uniRunnerDagNodeTypeCpy:
       return "cpy";
+    case uniRunnerDagNodeTypeDevApiCpy:
+      return "devapi_cpy";
     default:
       return "unknown";
   }
@@ -200,6 +194,8 @@ inline bool uniRunnerDagNodeTypeFromString(const std::string &text,
     *nodeType = uniRunnerDagNodeTypeRed;
   } else if (text == "cpy") {
     *nodeType = uniRunnerDagNodeTypeCpy;
+  } else if (text == "devapi_cpy") {
+    *nodeType = uniRunnerDagNodeTypeDevApiCpy;
   } else {
     return false;
   }
@@ -371,7 +367,8 @@ uniRunnerDagTemplateToJson(const uniRunnerDagTemplate &dagTemplate) {
         {"parents", node.parents},
         {"children", node.children},
     };
-    if (node.nodeType == uniRunnerDagNodeTypeP2p) {
+    if (node.nodeType == uniRunnerDagNodeTypeP2p ||
+        node.nodeType == uniRunnerDagNodeTypeDevApiCpy) {
       Json ops = Json::array();
       for (const uniRunnerDagP2pOpDesc &op : node.p2pOps) {
         ops.push_back(Json{
@@ -438,7 +435,8 @@ inline bool uniRunnerDagTemplateFromJson(const Json &j,
     node.parents = nodeJson.at("parents").get<std::vector<int>>();
     node.children = nodeJson.at("children").get<std::vector<int>>();
 
-    if (node.nodeType == uniRunnerDagNodeTypeP2p) {
+    if (node.nodeType == uniRunnerDagNodeTypeP2p ||
+        node.nodeType == uniRunnerDagNodeTypeDevApiCpy) {
       for (const Json &opJson : nodeJson.at("p2p_ops")) {
         uniRunnerDagP2pOpDesc op;
         std::string primType = opJson.at("type").get<std::string>();

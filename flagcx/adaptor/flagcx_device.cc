@@ -29,26 +29,70 @@
 // Shared: IPC peer pointer exchange (used by both tiers)
 // ==========================================================================
 
-// Build IPC peer pointer table for a user buffer.
-// Stores results in comm->ipcTable and returns the table index.
-// Returns -1 on failure (IPC not available for this buffer).
-// Internally checks globalRegPool for a pre-registered IPC handle to skip
-// ipcMemHandleGet when the buffer was already registered via
-// flagcxCommRegister.
-static int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
+static bool isIpcTableEntryEmpty(const struct flagcxIpcTableEntry &entry) {
+  return entry.hostPeerPtrs == nullptr && entry.devPeerPtrs == nullptr &&
+         entry.basePtr == nullptr && entry.size == 0 && entry.refCount == 0 &&
+         !entry.inUse && !entry.persistent;
+}
 
-  // Find a free slot in the IPC table
-  int slot = -1;
-  for (int k = 0; k < FLAGCX_MAX_IPC_ENTRIES; k++) {
-    if (comm->ipcTable[k].hostPeerPtrs == nullptr &&
-        comm->ipcTable[k].devPeerPtrs == nullptr) {
-      slot = k;
-      break;
-    }
+static void resetIpcTableEntry(struct flagcxIpcTableEntry *entry) {
+  entry->hostPeerPtrs = nullptr;
+  entry->devPeerPtrs = nullptr;
+  entry->nPeers = 0;
+  entry->basePtr = nullptr;
+  entry->size = 0;
+  entry->refCount = 0;
+  entry->inUse = false;
+  entry->persistent = false;
+}
+
+static flagcxResult_t destroyIpcTableEntryResources(flagcxComm_t comm,
+                                                    int slot) {
+  if (comm == nullptr || slot < 0 || slot >= FLAGCX_MAX_IPC_ENTRIES) {
+    return flagcxInvalidArgument;
   }
-  if (slot < 0) {
-    WARN("buildIpcPeerPointers: IPC table full (max %d entries)",
-         FLAGCX_MAX_IPC_ENTRIES);
+  struct flagcxIpcTableEntry *entry = &comm->ipcTable[slot];
+  if (entry->hostPeerPtrs) {
+    for (int i = 0; i < entry->nPeers; i++) {
+      if (entry->hostPeerPtrs[i] && entry->hostPeerPtrs[i] != entry->basePtr) {
+        deviceAdaptor->ipcMemHandleClose(entry->hostPeerPtrs[i]);
+      }
+    }
+    free(entry->hostPeerPtrs);
+  }
+  if (entry->devPeerPtrs) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(entry->devPeerPtrs, flagcxMemDevice,
+                                          NULL));
+  }
+  resetIpcTableEntry(entry);
+  return flagcxSuccess;
+}
+
+static bool isRegisteredBufferForComm(flagcxComm_t comm, void *buff) {
+  if (comm == nullptr || buff == nullptr) {
+    return false;
+  }
+  void *regKey =
+      comm->heteroComm ? (void *)comm->heteroComm : (void *)comm->homoComm;
+  flagcxRegItem *item = globalRegPool.getItem(regKey, buff);
+  if (item == nullptr) {
+    return false;
+  }
+  auto &regMap = globalRegPool.getGlobalMap();
+  uintptr_t commKey = reinterpret_cast<uintptr_t>(regKey);
+  auto mapIt = regMap.find(commKey);
+  if (mapIt == regMap.end()) {
+    return false;
+  }
+  auto pageIt = mapIt->second.find(item->beginAddr);
+  return pageIt != mapIt->second.end() && pageIt->second == item;
+}
+
+// Build IPC peer pointer table for a user buffer into a preselected slot.
+// Caller must hold comm->ipcTableMutex while publishing/consuming slot state.
+static int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size,
+                                int slot, bool persistent) {
+  if (slot < 0 || slot >= FLAGCX_MAX_IPC_ENTRIES) {
     return -1;
   }
 
@@ -154,11 +198,15 @@ static int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
   comm->ipcTable[slot].devPeerPtrs = devPeerPtrs;
   comm->ipcTable[slot].nPeers = localRanks;
   comm->ipcTable[slot].basePtr = buff;
+  comm->ipcTable[slot].size = size;
+  comm->ipcTable[slot].refCount = 1;
   comm->ipcTable[slot].inUse = true;
+  comm->ipcTable[slot].persistent = persistent;
 
   INFO(FLAGCX_INIT,
-       "buildIpcPeerPointers: rank %d slot %d buff=%p devPeerPtrs=%p", myRank,
-       slot, buff, (void *)devPeerPtrs);
+       "buildIpcPeerPointers: rank %d slot %d buff=%p size=%zu "
+       "persistent=%d devPeerPtrs=%p",
+       myRank, slot, buff, size, persistent ? 1 : 0, (void *)devPeerPtrs);
   for (int lr = 0; lr < localRanks; lr++) {
     INFO(FLAGCX_INIT, "buildIpcPeerPointers:   hostPeerPtrs[%d]=%p", lr,
          hostPeerPtrs[lr]);
@@ -180,6 +228,74 @@ fail:
     deviceAdaptor->deviceFree(devPeerPtrs, flagcxMemDevice, NULL);
   }
   return -1;
+}
+
+static int acquireIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size,
+                                  bool persistentHint) {
+  if (comm == nullptr || buff == nullptr || size == 0) {
+    return -1;
+  }
+
+  pthread_mutex_lock(&comm->ipcTableMutex);
+  for (int k = 0; k < FLAGCX_MAX_IPC_ENTRIES; k++) {
+    struct flagcxIpcTableEntry *entry = &comm->ipcTable[k];
+    if (entry->hostPeerPtrs != nullptr && entry->devPeerPtrs != nullptr &&
+        entry->basePtr == buff && entry->size == size) {
+      entry->refCount++;
+      entry->inUse = true;
+      entry->persistent = entry->persistent || persistentHint;
+      pthread_mutex_unlock(&comm->ipcTableMutex);
+      return k;
+    }
+  }
+
+  int slot = -1;
+  for (int k = 0; k < FLAGCX_MAX_IPC_ENTRIES; k++) {
+    if (isIpcTableEntryEmpty(comm->ipcTable[k])) {
+      slot = k;
+      break;
+    }
+  }
+  if (slot < 0) {
+    pthread_mutex_unlock(&comm->ipcTableMutex);
+    WARN("buildIpcPeerPointers: IPC table full (max %d entries)",
+         FLAGCX_MAX_IPC_ENTRIES);
+    return -1;
+  }
+
+  int builtSlot = buildIpcPeerPointers(comm, buff, size, slot, persistentHint);
+  pthread_mutex_unlock(&comm->ipcTableMutex);
+  return builtSlot;
+}
+
+static flagcxResult_t releaseIpcPeerPointers(flagcxComm_t comm, int slot,
+                                             bool forceDestroy) {
+  if (comm == nullptr || slot < 0 || slot >= FLAGCX_MAX_IPC_ENTRIES) {
+    return flagcxInvalidArgument;
+  }
+
+  pthread_mutex_lock(&comm->ipcTableMutex);
+  struct flagcxIpcTableEntry *entry = &comm->ipcTable[slot];
+  if (isIpcTableEntryEmpty(*entry)) {
+    pthread_mutex_unlock(&comm->ipcTableMutex);
+    return flagcxSuccess;
+  }
+
+  if (!forceDestroy && entry->refCount > 0) {
+    entry->refCount--;
+  } else if (forceDestroy) {
+    entry->refCount = 0;
+  }
+  entry->inUse = entry->refCount > 0;
+
+  if (entry->refCount > 0 || (entry->persistent && !forceDestroy)) {
+    pthread_mutex_unlock(&comm->ipcTableMutex);
+    return flagcxSuccess;
+  }
+
+  flagcxResult_t res = destroyIpcTableEntryResources(comm, slot);
+  pthread_mutex_unlock(&comm->ipcTableMutex);
+  return res;
 }
 
 // ==========================================================================
@@ -465,7 +581,7 @@ static flagcxResult_t setupIpcBarriers(flagcxComm_t comm,
                                             flagcxMemDevice, NULL));
     handle->localBarrierFlags = (uint64_t *)barrierFlags;
 
-    int slot = buildIpcPeerPointers(comm, barrierFlags, barrierSize);
+    int slot = acquireIpcPeerPointers(comm, barrierFlags, barrierSize, false);
     if (slot < 0) {
       deviceAdaptor->deviceFree(barrierFlags, flagcxMemDevice, NULL);
       handle->localBarrierFlags = nullptr;
@@ -952,22 +1068,8 @@ extern "C" flagcxResult_t flagcxDevCommDestroy(flagcxComm_t comm,
   // empty and reusable by the next buildIpcPeerPointers call.
   if (comm != nullptr && devComm->barrierIpcIndex >= 0 &&
       devComm->barrierIpcIndex < FLAGCX_MAX_IPC_ENTRIES) {
-    struct flagcxIpcTableEntry *e = &comm->ipcTable[devComm->barrierIpcIndex];
-    if (e->hostPeerPtrs) {
-      for (int i = 0; i < e->nPeers; i++) {
-        if (e->hostPeerPtrs[i] && e->hostPeerPtrs[i] != e->basePtr)
-          deviceAdaptor->ipcMemHandleClose(e->hostPeerPtrs[i]);
-      }
-      free(e->hostPeerPtrs);
-      e->hostPeerPtrs = nullptr;
-    }
-    if (e->devPeerPtrs) {
-      deviceAdaptor->deviceFree(e->devPeerPtrs, flagcxMemDevice, NULL);
-      e->devPeerPtrs = nullptr;
-    }
-    e->basePtr = nullptr;
-    e->nPeers = 0;
-    e->inUse = false;
+    FLAGCXCHECK(
+        releaseIpcPeerPointers(comm, devComm->barrierIpcIndex, true));
   }
 
   // ── shm path cleanup: unregister and close all shm mappings ───────────
@@ -1132,8 +1234,8 @@ extern "C" flagcxResult_t flagcxDevMemCreate(flagcxComm_t comm, void *buff,
         handle->mrBase = d->mrBase;
       }
       if (d == nullptr || !d->isVMM || !d->flatBase) {
-        // Priority 2: Symmetric IPC fallback (VMM not available)
-        int idx = buildIpcPeerPointers(comm, buff, size);
+        bool persistent = isRegisteredBufferForComm(comm, buff);
+        int idx = acquireIpcPeerPointers(comm, buff, size, persistent);
         if (idx >= 0) {
           handle->ipcIndex = idx;
         } else {
@@ -1144,35 +1246,23 @@ extern "C" flagcxResult_t flagcxDevMemCreate(flagcxComm_t comm, void *buff,
       // else: Priority 1 — VMM peer access via flat VA, nothing needed
       handle->window = nullptr;
     }
-    // ---- Priority 3: Vendor native window ----
-    else if (win != nullptr && !win->isSymmetricDefault) {
+    // ---- IPC layer: try if win is null (IPC needs cudaMalloc memory) ----
+    else if (win == nullptr) {
+      bool persistent = isRegisteredBufferForComm(comm, buff);
+      int idx = acquireIpcPeerPointers(comm, buff, size, persistent);
+      if (idx >= 0) {
+        handle->ipcIndex = idx;
+      } else {
+        WARN("flagcxDevMemCreate: IPC peer pointer setup failed, "
+             "IPC layer not available");
+      }
+    }
+
+    // ---- Window layer: if win provided and valid (vendor path) ----
+    if (win != nullptr && !win->isSymmetricDefault) {
       handle->hasWindow = true;
       handle->isSymmetric = (win->winFlags & FLAGCX_WIN_COLL_SYMMETRIC);
       handle->winHandle = (void *)win;
-    }
-    // ---- Priority 4 & 5: No window — IPC (buildIpcPeerPointers checks
-    //      globalRegPool internally to reuse pre-registered handles) ----
-    else if (win == nullptr) {
-      // Check if already in ipcTable (from a previous flagcxDevMemCreate call)
-      int existingIdx = -1;
-      for (int i = 0; i < FLAGCX_MAX_IPC_ENTRIES; i++) {
-        if (comm->ipcTable[i].inUse && comm->ipcTable[i].basePtr == buff) {
-          existingIdx = i;
-          break;
-        }
-      }
-      if (existingIdx >= 0) {
-        // Already built — reuse existing entry
-        handle->ipcIndex = existingIdx;
-      } else {
-        int idx = buildIpcPeerPointers(comm, buff, size);
-        if (idx >= 0) {
-          handle->ipcIndex = idx;
-        } else {
-          WARN("flagcxDevMemCreate: IPC peer pointer setup failed, "
-               "IPC layer not available");
-        }
-      }
     }
   }
 
@@ -1234,7 +1324,7 @@ extern "C" flagcxResult_t flagcxDevMemDestroy(flagcxComm_t comm,
   // flagcxCommDestroy.
   if (comm != nullptr && devMem->ipcIndex >= 0 &&
       devMem->ipcIndex < FLAGCX_MAX_IPC_ENTRIES) {
-    comm->ipcTable[devMem->ipcIndex].inUse = false;
+    FLAGCXCHECK(releaseIpcPeerPointers(comm, devMem->ipcIndex, false));
   }
 
   // Free window allocation if present
@@ -1250,6 +1340,41 @@ extern "C" flagcxResult_t flagcxDevMemDestroy(flagcxComm_t comm,
   pthread_mutex_destroy(&devMem->cachedPtrMutex);
   free(devMem);
   return flagcxSuccess;
+}
+
+flagcxResult_t flagcxCommReleaseRegisteredIpcEntries(flagcxComm_t comm,
+                                                     uintptr_t beginAddr,
+                                                     uintptr_t endAddr) {
+  if (comm == nullptr || beginAddr == 0 || endAddr <= beginAddr) {
+    return flagcxSuccess;
+  }
+
+  flagcxResult_t res = flagcxSuccess;
+  pthread_mutex_lock(&comm->ipcTableMutex);
+  for (int k = 0; k < FLAGCX_MAX_IPC_ENTRIES; k++) {
+    struct flagcxIpcTableEntry *entry = &comm->ipcTable[k];
+    if (!entry->persistent || entry->basePtr == nullptr) {
+      continue;
+    }
+    uintptr_t base = reinterpret_cast<uintptr_t>(entry->basePtr);
+    if (base < beginAddr || base >= endAddr) {
+      continue;
+    }
+    if (entry->refCount > 0) {
+      WARN("flagcxCommReleaseRegisteredIpcEntries: rank %d forcing release of "
+           "active IPC entry %d for buffer %p (refCount=%u)",
+           comm->rank, k, entry->basePtr, entry->refCount);
+    }
+    entry->persistent = false;
+    entry->refCount = 0;
+    entry->inUse = false;
+    res = destroyIpcTableEntryResources(comm, k);
+    if (res != flagcxSuccess) {
+      break;
+    }
+  }
+  pthread_mutex_unlock(&comm->ipcTableMutex);
+  return res;
 }
 
 // ==========================================================================
@@ -1375,39 +1500,27 @@ flagcxResult_t flagcxCommCleanupIpcTable(flagcxComm_t comm) {
     return flagcxSuccess;
   }
 
+  flagcxResult_t res = flagcxSuccess;
+  pthread_mutex_lock(&comm->ipcTableMutex);
   for (int k = 0; k < FLAGCX_MAX_IPC_ENTRIES; k++) {
     struct flagcxIpcTableEntry *e = &comm->ipcTable[k];
-    if (e->hostPeerPtrs == nullptr && e->devPeerPtrs == nullptr) {
+    if (isIpcTableEntryEmpty(*e)) {
       continue; // empty slot
     }
 
-    if (e->inUse) {
+    if (e->refCount > 0) {
       WARN("flagcxCommCleanupIpcTable: entry %d still in use — "
            "flagcxDevMemDestroy should be called before flagcxCommDestroy",
            k);
     }
-
-    // Close IPC handles
-    if (e->hostPeerPtrs) {
-      for (int i = 0; i < e->nPeers; i++) {
-        if (e->hostPeerPtrs[i] && e->hostPeerPtrs[i] != e->basePtr) {
-          deviceAdaptor->ipcMemHandleClose(e->hostPeerPtrs[i]);
-        }
-      }
-      free(e->hostPeerPtrs);
-      e->hostPeerPtrs = nullptr;
+    res = destroyIpcTableEntryResources(comm, k);
+    if (res != flagcxSuccess) {
+      break;
     }
-
-    // Free device memory safely
-    if (e->devPeerPtrs) {
-      deviceAdaptor->deviceFree(e->devPeerPtrs, flagcxMemDevice, NULL);
-      e->devPeerPtrs = nullptr;
-    }
-
-    e->inUse = false;
   }
+  pthread_mutex_unlock(&comm->ipcTableMutex);
 
-  return flagcxSuccess;
+  return res;
 }
 
 // ==========================================================================

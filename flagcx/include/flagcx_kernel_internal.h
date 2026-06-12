@@ -48,15 +48,20 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr1,
                                              flagcxRedOp_t redop,
                                              uint64_t flagIn,
                                              uint64_t flagOut, int *idx);
+FLAGCX_HOST_DECORATOR flagcxResult_t
+enqueueDevApi(void *fifoBuffer, uint64_t opsPtr, size_t numOps,
+                 uint64_t flagIn, uint64_t flagOut, int *idx);
 #ifdef COMPILE_KERNEL
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
                                                       int *idx);
 
-FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer);
+FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer,
+                                                    const void *devApiRuntimePtr);
 #endif // COMPILE_KERNEL
 
 void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
-                                  size_t nblocks, flagcxStream_t stream);
+                                  size_t nblocks, flagcxStream_t stream,
+                                  const void *devApiRuntimePtr);
 
 // ==========================================================================
 // Device Communicator — Host-side lifecycle management
@@ -195,6 +200,9 @@ flagcxResult_t flagcxDevMemFreeDevicePtr(flagcxDevMem_t devMem);
 // Must be called after homoComm destroy.
 // so that cudaFree does not deadlock on device synchronization.
 flagcxResult_t flagcxCommCleanupIpcTable(flagcxComm_t comm);
+flagcxResult_t flagcxCommReleaseRegisteredIpcEntries(flagcxComm_t comm,
+                                                     uintptr_t beginAddr,
+                                                     uintptr_t endAddr);
 
 // Tear down inter-node signal relay stored on heteroComm.
 // Must be called before flagcxHeteroCommDestroy (which frees proxyState and

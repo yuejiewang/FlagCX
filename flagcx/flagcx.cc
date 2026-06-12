@@ -9,6 +9,7 @@
 #include "cost_model.h"
 #include "flagcx_hetero.h"
 #include "flagcx_kernel.h"
+#include "flagcx_kernel_internal.h"
 #include "flagcx_net.h"
 #include "ib_common.h"
 #include "launch_kernel.h"
@@ -1171,6 +1172,8 @@ flagcxResult_t flagcxCommDeregister(const flagcxComm_t comm, void *handle) {
   // Remove this comm's net/p2p handles from the regItem
   globalRegPool.removeRegItemNetHandles(regKey, regItem);
   globalRegPool.removeRegItemP2pHandles(regKey, regItem);
+  FLAGCXCHECK(flagcxCommReleaseRegisteredIpcEntries(
+      comm, regItem->beginAddr, regItem->endAddr));
 
   // Clean up globalRegPool (refCount--, page mappings, item removal at 0)
   globalRegPool.deregisterBuffer(regKey, handle);
@@ -1613,6 +1616,11 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
 
   (*comm) = NULL;
   flagcxCalloc(comm, 1);
+  if (pthread_mutex_init(&(*comm)->ipcTableMutex, NULL) != 0) {
+    free(*comm);
+    *comm = NULL;
+    return flagcxSystemError;
+  }
   (*comm)->rank = rank;
   (*comm)->nranks = nranks;
   (*comm)->nclusters = -1;
@@ -2111,6 +2119,7 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
   flagcxCCLAdaptorPluginFinalize();
   flagcxDeviceAdaptorPluginFinalize();
 
+  pthread_mutex_destroy(&comm->ipcTableMutex);
   free(comm);
   return flagcxSuccess;
 }

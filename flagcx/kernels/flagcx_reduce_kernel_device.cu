@@ -1,5 +1,6 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
+#include "device_api/flagcx_device.h"
 #include "device_api/comm_traits.h"
 
 #define SLOT_IDX 4
@@ -12,6 +13,7 @@
 #define REDOP_IDX 11
 #define FLAG_IN_IDX 12
 #define FLAG_OUT_IDX 13
+#define TYPE_IDX 14
 
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxStreamFlagState
 loadStreamFlagState(uint64_t flagAddr) {
@@ -58,6 +60,10 @@ FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getState() {
   return value[3] >> flagcxReduceTriggerOffState &
          flagcxTriggerMask(flagcxReduceTriggerBitsState);
 }
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getType() {
+  return value[3] >> flagcxReduceTriggerOffType &
+         flagcxTriggerMask(flagcxReduceTriggerBitsType);
+}
 FLAGCX_DEVICE_INLINE_DECORATOR void flagcxReduceTrigger::setComplete() {
   uint64_t flagOut = getFlagOut();
   if (flagOut != 0) {
@@ -85,6 +91,12 @@ FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getFlagIn() {
 }
 FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getFlagOut() {
   return value[5];
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getDevApiOpsPtr() {
+  return value[0];
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getDevApiNumOps() {
+  return value[1];
 }
 
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(uint64_t *buffer,
@@ -124,7 +136,91 @@ flagcxReduceKernel(uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
   }
 }
 
-FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
+FLAGCX_DEVICE_INLINE_DECORATOR void
+flagcxCopyBytes(uint8_t *dst, const uint8_t *src, size_t bytes) {
+  for (size_t idx = FLAGCX_THREAD_IDX_X; idx < bytes;
+       idx += FLAGCX_BLOCK_DIM_X) {
+    dst[idx] = src[idx];
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void
+flagcxDevApiBarrierSync(const flagcxDevApiRuntime &runtime,
+                        flagcxCoopBlock coop, uint32_t ctaIndex) {
+  if (runtime.intraSize <= 1) {
+    coop.sync();
+    return;
+  }
+  if (runtime.barrierPeers == nullptr || runtime.epochBuffer == nullptr ||
+      runtime.nBarriers <= 0) {
+    coop.sync();
+    return;
+  }
+
+  uint64_t epoch = DeviceAPI::Atomic::load(
+      &runtime.epochBuffer[ctaIndex], flagcxDeviceMemoryOrderRelaxed);
+  coop.sync();
+
+  for (int i = coop.threadRank(); i < runtime.intraSize - 1; i += coop.size()) {
+    int peer = 1 + runtime.intraRank + i;
+    if (peer >= runtime.intraSize)
+      peer -= runtime.intraSize;
+    uint64_t *slot =
+        &runtime.barrierPeers[peer][runtime.intraRank * runtime.nBarriers +
+                                    static_cast<int>(ctaIndex)];
+    DeviceAPI::Atomic::store(slot, epoch + 1, flagcxDeviceMemoryOrderRelease);
+  }
+
+  for (int i = coop.threadRank(); i < runtime.intraSize - 1; i += coop.size()) {
+    int peer = 1 + runtime.intraRank + i;
+    if (peer >= runtime.intraSize)
+      peer -= runtime.intraSize;
+    uint64_t *slot =
+        &runtime.barrierPeers[runtime.intraRank][peer * runtime.nBarriers +
+                                                 static_cast<int>(ctaIndex)];
+    int iter = 0;
+    while (DeviceAPI::Atomic::load(slot, flagcxDeviceMemoryOrderAcquire) <
+           epoch + 1) {
+      DeviceAPI::Intrin::spinBackoff(iter++);
+    }
+  }
+
+  DeviceAPI::Atomic::store(&runtime.epochBuffer[ctaIndex], epoch + 1,
+                           flagcxDeviceMemoryOrderRelaxed);
+  coop.sync();
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void
+flagcxDevApiKernel(uint64_t opsPtr, uint64_t numOps, const void *runtimePtr) {
+  if (opsPtr == 0 || numOps == 0 || runtimePtr == nullptr) {
+    return;
+  }
+
+  const flagcxDevApiRuntime *runtime =
+      reinterpret_cast<const flagcxDevApiRuntime *>(runtimePtr);
+  flagcxCoopBlock coop;
+  const flagcxDevApiKernelOp *ops =
+      reinterpret_cast<const flagcxDevApiKernelOp *>(opsPtr);
+
+  flagcxDevApiBarrierSync(*runtime, coop, FLAGCX_BLOCK_IDX_X);
+  for (uint64_t i = 0; i < numOps; i++) {
+    const flagcxDevApiKernelOp &op = ops[i];
+    if (op.srcPtr == 0 || op.dstPtr == 0 || op.count == 0 || op.nbytes == 0) {
+      continue;
+    }
+    const uint8_t *src = reinterpret_cast<const uint8_t *>(op.srcPtr);
+    uint8_t *dst = reinterpret_cast<uint8_t *>(op.dstPtr);
+    if (src == nullptr || dst == nullptr) {
+      continue;
+    }
+    flagcxCopyBytes(dst, src, op.nbytes);
+  }
+  FLAGCX_DEVICE_SYNC_THREADS();
+  flagcxDevApiBarrierSync(*runtime, coop, FLAGCX_BLOCK_IDX_X);
+}
+
+FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer,
+                                                    const void *devApiRuntimePtr) {
   FLAGCX_SHARED uint64_t shm[16];
   uint64_t *vBuf = (uint64_t *)fifoBuffer;
   int emptyIter = 0; // backoff counter
@@ -183,6 +279,11 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
         shm[REDOP_IDX] = t->getRedop();
         shm[FLAG_IN_IDX] = t->getFlagIn();
         shm[FLAG_OUT_IDX] = t->getFlagOut();
+        shm[TYPE_IDX] = t->getType();
+        if (shm[TYPE_IDX] == flagcxCollectiveTriggerTypeDevApi) {
+          shm[FST_IDX] = t->getDevApiOpsPtr();
+          shm[COUNT_IDX] = t->getDevApiNumOps();
+        }
       }
     }
     FLAGCX_DEVICE_SYNC_THREADS();
@@ -234,7 +335,12 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
     uint64_t nthreads = shm[NTHREADS_IDX];
     uint64_t datatype = shm[DATATYPE_IDX];
     uint64_t redop = shm[REDOP_IDX];
-    flagcxReduceKernel(fst, snd, out, count, nthreads, datatype, redop);
+    uint64_t type = shm[TYPE_IDX];
+    if (type == flagcxCollectiveTriggerTypeDevApi) {
+      flagcxDevApiKernel(fst, count, devApiRuntimePtr);
+    } else {
+      flagcxReduceKernel(fst, snd, out, count, nthreads, datatype, redop);
+    }
     FLAGCX_DEVICE_SYNC_THREADS();
     FLAGCX_DEVICE_THREAD_FENCE();
 
@@ -248,7 +354,9 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
 }
 
 void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
-                                  size_t nblocks, flagcxStream_t stream) {
+                                  size_t nblocks, flagcxStream_t stream,
+                                  const void *devApiRuntimePtr) {
   flagcxCollectiveKernel<<<nblocks, nthreads, 0,
-                           *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(fifoBuffer);
+                           *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(
+      fifoBuffer, devApiRuntimePtr);
 }

@@ -19,6 +19,7 @@
 
 #include "device_utils.h"
 #include "flagcx.h"
+#include <stdint.h>
 
 struct flagcxHeteroComm;
 
@@ -56,6 +57,11 @@ typedef enum {
   flagcxReduceTriggerInprogress = 2,
   flagcxReduceTriggerComplete = 3
 } flagcxReduceTriggerState;
+
+typedef enum {
+  flagcxCollectiveTriggerTypeRed = 0,
+  flagcxCollectiveTriggerTypeDevApi = 1
+} flagcxCollectiveTriggerType;
 
 typedef enum {
   flagcxStreamFlagIdle = 0,
@@ -156,7 +162,29 @@ constexpr unsigned int flagcxReduceTriggerOffState =
     flagcxReduceTriggerOffRedop + flagcxReduceTriggerBitsRedop;
 /* op state: 0 for available, 1 for enqueued, 2 for in-progress, 3 for done */
 constexpr unsigned int flagcxReduceTriggerBitsState = 2;
+constexpr unsigned int flagcxReduceTriggerOffType =
+    flagcxReduceTriggerOffState + flagcxReduceTriggerBitsState;
+constexpr unsigned int flagcxReduceTriggerBitsType = 2;
 constexpr unsigned int flagcxReduceTriggerBitsFifoReserved = 1;
+
+struct alignas(16) flagcxDevApiKernelOp {
+  uint64_t srcPtr;
+  uint64_t dstPtr;
+  uint64_t offsetBytes;
+  uint64_t count;
+  int32_t peerRank;
+  uint32_t datatype;
+  uint64_t nbytes;
+};
+
+struct alignas(16) flagcxDevApiRuntime {
+  int32_t rank;
+  int32_t intraRank;
+  int32_t intraSize;
+  int32_t nBarriers;
+  uint64_t **barrierPeers;
+  uint64_t *epochBuffer;
+};
 
 // Kernel launch configuration constants.
 // Also defined in device_api/flagcx_device.h (with same include guard).
@@ -215,8 +243,11 @@ struct alignas(16) flagcxReduceTrigger {
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getDatatype();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getRedop();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getState();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getType();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getFlagIn();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getFlagOut();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getDevApiOpsPtr();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getDevApiNumOps();
   FLAGCX_DEVICE_INLINE_DECORATOR void setComplete();
 #endif
   FLAGCX_HOST_DECORATOR void setValue(uint64_t fst, uint64_t snd, uint64_t out,
@@ -225,6 +256,9 @@ struct alignas(16) flagcxReduceTrigger {
                                       flagcxRedOp_t redOp,
                                       flagcxReduceTriggerState state,
                                       uint64_t flagIn, uint64_t flagOut);
+  FLAGCX_HOST_DECORATOR void setDevApiValue(
+      uint64_t opsPtr, size_t numOps, flagcxReduceTriggerState state,
+      uint64_t flagIn, uint64_t flagOut);
   FLAGCX_HOST_DECORATOR uint64_t pollState();
   FLAGCX_HOST_DECORATOR void setState(int state);
 };

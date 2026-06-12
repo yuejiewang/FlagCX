@@ -8,14 +8,15 @@
 #include "utils.h"
 
 #include <map>
+#include <pthread.h>
 #include <vector>
 
 /* Opaque handle to flagcxInnerComm */
 typedef struct flagcxInnerComm *flagcxInnerComm_t;
 
-// IPC peer pointer table entry — owned by comm, referenced by devMem.
-// Cleanup deferred to flagcxCommDestroy.
-// to avoid cudaFree implicit device synchronization deadlock.
+// IPC peer pointer table entry — owned by comm, referenced by DevMem/DevComm.
+// Entries are ref-counted and may be kept persistent for registered buffers.
+// Final cleanup is still deferred to flagcxCommDestroy.
 #define FLAGCX_MAX_IPC_ENTRIES 16
 
 struct flagcxIpcTableEntry {
@@ -23,7 +24,10 @@ struct flagcxIpcTableEntry {
   void **devPeerPtrs;  // device array: peer buffer ptrs (for cudaFree)
   int nPeers;          // number of local peers
   void *basePtr;       // own buffer ptr (skip in ipcMemHandleClose loop)
-  bool inUse;          // true while a devMem references this entry
+  size_t size;         // size of the buffer range represented by this entry
+  uint32_t refCount;   // number of active DevMem/DevComm users
+  bool inUse;          // compatibility/debug view: refCount > 0
+  bool persistent;     // keep the entry live when refCount reaches zero
 };
 
 // Deferred device/host-pinned memory free — collected during cleanup,
@@ -109,6 +113,7 @@ struct flagcxComm {
 
   // IPC peer pointer table — deferred cleanup
   struct flagcxIpcTableEntry ipcTable[FLAGCX_MAX_IPC_ENTRIES];
+  pthread_mutex_t ipcTableMutex;
 
   // Deferred DevComm buffer queue — buffers stashed here during
   // flagcxDevCommDestroy, drained at flagcxCommDestroy.
