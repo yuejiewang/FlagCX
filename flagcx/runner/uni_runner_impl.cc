@@ -3951,7 +3951,8 @@ ensureUniRunnerDevApiSyncResources(flagcxUniRunnerState *runnerState,
 
 static flagcxResult_t
 reserveUniRunnerDevApiSyncBase(flagcxUniRunnerState *runnerState,
-                               flagcxComm_t comm, uint64_t *syncBaseOut) {
+                               flagcxComm_t comm, size_t numSyncSlots,
+                               uint64_t *syncBaseOut) {
   if (runnerState == NULL || syncBaseOut == NULL) {
     return flagcxInvalidArgument;
   }
@@ -3959,7 +3960,11 @@ reserveUniRunnerDevApiSyncBase(flagcxUniRunnerState *runnerState,
     runnerState->devApiSyncNextValue = 1;
   }
 
-  uint64_t span = static_cast<uint64_t>(runnerState->numDagNodes) + 1;
+  if (numSyncSlots >
+      std::numeric_limits<uint64_t>::max() - static_cast<uint64_t>(1)) {
+    return flagcxInvalidArgument;
+  }
+  uint64_t span = static_cast<uint64_t>(numSyncSlots) + 1;
   uint64_t maxValue = std::numeric_limits<uint64_t>::max();
   if (maxValue - runnerState->devApiSyncNextValue < span) {
     FLAGCXCHECK(bootstrapCollBarrier(comm->bootstrap, comm->rank, comm->nranks,
@@ -4063,6 +4068,39 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
     return flagcxSuccess;
   }
 
+  size_t totalOps = 0;
+  size_t numSyncSlots = 0;
+  for (int i = 0; i < runnerState->numDagNodes; i++) {
+    uniRunnerDagNode *node = &runnerState->dagNodes[i];
+    if (node->nodeType != uniRunnerDagNodeTypeDevApiCpy) {
+      continue;
+    }
+    node->nodeData.devApiCpy.opsDev = NULL;
+    node->nodeData.devApiCpy.syncSlot = -1;
+    if (node->nodeData.devApiCpy.numOps <= 0) {
+      continue;
+    }
+    size_t nodeOps = static_cast<size_t>(node->nodeData.devApiCpy.numOps);
+    if (nodeOps > (std::numeric_limits<size_t>::max() - totalOps) ||
+        numSyncSlots >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+      return flagcxInvalidArgument;
+    }
+    totalOps += nodeOps;
+    node->nodeData.devApiCpy.syncSlot = static_cast<int>(numSyncSlots++);
+  }
+
+  if (totalOps == 0) {
+    return flagcxSuccess;
+  }
+  if (totalOps >
+          std::numeric_limits<size_t>::max() /
+              sizeof(flagcxDevApiKernelOp) ||
+      numSyncSlots >
+          std::numeric_limits<size_t>::max() / (2 * sizeof(uint64_t))) {
+    return flagcxInvalidArgument;
+  }
+
   FLAGCXCHECK(acquireUniRunnerDevMem(
       runnerState, comm, const_cast<void *>(runnerState->inputBase),
       runnerState->inputBytes,
@@ -4074,12 +4112,12 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
       runnerState, comm, runnerState->scratchBase, runnerState->scratchBytes,
       &runnerState->devApiScratchMem, &runnerState->devApiScratchMemCached));
 
-  size_t requiredSyncBytes =
-      static_cast<size_t>(runnerState->numDagNodes) * 2 * sizeof(uint64_t);
+  size_t requiredSyncBytes = numSyncSlots * 2 * sizeof(uint64_t);
   FLAGCXCHECK(ensureUniRunnerDevApiSyncResources(runnerState, comm,
                                                  requiredSyncBytes));
   uint64_t syncBase = 0;
-  FLAGCXCHECK(reserveUniRunnerDevApiSyncBase(runnerState, comm, &syncBase));
+  FLAGCXCHECK(reserveUniRunnerDevApiSyncBase(runnerState, comm, numSyncSlots,
+                                             &syncBase));
 
   auto logDevMemState = [&](const char *label, flagcxDevMem_t memHandle,
                             void *base, size_t bytes) {
@@ -4110,36 +4148,12 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
                  runnerState->devApiSyncFlagsSize);
 
   INFO(FLAGCX_UNIRUNNER,
-       "uniRunner DevApi: rank %d numDagNodes=%d syncFlags=%p syncBytes=%zu "
-       "syncBase=%llu",
-       comm->rank, runnerState->numDagNodes, runnerState->devApiSyncFlags,
-       runnerState->devApiSyncFlagsSize, (unsigned long long)syncBase);
+       "uniRunner DevApi: rank %d numDagNodes=%d syncSlots=%zu "
+       "syncFlags=%p syncBytes=%zu syncBase=%llu",
+       comm->rank, runnerState->numDagNodes, numSyncSlots,
+       runnerState->devApiSyncFlags, runnerState->devApiSyncFlagsSize,
+       (unsigned long long)syncBase);
 
-  size_t totalOps = 0;
-  for (int i = 0; i < runnerState->numDagNodes; i++) {
-    uniRunnerDagNode *node = &runnerState->dagNodes[i];
-    if (node->nodeType != uniRunnerDagNodeTypeDevApiCpy) {
-      continue;
-    }
-    node->nodeData.devApiCpy.opsDev = NULL;
-    if (node->nodeData.devApiCpy.numOps <= 0) {
-      continue;
-    }
-    size_t nodeOps = static_cast<size_t>(node->nodeData.devApiCpy.numOps);
-    if (nodeOps >
-        (std::numeric_limits<size_t>::max() - totalOps)) {
-      return flagcxInvalidArgument;
-    }
-    totalOps += nodeOps;
-  }
-
-  if (totalOps == 0) {
-    return flagcxSuccess;
-  }
-  if (totalOps >
-      std::numeric_limits<size_t>::max() / sizeof(flagcxDevApiKernelOp)) {
-    return flagcxInvalidArgument;
-  }
   size_t opsBytes = totalOps * sizeof(flagcxDevApiKernelOp);
   FLAGCXCHECK(deviceAdaptor->deviceMalloc(&runnerState->devApiOpsPool,
                                           opsBytes, flagcxMemDevice, NULL));
@@ -4158,6 +4172,9 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
     }
     if (runnerState->devApiSyncMem == NULL) {
       return flagcxInvalidArgument;
+    }
+    if (node->nodeData.devApiCpy.syncSlot < 0) {
+      return flagcxInternalError;
     }
 
     size_t nodeOffset = opCursor;
@@ -4187,7 +4204,8 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
       // reads this rank's source slice, so done waits are wired in that
       // opposite direction.
       int64_t readyOffset =
-          static_cast<int64_t>(2 * static_cast<size_t>(node->nodeIdx) *
+          static_cast<int64_t>(2 * static_cast<size_t>(
+                                      node->nodeData.devApiCpy.syncSlot) *
                                sizeof(uint64_t));
       int64_t doneOffset =
           readyOffset + static_cast<int64_t>(sizeof(uint64_t));
@@ -4201,7 +4219,8 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
       FLAGCXCHECK(resolveDevApiPeerPtr(comm, runnerState->devApiSyncMem,
                                        nextRank, doneOffset,
                                        &dstOp.peerDonePtr));
-      dstOp.syncValue = syncBase + static_cast<uint64_t>(node->nodeIdx);
+      dstOp.syncValue =
+          syncBase + static_cast<uint64_t>(node->nodeData.devApiCpy.syncSlot);
       dstOp.nbytes = static_cast<uint64_t>(
           srcOp.count * getFlagcxDataTypeSize(srcOp.datatype));
       if (i < 4) {

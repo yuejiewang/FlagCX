@@ -97,6 +97,7 @@ struct uniRunnerDevApiCpyNodeData {
   struct uniRunnerDevApiCpyOpData *ops; // Host-side op metadata
   int numOps;                           // Number of operations
   void *opsDev;                         // Device-side kernel op array
+  int syncSlot;                          // Compact ready/done sync slot
 };
 
 // Reduce node data (operation-specific fields only)
