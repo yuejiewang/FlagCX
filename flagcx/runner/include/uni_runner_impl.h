@@ -195,7 +195,7 @@ typedef struct {
   flagcxDevMem_t devApiSyncMem;
   void *devApiSyncFlags;
   size_t devApiSyncFlagsSize;
-  bool devApiFinalBarrierDone;
+  uint64_t devApiSyncNextValue;
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
@@ -242,6 +242,7 @@ size_t getUniRunnerDagPatternHash(const uniRunnerDagCacheKey &key);
 flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream);
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm);
 flagcxResult_t
-cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState);
+cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState,
+                                flagcxComm_t comm = NULL);
 flagcxResult_t runUniRunner(flagcxComm_t comm);
 #endif // FLAGCX_UNIRUNNER_IMPL_H_

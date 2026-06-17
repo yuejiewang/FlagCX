@@ -2077,6 +2077,23 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
     // proxyState and heteroComm. Proxy threads are stopped inside
     // flagcxCommRelayDestroy via the bootstrap barrier before any teardown.
     FLAGCXCHECK(flagcxCommRelayDestroy(comm));
+    if (comm->heteroComm != nullptr &&
+        comm->heteroComm->proxyState != nullptr) {
+      flagcxUniRunnerState *uniRunnerState =
+          &comm->heteroComm->proxyState->uniRunnerState;
+      if (uniRunnerState->streamFlagsPool != NULL ||
+          uniRunnerState->streamFlags != NULL ||
+          uniRunnerState->streamFlagsCapacity != 0 ||
+          uniRunnerState->entryFlagsPool != NULL ||
+          uniRunnerState->entryFlags != NULL ||
+          uniRunnerState->entryFlagsCapacity != 0 ||
+          uniRunnerState->devApiSyncMem != NULL ||
+          uniRunnerState->devApiSyncFlags != NULL ||
+          uniRunnerState->devApiSyncFlagsSize != 0) {
+        FLAGCXCHECK(deviceAdaptor->setDevice(comm->heteroComm->cudaDev));
+        FLAGCXCHECK(cleanupUniRunnerPersistentState(uniRunnerState, comm));
+      }
+    }
     // Destroy hetero comm (stops/joins proxy threads, frees proxyState)
     flagcxOneSideStagingDeregister(comm);
     flagcxOneSideSignalDeregister(comm->heteroComm);

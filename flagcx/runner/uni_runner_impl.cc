@@ -18,6 +18,7 @@
 #include <assert.h>
 #include <cerrno>
 #include <cstdint>
+#include <limits>
 #include <math.h>
 #include <mutex>
 #include <string>
@@ -38,7 +39,7 @@ FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
 namespace {
 
 constexpr char kUniRunnerDagCachePathEnv[] = "FLAGCX_UNIRUNNER_DAG_CACHE_PATH";
-constexpr int kUniRunnerDevApiFinalBarrierTag = 0xD5A1;
+constexpr int kUniRunnerDevApiSyncResizeBarrierTag = 0xD5A1;
 
 struct uniRunnerDagRuntimeBindings {
   const void *inputBase = NULL;
@@ -3612,6 +3613,99 @@ static flagcxResult_t createUniRunnerInvocationDevMem(flagcxComm_t comm,
   return flagcxDevMemCreate(comm, base, bytes, NULL, devMem);
 }
 
+static flagcxResult_t
+destroyUniRunnerDevApiSyncResources(flagcxUniRunnerState *runnerState,
+                                    flagcxComm_t comm) {
+  if (runnerState == NULL) {
+    return flagcxSuccess;
+  }
+
+  if (runnerState->devApiSyncMem != NULL) {
+    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiSyncMem));
+    runnerState->devApiSyncMem = NULL;
+  }
+  if (runnerState->devApiSyncFlags != NULL) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->devApiSyncFlags,
+                                          flagcxMemDevice, NULL));
+    runnerState->devApiSyncFlags = NULL;
+  }
+  runnerState->devApiSyncFlagsSize = 0;
+  runnerState->devApiSyncNextValue = 0;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+ensureUniRunnerDevApiSyncResources(flagcxUniRunnerState *runnerState,
+                                   flagcxComm_t comm, size_t requiredBytes) {
+  if (requiredBytes == 0) {
+    return flagcxSuccess;
+  }
+  if (runnerState->devApiSyncFlags != NULL &&
+      runnerState->devApiSyncMem != NULL &&
+      runnerState->devApiSyncFlagsSize >= requiredBytes) {
+    return flagcxSuccess;
+  }
+
+  if (runnerState->devApiSyncFlags != NULL ||
+      runnerState->devApiSyncMem != NULL) {
+    // This resize path is expected to be rare. The normal fast path reuses the
+    // existing sync buffer and relies on monotonically increasing sync values.
+    FLAGCXCHECK(bootstrapCollBarrier(comm->bootstrap, comm->rank, comm->nranks,
+                                     kUniRunnerDevApiSyncResizeBarrierTag));
+    FLAGCXCHECK(destroyUniRunnerDevApiSyncResources(runnerState, comm));
+  }
+
+  void *syncFlags = NULL;
+  flagcxDevMem_t syncMem = NULL;
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(&syncFlags, requiredBytes,
+                                          flagcxMemDevice, NULL));
+  flagcxResult_t res =
+      deviceAdaptor->deviceMemset(syncFlags, 0, requiredBytes,
+                                  flagcxMemDevice, NULL);
+  if (res != flagcxSuccess) {
+    deviceAdaptor->deviceFree(syncFlags, flagcxMemDevice, NULL);
+    return res;
+  }
+  res = createUniRunnerInvocationDevMem(comm, syncFlags, requiredBytes,
+                                        &syncMem);
+  if (res != flagcxSuccess) {
+    deviceAdaptor->deviceFree(syncFlags, flagcxMemDevice, NULL);
+    return res;
+  }
+
+  runnerState->devApiSyncFlags = syncFlags;
+  runnerState->devApiSyncFlagsSize = requiredBytes;
+  runnerState->devApiSyncMem = syncMem;
+  runnerState->devApiSyncNextValue = 1;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+reserveUniRunnerDevApiSyncBase(flagcxUniRunnerState *runnerState,
+                               flagcxComm_t comm, uint64_t *syncBaseOut) {
+  if (runnerState == NULL || syncBaseOut == NULL) {
+    return flagcxInvalidArgument;
+  }
+  if (runnerState->devApiSyncNextValue == 0) {
+    runnerState->devApiSyncNextValue = 1;
+  }
+
+  uint64_t span = static_cast<uint64_t>(runnerState->numDagNodes) + 1;
+  uint64_t maxValue = std::numeric_limits<uint64_t>::max();
+  if (maxValue - runnerState->devApiSyncNextValue < span) {
+    FLAGCXCHECK(bootstrapCollBarrier(comm->bootstrap, comm->rank, comm->nranks,
+                                     kUniRunnerDevApiSyncResizeBarrierTag));
+    FLAGCXCHECK(deviceAdaptor->deviceMemset(
+        runnerState->devApiSyncFlags, 0, runnerState->devApiSyncFlagsSize,
+        flagcxMemDevice, NULL));
+    runnerState->devApiSyncNextValue = 1;
+  }
+
+  *syncBaseOut = runnerState->devApiSyncNextValue;
+  runnerState->devApiSyncNextValue += span;
+  return flagcxSuccess;
+}
+
 static flagcxDevMem_t selectDevApiMemHandle(uniRunnerDagBufferType bufferType,
                                             flagcxDevMem_t inputMem,
                                             flagcxDevMem_t outputMem,
@@ -3690,10 +3784,6 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
   runnerState->devApiInputMem = NULL;
   runnerState->devApiOutputMem = NULL;
   runnerState->devApiScratchMem = NULL;
-  runnerState->devApiSyncMem = NULL;
-  runnerState->devApiSyncFlags = NULL;
-  runnerState->devApiSyncFlagsSize = 0;
-  runnerState->devApiFinalBarrierDone = false;
 
   if (!runnerState->hasDevApiNodes) {
     return flagcxSuccess;
@@ -3709,17 +3799,12 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
       comm, runnerState->scratchBase, runnerState->scratchBytes,
       &runnerState->devApiScratchMem));
 
-  runnerState->devApiSyncFlagsSize =
+  size_t requiredSyncBytes =
       static_cast<size_t>(runnerState->numDagNodes) * 2 * sizeof(uint64_t);
-  FLAGCXCHECK(deviceAdaptor->deviceMalloc(&runnerState->devApiSyncFlags,
-                                          runnerState->devApiSyncFlagsSize,
-                                          flagcxMemDevice, NULL));
-  FLAGCXCHECK(deviceAdaptor->deviceMemset(
-      runnerState->devApiSyncFlags, 0, runnerState->devApiSyncFlagsSize,
-      flagcxMemDevice, NULL));
-  FLAGCXCHECK(createUniRunnerInvocationDevMem(
-      comm, runnerState->devApiSyncFlags, runnerState->devApiSyncFlagsSize,
-      &runnerState->devApiSyncMem));
+  FLAGCXCHECK(ensureUniRunnerDevApiSyncResources(runnerState, comm,
+                                                 requiredSyncBytes));
+  uint64_t syncBase = 0;
+  FLAGCXCHECK(reserveUniRunnerDevApiSyncBase(runnerState, comm, &syncBase));
 
   auto logDevMemState = [&](const char *label, flagcxDevMem_t memHandle,
                             void *base, size_t bytes) {
@@ -3750,9 +3835,10 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
                  runnerState->devApiSyncFlagsSize);
 
   INFO(FLAGCX_UNIRUNNER,
-       "uniRunner DevApi: rank %d numDagNodes=%d syncFlags=%p syncBytes=%zu",
+       "uniRunner DevApi: rank %d numDagNodes=%d syncFlags=%p syncBytes=%zu "
+       "syncBase=%llu",
        comm->rank, runnerState->numDagNodes, runnerState->devApiSyncFlags,
-       runnerState->devApiSyncFlagsSize);
+       runnerState->devApiSyncFlagsSize, (unsigned long long)syncBase);
 
   for (int i = 0; i < runnerState->numDagNodes; i++) {
     uniRunnerDagNode *node = &runnerState->dagNodes[i];
@@ -3809,7 +3895,7 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
       FLAGCXCHECK(resolveDevApiPeerPtr(comm, runnerState->devApiSyncMem,
                                        nextRank, doneOffset,
                                        &dstOp.peerDonePtr));
-      dstOp.syncValue = static_cast<uint64_t>(node->nodeIdx) + 1;
+      dstOp.syncValue = syncBase + static_cast<uint64_t>(node->nodeIdx);
       dstOp.offsetBytes = static_cast<uint64_t>(srcOp.buffer.offsetBytes);
       dstOp.count = static_cast<uint64_t>(srcOp.count);
       dstOp.peerRank = srcOp.peerRank;
@@ -3864,21 +3950,6 @@ cleanupUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
     }
   }
 
-  if (runnerState->devApiSyncMem != NULL) {
-    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiSyncMem));
-    runnerState->devApiSyncMem = NULL;
-  }
-  if (runnerState->devApiSyncFlags != NULL) {
-    if (!runnerState->devApiFinalBarrierDone) {
-      WARN("uniRunner DevApi: rank %d deferring sync flag free without final "
-           "barrier; this should only happen on an error path",
-           comm != NULL ? comm->rank : -1);
-    }
-    flagcxCommDeferFree(comm, runnerState->devApiSyncFlags, flagcxMemDevice);
-    runnerState->devApiSyncFlags = NULL;
-    runnerState->devApiSyncFlagsSize = 0;
-    runnerState->devApiFinalBarrierDone = false;
-  }
   if (runnerState->devApiScratchMem != NULL) {
     FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiScratchMem));
     runnerState->devApiScratchMem = NULL;
@@ -3911,10 +3982,9 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->devApiInputMem = NULL;
   runnerState->devApiOutputMem = NULL;
   runnerState->devApiScratchMem = NULL;
-  runnerState->devApiSyncMem = NULL;
-  runnerState->devApiSyncFlags = NULL;
-  runnerState->devApiSyncFlagsSize = 0;
-  runnerState->devApiFinalBarrierDone = false;
+  if (runnerState->devApiSyncNextValue == 0) {
+    runnerState->devApiSyncNextValue = 1;
+  }
 
   runnerState->uniRunnerNSlices = flagcxParamUniRunnerNSlices();
   runnerState->uniRunnerNThreads = flagcxParamUniRunnerNThreads();
@@ -4071,25 +4141,24 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   if (runnerState->hasDevApiNodes) {
     if (redSyncRes != flagcxSuccess || cpySyncRes != flagcxSuccess ||
         ctrlSyncRes != flagcxSuccess || commSyncRes != flagcxSuccess) {
-      WARN("runUniRunner: rank %d skip DevApi final barrier because local "
-           "stream sync failed (red=%d cpy=%d ctrl=%d comm=%d)",
+      WARN("runUniRunner: rank %d DevApi local stream sync failed "
+           "(red=%d cpy=%d ctrl=%d comm=%d)",
            comm->rank, redSyncRes, cpySyncRes, ctrlSyncRes, commSyncRes);
       return redSyncRes != flagcxSuccess ? redSyncRes
              : cpySyncRes != flagcxSuccess ? cpySyncRes
              : ctrlSyncRes != flagcxSuccess ? ctrlSyncRes
                                             : commSyncRes;
     }
-    FLAGCXCHECK(bootstrapCollBarrier(comm->bootstrap, comm->rank, comm->nranks,
-                                     kUniRunnerDevApiFinalBarrierTag));
-    runnerState->devApiFinalBarrierDone = true;
   }
 
   return flagcxSuccess;
 }
 
 flagcxResult_t
-cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState) {
+cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState,
+                                flagcxComm_t comm) {
   FLAGCXCHECK(cleanupDagScheduler(runnerState));
+  FLAGCXCHECK(destroyUniRunnerDevApiSyncResources(runnerState, comm));
   FLAGCXCHECK(destroyEntryFlagQueue(runnerState));
   return destroyStreamFlagQueue(runnerState);
 }
