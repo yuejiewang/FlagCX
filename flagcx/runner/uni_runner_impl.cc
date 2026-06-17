@@ -704,6 +704,23 @@ destroyEntryFlagQueue(flagcxUniRunnerState *runnerState) {
   return flagcxSuccess;
 }
 
+static flagcxResult_t
+cleanupUniRunnerCompletedInvocation(flagcxUniRunnerState *runnerState,
+                                    flagcxComm_t comm);
+
+static flagcxResult_t
+drainUniRunnerPendingInvocation(flagcxUniRunnerState *runnerState,
+                                flagcxComm_t comm) {
+  if (runnerState == NULL || !runnerState->invocationInFlight) {
+    return flagcxSuccess;
+  }
+  if (runnerState->commDoneEvent != NULL) {
+    FLAGCXCHECK(deviceAdaptor->eventSynchronize(runnerState->commDoneEvent));
+  }
+  runnerState->invocationInFlight = false;
+  return cleanupUniRunnerCompletedInvocation(runnerState, comm);
+}
+
 static flagcxResult_t resetUniRunnerFifo(flagcxUniRunnerState *runnerState) {
   if (runnerState == NULL || runnerState->fifo == NULL ||
       runnerState->fifo->buffer == NULL) {
@@ -718,6 +735,24 @@ static flagcxResult_t resetUniRunnerFifo(flagcxUniRunnerState *runnerState) {
   memset((void *)(buffer + flagcxFifoIdxData), 0,
          capacity * sizeof(flagcxReduceTrigger));
   __sync_synchronize();
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+ensureUniRunnerCompletionEvents(flagcxUniRunnerState *runnerState) {
+  if (runnerState->completionEventsInitialized) {
+    return flagcxSuccess;
+  }
+
+  FLAGCXCHECK(deviceAdaptor->eventCreate(&runnerState->redDoneEvent,
+                                         flagcxEventDisableTiming));
+  FLAGCXCHECK(deviceAdaptor->eventCreate(&runnerState->cpyDoneEvent,
+                                         flagcxEventDisableTiming));
+  FLAGCXCHECK(deviceAdaptor->eventCreate(&runnerState->ctrlDoneEvent,
+                                         flagcxEventDisableTiming));
+  FLAGCXCHECK(deviceAdaptor->eventCreate(&runnerState->commDoneEvent,
+                                         flagcxEventDisableTiming));
+  runnerState->completionEventsInitialized = true;
   return flagcxSuccess;
 }
 
@@ -739,7 +774,33 @@ ensureUniRunnerRuntimeResources(flagcxUniRunnerState *runnerState,
   FLAGCXCHECK(deviceAdaptor->streamCreate(&runnerState->redStream));
   FLAGCXCHECK(deviceAdaptor->streamCreate(&runnerState->cpyStream));
   FLAGCXCHECK(deviceAdaptor->streamCreate(&runnerState->ctrlStream));
+  FLAGCXCHECK(ensureUniRunnerCompletionEvents(runnerState));
   runnerState->runtimeInitialized = true;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+recordUniRunnerInvocationCompletion(flagcxUniRunnerState *runnerState) {
+  if (runnerState == NULL || !runnerState->runtimeInitialized ||
+      !runnerState->completionEventsInitialized) {
+    return flagcxInvalidArgument;
+  }
+
+  FLAGCXCHECK(deviceAdaptor->eventRecord(runnerState->redDoneEvent,
+                                         runnerState->redStream));
+  FLAGCXCHECK(deviceAdaptor->eventRecord(runnerState->cpyDoneEvent,
+                                         runnerState->cpyStream));
+  FLAGCXCHECK(deviceAdaptor->eventRecord(runnerState->ctrlDoneEvent,
+                                         runnerState->ctrlStream));
+  FLAGCXCHECK(deviceAdaptor->streamWaitEvent(runnerState->commStream,
+                                             runnerState->redDoneEvent));
+  FLAGCXCHECK(deviceAdaptor->streamWaitEvent(runnerState->commStream,
+                                             runnerState->cpyDoneEvent));
+  FLAGCXCHECK(deviceAdaptor->streamWaitEvent(runnerState->commStream,
+                                             runnerState->ctrlDoneEvent));
+  FLAGCXCHECK(deviceAdaptor->eventRecord(runnerState->commDoneEvent,
+                                         runnerState->commStream));
+  runnerState->invocationInFlight = true;
   return flagcxSuccess;
 }
 
@@ -762,6 +823,22 @@ destroyUniRunnerRuntimeResources(flagcxUniRunnerState *runnerState,
     FLAGCXCHECK(deviceAdaptor->streamDestroy(runnerState->ctrlStream));
     runnerState->ctrlStream = NULL;
   }
+  if (runnerState->redDoneEvent != NULL) {
+    FLAGCXCHECK(deviceAdaptor->eventDestroy(runnerState->redDoneEvent));
+    runnerState->redDoneEvent = NULL;
+  }
+  if (runnerState->cpyDoneEvent != NULL) {
+    FLAGCXCHECK(deviceAdaptor->eventDestroy(runnerState->cpyDoneEvent));
+    runnerState->cpyDoneEvent = NULL;
+  }
+  if (runnerState->ctrlDoneEvent != NULL) {
+    FLAGCXCHECK(deviceAdaptor->eventDestroy(runnerState->ctrlDoneEvent));
+    runnerState->ctrlDoneEvent = NULL;
+  }
+  if (runnerState->commDoneEvent != NULL) {
+    FLAGCXCHECK(deviceAdaptor->eventDestroy(runnerState->commDoneEvent));
+    runnerState->commDoneEvent = NULL;
+  }
 
   if (runnerState->fifo != NULL) {
     FLAGCXCHECK(runnerState->fifo->flagcxRedFifoDestroy());
@@ -772,6 +849,8 @@ destroyUniRunnerRuntimeResources(flagcxUniRunnerState *runnerState,
     hcomm->uniRunnerFifoBuffer = NULL;
   }
   runnerState->runtimeInitialized = false;
+  runnerState->completionEventsInitialized = false;
+  runnerState->invocationInFlight = false;
   return flagcxSuccess;
 }
 
@@ -4036,9 +4115,22 @@ cleanupUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
   return flagcxSuccess;
 }
 
+static flagcxResult_t
+cleanupUniRunnerCompletedInvocation(flagcxUniRunnerState *runnerState,
+                                    flagcxComm_t comm) {
+  FLAGCXCHECK(cleanupUniRunnerDevApiResources(runnerState, comm));
+  FLAGCXCHECK(cleanupDagScheduler(runnerState));
+  runnerState->streamFlagsSize = 0;
+  runnerState->entryFlagsSize = 0;
+  return flagcxSuccess;
+}
+
 flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
+  FLAGCXCHECK(drainUniRunnerPendingInvocation(runnerState, comm));
+
   runnerState->dagNodes = NULL;
   runnerState->numDagNodes = 0;
   runnerState->streamFlagsSize = 0;
@@ -4063,9 +4155,6 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
   runnerState->uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
 
-  // Set device context
-  FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
-
   FLAGCXCHECK(ensureUniRunnerRuntimeResources(runnerState, hcomm));
 
   // Initialize queues
@@ -4080,6 +4169,11 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  if (runnerState->invocationInFlight) {
+    return flagcxSuccess;
+  }
+
   flagcxStream_t commStream = hcomm->proxyState->uniRunnerState.commStream;
   flagcxStream_t redStream = hcomm->proxyState->uniRunnerState.redStream;
   flagcxStream_t cpyStream = hcomm->proxyState->uniRunnerState.cpyStream;
@@ -4114,12 +4208,7 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
     return syncRes;
   }
 
-  FLAGCXCHECK(cleanupUniRunnerDevApiResources(
-      &hcomm->proxyState->uniRunnerState, comm));
-  FLAGCXCHECK(cleanupDagScheduler(&hcomm->proxyState->uniRunnerState));
-
-  hcomm->proxyState->uniRunnerState.streamFlagsSize = 0;
-  hcomm->proxyState->uniRunnerState.entryFlagsSize = 0;
+  FLAGCXCHECK(cleanupUniRunnerCompletedInvocation(runnerState, comm));
 
   return flagcxSuccess;
 }
@@ -4157,54 +4246,15 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
 
     FLAGCXCHECK(processReadyQueue(runnerState, hcomm));
   }
-  flagcxResult_t redSyncRes =
-      deviceAdaptor->streamSynchronize(runnerState->redStream);
-  if (redSyncRes != flagcxSuccess && redSyncRes != flagcxInProgress) {
-    WARN("runUniRunner: rank %d redStream sync after scheduling failed (%d) "
-         "hasDevApi=%d",
-         comm->rank, redSyncRes, runnerState->hasDevApiNodes ? 1 : 0);
-  }
-  flagcxResult_t cpySyncRes =
-      deviceAdaptor->streamSynchronize(runnerState->cpyStream);
-  if (cpySyncRes != flagcxSuccess && cpySyncRes != flagcxInProgress) {
-    WARN("runUniRunner: rank %d cpyStream sync after scheduling failed (%d)",
-         comm->rank, cpySyncRes);
-  }
-  flagcxResult_t ctrlSyncRes =
-      deviceAdaptor->streamSynchronize(runnerState->ctrlStream);
-  if (ctrlSyncRes != flagcxSuccess && ctrlSyncRes != flagcxInProgress) {
-    WARN("runUniRunner: rank %d ctrlStream sync after scheduling failed (%d)",
-         comm->rank, ctrlSyncRes);
-  }
-  flagcxResult_t commSyncRes =
-      deviceAdaptor->streamSynchronize(runnerState->commStream);
-  if (commSyncRes != flagcxSuccess && commSyncRes != flagcxInProgress) {
-    WARN("runUniRunner: rank %d commStream sync after scheduling failed (%d)",
-         comm->rank, commSyncRes);
-  }
-
-  if (runnerState->hasDevApiNodes) {
-    if (redSyncRes != flagcxSuccess || cpySyncRes != flagcxSuccess ||
-        ctrlSyncRes != flagcxSuccess || commSyncRes != flagcxSuccess) {
-      WARN("runUniRunner: rank %d DevApi local stream sync failed "
-           "(red=%d cpy=%d ctrl=%d comm=%d)",
-           comm->rank, redSyncRes, cpySyncRes, ctrlSyncRes, commSyncRes);
-      return redSyncRes != flagcxSuccess ? redSyncRes
-             : cpySyncRes != flagcxSuccess ? cpySyncRes
-             : ctrlSyncRes != flagcxSuccess ? ctrlSyncRes
-                                            : commSyncRes;
-    }
-  }
-
-  return flagcxSuccess;
+  return recordUniRunnerInvocationCompletion(runnerState);
 }
 
 flagcxResult_t
 cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState,
                                 flagcxComm_t comm) {
   flagcxHeteroComm_t hcomm = comm != NULL ? comm->heteroComm : NULL;
-  FLAGCXCHECK(cleanupUniRunnerDevApiResources(runnerState, comm));
-  FLAGCXCHECK(cleanupDagScheduler(runnerState));
+  FLAGCXCHECK(drainUniRunnerPendingInvocation(runnerState, comm));
+  FLAGCXCHECK(cleanupUniRunnerCompletedInvocation(runnerState, comm));
   FLAGCXCHECK(destroyUniRunnerDevApiSyncResources(runnerState, comm));
   FLAGCXCHECK(destroyEntryFlagQueue(runnerState));
   FLAGCXCHECK(destroyStreamFlagQueue(runnerState));
