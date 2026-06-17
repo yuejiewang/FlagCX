@@ -1157,6 +1157,13 @@ flagcxResult_t flagcxCommDeregister(const flagcxComm_t comm, void *handle) {
 
   void *regKey =
       comm->heteroComm ? (void *)comm->heteroComm : (void *)comm->homoComm;
+  if (comm->heteroComm != nullptr && comm->heteroComm->proxyState != nullptr) {
+    flagcxUniRunnerState *uniRunnerState =
+        &comm->heteroComm->proxyState->uniRunnerState;
+    FLAGCXCHECK(invalidateUniRunnerDevMemCache(
+        uniRunnerState, comm, reinterpret_cast<void *>(regItem->beginAddr),
+        regItem->endAddr - regItem->beginAddr));
+  }
 
   // Backend-specific deregistration (homo path)
   uintptr_t thisCommKey = reinterpret_cast<uintptr_t>(regKey);
@@ -2090,7 +2097,8 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
           uniRunnerState->entryFlagsCapacity != 0 ||
           uniRunnerState->devApiSyncMem != NULL ||
           uniRunnerState->devApiSyncFlags != NULL ||
-          uniRunnerState->devApiSyncFlagsSize != 0) {
+          uniRunnerState->devApiSyncFlagsSize != 0 ||
+          uniRunnerState->devApiMemCacheSize != 0) {
         FLAGCXCHECK(deviceAdaptor->setDevice(comm->heteroComm->cudaDev));
         FLAGCXCHECK(cleanupUniRunnerPersistentState(uniRunnerState, comm));
       }

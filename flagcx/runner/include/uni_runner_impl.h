@@ -143,6 +143,14 @@ struct uniRunnerDagNode {
   } nodeData;
 };
 
+#define FLAGCX_UNIRUNNER_DEVMEM_CACHE_CAPACITY 16
+
+struct uniRunnerDevMemCacheEntry {
+  void *base;
+  size_t bytes;
+  flagcxDevMem_t devMem;
+};
+
 typedef struct {
   pthread_t thread;
   flagcxFifo_t fifo;
@@ -199,10 +207,16 @@ typedef struct {
   flagcxDevMem_t devApiInputMem;
   flagcxDevMem_t devApiOutputMem;
   flagcxDevMem_t devApiScratchMem;
+  bool devApiInputMemCached;
+  bool devApiOutputMemCached;
+  bool devApiScratchMemCached;
   flagcxDevMem_t devApiSyncMem;
   void *devApiSyncFlags;
   size_t devApiSyncFlagsSize;
   uint64_t devApiSyncNextValue;
+  struct uniRunnerDevMemCacheEntry
+      devApiMemCache[FLAGCX_UNIRUNNER_DEVMEM_CACHE_CAPACITY];
+  int devApiMemCacheSize;
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
@@ -251,5 +265,8 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm);
 flagcxResult_t
 cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState,
                                 flagcxComm_t comm = NULL);
+flagcxResult_t invalidateUniRunnerDevMemCache(flagcxUniRunnerState *runnerState,
+                                              flagcxComm_t comm, void *base,
+                                              size_t bytes);
 flagcxResult_t runUniRunner(flagcxComm_t comm);
 #endif // FLAGCX_UNIRUNNER_IMPL_H_

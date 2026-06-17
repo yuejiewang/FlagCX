@@ -478,7 +478,8 @@ flagcxResult_t flagcxHeteroCommDestroy(flagcxHeteroComm_t comm) {
       comm->proxyState->uniRunnerState.entryFlagsCapacity != 0 ||
       comm->proxyState->uniRunnerState.devApiSyncMem != NULL ||
       comm->proxyState->uniRunnerState.devApiSyncFlags != NULL ||
-      comm->proxyState->uniRunnerState.devApiSyncFlagsSize != 0) {
+      comm->proxyState->uniRunnerState.devApiSyncFlagsSize != 0 ||
+      comm->proxyState->uniRunnerState.devApiMemCacheSize != 0) {
     FLAGCXCHECK(deviceAdaptor->setDevice(comm->cudaDev));
     FLAGCXCHECK(
         cleanupUniRunnerPersistentState(&comm->proxyState->uniRunnerState));

@@ -6,6 +6,7 @@
 #include "net.h"
 #include "p2p.h"
 #include "proxy.h"
+#include "reg_pool.h"
 #include "dev_comm_state.h"
 #include "device_api/flagcx_device_internal.h"
 #include "socket.h"
@@ -3763,6 +3764,124 @@ static flagcxResult_t createUniRunnerInvocationDevMem(flagcxComm_t comm,
   return flagcxDevMemCreate(comm, base, bytes, NULL, devMem);
 }
 
+static bool isUniRunnerDevMemCacheable(flagcxComm_t comm, void *base) {
+  if (comm == NULL || base == NULL) {
+    return false;
+  }
+  void *regKey =
+      comm->heteroComm ? (void *)comm->heteroComm : (void *)comm->homoComm;
+  return globalRegPool.getItem(regKey, base) != NULL;
+}
+
+static flagcxResult_t
+acquireUniRunnerDevMem(flagcxUniRunnerState *runnerState, flagcxComm_t comm,
+                       void *base, size_t bytes, flagcxDevMem_t *devMem,
+                       bool *fromCache) {
+  if (devMem == NULL || fromCache == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *devMem = NULL;
+  *fromCache = false;
+  if (base == NULL || bytes == 0) {
+    return flagcxSuccess;
+  }
+
+  if (!isUniRunnerDevMemCacheable(comm, base)) {
+    return createUniRunnerInvocationDevMem(comm, base, bytes, devMem);
+  }
+
+  for (int i = 0; i < runnerState->devApiMemCacheSize; ++i) {
+    uniRunnerDevMemCacheEntry *entry = &runnerState->devApiMemCache[i];
+    if (entry->base == base && entry->bytes == bytes && entry->devMem != NULL) {
+      *devMem = entry->devMem;
+      *fromCache = true;
+      return flagcxSuccess;
+    }
+  }
+
+  if (runnerState->devApiMemCacheSize >=
+      FLAGCX_UNIRUNNER_DEVMEM_CACHE_CAPACITY) {
+    WARN("uniRunner DevApi mem cache full; using invocation-local DevMem for "
+         "base=%p bytes=%zu",
+         base, bytes);
+    return createUniRunnerInvocationDevMem(comm, base, bytes, devMem);
+  }
+
+  flagcxDevMem_t cachedMem = NULL;
+  FLAGCXCHECK(createUniRunnerInvocationDevMem(comm, base, bytes, &cachedMem));
+  int idx = runnerState->devApiMemCacheSize++;
+  runnerState->devApiMemCache[idx].base = base;
+  runnerState->devApiMemCache[idx].bytes = bytes;
+  runnerState->devApiMemCache[idx].devMem = cachedMem;
+  *devMem = cachedMem;
+  *fromCache = true;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+destroyUniRunnerDevMemCache(flagcxUniRunnerState *runnerState,
+                            flagcxComm_t comm) {
+  if (runnerState == NULL) {
+    return flagcxSuccess;
+  }
+  for (int i = 0; i < runnerState->devApiMemCacheSize; ++i) {
+    uniRunnerDevMemCacheEntry *entry = &runnerState->devApiMemCache[i];
+    if (entry->devMem != NULL) {
+      FLAGCXCHECK(flagcxDevMemDestroy(comm, entry->devMem));
+      entry->devMem = NULL;
+    }
+    entry->base = NULL;
+    entry->bytes = 0;
+  }
+  runnerState->devApiMemCacheSize = 0;
+  return flagcxSuccess;
+}
+
+flagcxResult_t invalidateUniRunnerDevMemCache(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm, void *base,
+    size_t bytes) {
+  if (runnerState == NULL || base == NULL || bytes == 0) {
+    return flagcxSuccess;
+  }
+
+  uintptr_t begin = reinterpret_cast<uintptr_t>(base);
+  uintptr_t end = begin + bytes;
+  if (end <= begin) {
+    return flagcxInvalidArgument;
+  }
+
+  FLAGCXCHECK(drainUniRunnerPendingInvocation(runnerState, comm));
+
+  int writeIdx = 0;
+  for (int readIdx = 0; readIdx < runnerState->devApiMemCacheSize; ++readIdx) {
+    uniRunnerDevMemCacheEntry *entry = &runnerState->devApiMemCache[readIdx];
+    uintptr_t entryBegin = reinterpret_cast<uintptr_t>(entry->base);
+    uintptr_t entryEnd = entryBegin + entry->bytes;
+    bool overlaps = entry->base != NULL && entry->bytes != 0 &&
+                    entryBegin < end && begin < entryEnd;
+
+    if (overlaps) {
+      if (entry->devMem != NULL) {
+        FLAGCXCHECK(flagcxDevMemDestroy(comm, entry->devMem));
+      }
+      entry->base = NULL;
+      entry->bytes = 0;
+      entry->devMem = NULL;
+      continue;
+    }
+
+    if (writeIdx != readIdx) {
+      runnerState->devApiMemCache[writeIdx] = *entry;
+      entry->base = NULL;
+      entry->bytes = 0;
+      entry->devMem = NULL;
+    }
+    writeIdx++;
+  }
+  runnerState->devApiMemCacheSize = writeIdx;
+  return flagcxSuccess;
+}
+
 static flagcxResult_t
 destroyUniRunnerDevApiSyncResources(flagcxUniRunnerState *runnerState,
                                     flagcxComm_t comm) {
@@ -3934,20 +4053,24 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
   runnerState->devApiInputMem = NULL;
   runnerState->devApiOutputMem = NULL;
   runnerState->devApiScratchMem = NULL;
+  runnerState->devApiInputMemCached = false;
+  runnerState->devApiOutputMemCached = false;
+  runnerState->devApiScratchMemCached = false;
 
   if (!runnerState->hasDevApiNodes) {
     return flagcxSuccess;
   }
 
-  FLAGCXCHECK(createUniRunnerInvocationDevMem(
-      comm, const_cast<void *>(runnerState->inputBase), runnerState->inputBytes,
-      &runnerState->devApiInputMem));
-  FLAGCXCHECK(createUniRunnerInvocationDevMem(
-      comm, runnerState->outputBase, runnerState->outputBytes,
-      &runnerState->devApiOutputMem));
-  FLAGCXCHECK(createUniRunnerInvocationDevMem(
-      comm, runnerState->scratchBase, runnerState->scratchBytes,
-      &runnerState->devApiScratchMem));
+  FLAGCXCHECK(acquireUniRunnerDevMem(
+      runnerState, comm, const_cast<void *>(runnerState->inputBase),
+      runnerState->inputBytes,
+      &runnerState->devApiInputMem, &runnerState->devApiInputMemCached));
+  FLAGCXCHECK(acquireUniRunnerDevMem(
+      runnerState, comm, runnerState->outputBase, runnerState->outputBytes,
+      &runnerState->devApiOutputMem, &runnerState->devApiOutputMemCached));
+  FLAGCXCHECK(acquireUniRunnerDevMem(
+      runnerState, comm, runnerState->scratchBase, runnerState->scratchBytes,
+      &runnerState->devApiScratchMem, &runnerState->devApiScratchMemCached));
 
   size_t requiredSyncBytes =
       static_cast<size_t>(runnerState->numDagNodes) * 2 * sizeof(uint64_t);
@@ -4100,18 +4223,24 @@ cleanupUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
     }
   }
 
-  if (runnerState->devApiScratchMem != NULL) {
+  if (runnerState->devApiScratchMem != NULL &&
+      !runnerState->devApiScratchMemCached) {
     FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiScratchMem));
-    runnerState->devApiScratchMem = NULL;
   }
-  if (runnerState->devApiOutputMem != NULL) {
+  if (runnerState->devApiOutputMem != NULL &&
+      !runnerState->devApiOutputMemCached) {
     FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiOutputMem));
-    runnerState->devApiOutputMem = NULL;
   }
-  if (runnerState->devApiInputMem != NULL) {
+  if (runnerState->devApiInputMem != NULL &&
+      !runnerState->devApiInputMemCached) {
     FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiInputMem));
-    runnerState->devApiInputMem = NULL;
   }
+  runnerState->devApiScratchMem = NULL;
+  runnerState->devApiOutputMem = NULL;
+  runnerState->devApiInputMem = NULL;
+  runnerState->devApiScratchMemCached = false;
+  runnerState->devApiOutputMemCached = false;
+  runnerState->devApiInputMemCached = false;
   return flagcxSuccess;
 }
 
@@ -4255,6 +4384,7 @@ cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState,
   flagcxHeteroComm_t hcomm = comm != NULL ? comm->heteroComm : NULL;
   FLAGCXCHECK(drainUniRunnerPendingInvocation(runnerState, comm));
   FLAGCXCHECK(cleanupUniRunnerCompletedInvocation(runnerState, comm));
+  FLAGCXCHECK(destroyUniRunnerDevMemCache(runnerState, comm));
   FLAGCXCHECK(destroyUniRunnerDevApiSyncResources(runnerState, comm));
   FLAGCXCHECK(destroyEntryFlagQueue(runnerState));
   FLAGCXCHECK(destroyStreamFlagQueue(runnerState));
