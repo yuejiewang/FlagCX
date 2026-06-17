@@ -2081,7 +2081,8 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
         comm->heteroComm->proxyState != nullptr) {
       flagcxUniRunnerState *uniRunnerState =
           &comm->heteroComm->proxyState->uniRunnerState;
-      if (uniRunnerState->streamFlagsPool != NULL ||
+      if (uniRunnerState->runtimeInitialized ||
+          uniRunnerState->streamFlagsPool != NULL ||
           uniRunnerState->streamFlags != NULL ||
           uniRunnerState->streamFlagsCapacity != 0 ||
           uniRunnerState->entryFlagsPool != NULL ||

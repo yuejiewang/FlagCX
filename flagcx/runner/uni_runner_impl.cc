@@ -704,6 +704,77 @@ destroyEntryFlagQueue(flagcxUniRunnerState *runnerState) {
   return flagcxSuccess;
 }
 
+static flagcxResult_t resetUniRunnerFifo(flagcxUniRunnerState *runnerState) {
+  if (runnerState == NULL || runnerState->fifo == NULL ||
+      runnerState->fifo->buffer == NULL) {
+    return flagcxSuccess;
+  }
+
+  uint64_t *buffer = runnerState->fifo->buffer;
+  uint64_t capacity = buffer[flagcxFifoIdxCapacity];
+  buffer[flagcxFifoIdxConsumed] = 0;
+  buffer[flagcxFifoIdxProduced] = 0;
+  buffer[flagcxFifoIdxTerminate] = 0;
+  memset((void *)(buffer + flagcxFifoIdxData), 0,
+         capacity * sizeof(flagcxReduceTrigger));
+  __sync_synchronize();
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+ensureUniRunnerRuntimeResources(flagcxUniRunnerState *runnerState,
+                                flagcxHeteroComm_t hcomm) {
+  if (runnerState == NULL || hcomm == NULL) {
+    return flagcxInvalidArgument;
+  }
+  if (runnerState->runtimeInitialized) {
+    return resetUniRunnerFifo(runnerState);
+  }
+
+  runnerState->fifo = new flagcxFifo();
+  FLAGCXCHECK(runnerState->fifo->flagcxRedFifoInit());
+  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
+      &hcomm->uniRunnerFifoBuffer, (void *)runnerState->fifo->buffer));
+
+  FLAGCXCHECK(deviceAdaptor->streamCreate(&runnerState->redStream));
+  FLAGCXCHECK(deviceAdaptor->streamCreate(&runnerState->cpyStream));
+  FLAGCXCHECK(deviceAdaptor->streamCreate(&runnerState->ctrlStream));
+  runnerState->runtimeInitialized = true;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+destroyUniRunnerRuntimeResources(flagcxUniRunnerState *runnerState,
+                                 flagcxHeteroComm_t hcomm) {
+  if (runnerState == NULL) {
+    return flagcxSuccess;
+  }
+
+  if (runnerState->redStream != NULL) {
+    FLAGCXCHECK(deviceAdaptor->streamDestroy(runnerState->redStream));
+    runnerState->redStream = NULL;
+  }
+  if (runnerState->cpyStream != NULL) {
+    FLAGCXCHECK(deviceAdaptor->streamDestroy(runnerState->cpyStream));
+    runnerState->cpyStream = NULL;
+  }
+  if (runnerState->ctrlStream != NULL) {
+    FLAGCXCHECK(deviceAdaptor->streamDestroy(runnerState->ctrlStream));
+    runnerState->ctrlStream = NULL;
+  }
+
+  if (runnerState->fifo != NULL) {
+    FLAGCXCHECK(runnerState->fifo->flagcxRedFifoDestroy());
+    delete runnerState->fifo;
+    runnerState->fifo = NULL;
+  }
+  if (hcomm != NULL) {
+    hcomm->uniRunnerFifoBuffer = NULL;
+  }
+  runnerState->runtimeInitialized = false;
+  return flagcxSuccess;
+}
+
 static inline flagcxStream_t
 getDagNodeExecutionStream(flagcxUniRunnerState *runnerState,
                           const uniRunnerDagNode *node) {
@@ -3995,29 +4066,13 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   // Set device context
   FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
 
-  // Create FIFO
-  runnerState->fifo = new flagcxFifo();
-  FLAGCXCHECK(runnerState->fifo->flagcxRedFifoInit());
-  // hcomm->proxyState->uniRunnerState.fifo->buffer is the host pointer
-  // hcomm->uniRunnerFifoBuffer stores the device pointer to fifo buffer
-  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
-      &hcomm->uniRunnerFifoBuffer, (void *)runnerState->fifo->buffer));
+  FLAGCXCHECK(ensureUniRunnerRuntimeResources(runnerState, hcomm));
 
   // Initialize queues
   flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
   flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
   runnerState->numPendingNodes = 0;
 
-  // Create dedicated reduce and copy streams
-  flagcxStream_t redStream;
-  FLAGCXCHECK(deviceAdaptor->streamCreate(&redStream));
-  flagcxStream_t cpyStream;
-  FLAGCXCHECK(deviceAdaptor->streamCreate(&cpyStream));
-  flagcxStream_t ctrlStream;
-  FLAGCXCHECK(deviceAdaptor->streamCreate(&ctrlStream));
-  runnerState->redStream = redStream;
-  runnerState->cpyStream = cpyStream;
-  runnerState->ctrlStream = ctrlStream;
   runnerState->commStream = stream;
   return flagcxSuccess;
 }
@@ -4065,16 +4120,6 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
 
   hcomm->proxyState->uniRunnerState.streamFlagsSize = 0;
   hcomm->proxyState->uniRunnerState.entryFlagsSize = 0;
-
-  // Destroy streams
-  FLAGCXCHECK(deviceAdaptor->streamDestroy(redStream));
-  FLAGCXCHECK(deviceAdaptor->streamDestroy(cpyStream));
-  FLAGCXCHECK(deviceAdaptor->streamDestroy(ctrlStream));
-
-  // Destroy fifo
-  FLAGCXCHECK(hcomm->proxyState->uniRunnerState.fifo->flagcxRedFifoDestroy());
-  delete hcomm->proxyState->uniRunnerState.fifo;
-  hcomm->uniRunnerFifoBuffer = NULL;
 
   return flagcxSuccess;
 }
@@ -4157,8 +4202,11 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
 flagcxResult_t
 cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState,
                                 flagcxComm_t comm) {
+  flagcxHeteroComm_t hcomm = comm != NULL ? comm->heteroComm : NULL;
+  FLAGCXCHECK(cleanupUniRunnerDevApiResources(runnerState, comm));
   FLAGCXCHECK(cleanupDagScheduler(runnerState));
   FLAGCXCHECK(destroyUniRunnerDevApiSyncResources(runnerState, comm));
   FLAGCXCHECK(destroyEntryFlagQueue(runnerState));
-  return destroyStreamFlagQueue(runnerState);
+  FLAGCXCHECK(destroyStreamFlagQueue(runnerState));
+  return destroyUniRunnerRuntimeResources(runnerState, hcomm);
 }
