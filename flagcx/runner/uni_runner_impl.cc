@@ -4056,6 +4056,8 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
   runnerState->devApiInputMemCached = false;
   runnerState->devApiOutputMemCached = false;
   runnerState->devApiScratchMemCached = false;
+  runnerState->devApiOpsPool = NULL;
+  runnerState->devApiOpsPoolBytes = 0;
 
   if (!runnerState->hasDevApiNodes) {
     return flagcxSuccess;
@@ -4113,13 +4115,42 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
        comm->rank, runnerState->numDagNodes, runnerState->devApiSyncFlags,
        runnerState->devApiSyncFlagsSize, (unsigned long long)syncBase);
 
+  size_t totalOps = 0;
   for (int i = 0; i < runnerState->numDagNodes; i++) {
     uniRunnerDagNode *node = &runnerState->dagNodes[i];
     if (node->nodeType != uniRunnerDagNodeTypeDevApiCpy) {
       continue;
     }
     node->nodeData.devApiCpy.opsDev = NULL;
-    if (node->nodeData.devApiCpy.numOps == 0) {
+    if (node->nodeData.devApiCpy.numOps <= 0) {
+      continue;
+    }
+    size_t nodeOps = static_cast<size_t>(node->nodeData.devApiCpy.numOps);
+    if (nodeOps >
+        (std::numeric_limits<size_t>::max() - totalOps)) {
+      return flagcxInvalidArgument;
+    }
+    totalOps += nodeOps;
+  }
+
+  if (totalOps == 0) {
+    return flagcxSuccess;
+  }
+  if (totalOps >
+      std::numeric_limits<size_t>::max() / sizeof(flagcxDevApiKernelOp)) {
+    return flagcxInvalidArgument;
+  }
+  size_t opsBytes = totalOps * sizeof(flagcxDevApiKernelOp);
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(&runnerState->devApiOpsPool,
+                                          opsBytes, flagcxMemDevice, NULL));
+  runnerState->devApiOpsPoolBytes = opsBytes;
+
+  std::vector<flagcxDevApiKernelOp> ops(totalOps);
+  size_t opCursor = 0;
+  for (int i = 0; i < runnerState->numDagNodes; i++) {
+    uniRunnerDagNode *node = &runnerState->dagNodes[i];
+    if (node->nodeType != uniRunnerDagNodeTypeDevApiCpy ||
+        node->nodeData.devApiCpy.numOps <= 0) {
       continue;
     }
     if (runnerState->devApiOutputMem == NULL) {
@@ -4129,8 +4160,10 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
       return flagcxInvalidArgument;
     }
 
-    std::vector<flagcxDevApiKernelOp> ops(
-        static_cast<size_t>(node->nodeData.devApiCpy.numOps));
+    size_t nodeOffset = opCursor;
+    node->nodeData.devApiCpy.opsDev =
+        static_cast<void *>(static_cast<char *>(runnerState->devApiOpsPool) +
+                            nodeOffset * sizeof(flagcxDevApiKernelOp));
     for (int opIdx = 0; opIdx < node->nodeData.devApiCpy.numOps; opIdx++) {
       const uniRunnerDevApiCpyOpData &srcOp =
           node->nodeData.devApiCpy.ops[opIdx];
@@ -4142,7 +4175,7 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
       if (srcMemHandle == NULL) {
         return flagcxInvalidArgument;
       }
-      flagcxDevApiKernelOp &dstOp = ops[static_cast<size_t>(opIdx)];
+      flagcxDevApiKernelOp &dstOp = ops[opCursor++];
       FLAGCXCHECK(resolveDevApiPeerPtr(comm, srcMemHandle, srcOp.peerRank,
                                        srcOp.buffer.offsetBytes,
                                        &dstOp.srcPtr));
@@ -4194,14 +4227,14 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
              uniRunnerDagBufferTypeToString(srcOp.buffer.bufferType));
       }
     }
-
-    size_t bytes = ops.size() * sizeof(flagcxDevApiKernelOp);
-    FLAGCXCHECK(deviceAdaptor->deviceMalloc(&node->nodeData.devApiCpy.opsDev,
-                                            bytes, flagcxMemDevice, NULL));
-    FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-        node->nodeData.devApiCpy.opsDev, ops.data(), bytes,
-        flagcxMemcpyHostToDevice, NULL, NULL));
   }
+  if (opCursor != totalOps) {
+    return flagcxInternalError;
+  }
+
+  FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+      runnerState->devApiOpsPool, ops.data(), opsBytes,
+      flagcxMemcpyHostToDevice, NULL, NULL));
 
   return flagcxSuccess;
 }
@@ -4213,12 +4246,15 @@ cleanupUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
     return flagcxSuccess;
   }
 
+  if (runnerState->devApiOpsPool != NULL) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->devApiOpsPool,
+                                          flagcxMemDevice, NULL));
+  }
+  runnerState->devApiOpsPool = NULL;
+  runnerState->devApiOpsPoolBytes = 0;
   for (int i = 0; i < runnerState->numDagNodes; i++) {
     uniRunnerDagNode *node = &runnerState->dagNodes[i];
-    if (node->nodeType == uniRunnerDagNodeTypeDevApiCpy &&
-        node->nodeData.devApiCpy.opsDev != NULL) {
-      FLAGCXCHECK(deviceAdaptor->deviceFree(node->nodeData.devApiCpy.opsDev,
-                                            flagcxMemDevice, NULL));
+    if (node->nodeType == uniRunnerDagNodeTypeDevApiCpy) {
       node->nodeData.devApiCpy.opsDev = NULL;
     }
   }
@@ -4274,6 +4310,8 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->devApiInputMem = NULL;
   runnerState->devApiOutputMem = NULL;
   runnerState->devApiScratchMem = NULL;
+  runnerState->devApiOpsPool = NULL;
+  runnerState->devApiOpsPoolBytes = 0;
   if (runnerState->devApiSyncNextValue == 0) {
     runnerState->devApiSyncNextValue = 1;
   }

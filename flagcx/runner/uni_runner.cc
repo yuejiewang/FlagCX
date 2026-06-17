@@ -151,7 +151,7 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
                                              count, datatype, op, comm),
                     res, out);
   }
-  FLAGCXCHECK(runUniRunner(comm));
+  FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
 out:
   FLAGCXCHECK(cleanupUniRunner(comm));
   return res;

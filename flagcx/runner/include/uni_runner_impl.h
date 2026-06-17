@@ -214,6 +214,8 @@ typedef struct {
   void *devApiSyncFlags;
   size_t devApiSyncFlagsSize;
   uint64_t devApiSyncNextValue;
+  void *devApiOpsPool;
+  size_t devApiOpsPoolBytes;
   struct uniRunnerDevMemCacheEntry
       devApiMemCache[FLAGCX_UNIRUNNER_DEVMEM_CACHE_CAPACITY];
   int devApiMemCacheSize;

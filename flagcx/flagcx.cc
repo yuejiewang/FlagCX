@@ -2098,6 +2098,8 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
           uniRunnerState->devApiSyncMem != NULL ||
           uniRunnerState->devApiSyncFlags != NULL ||
           uniRunnerState->devApiSyncFlagsSize != 0 ||
+          uniRunnerState->devApiOpsPool != NULL ||
+          uniRunnerState->devApiOpsPoolBytes != 0 ||
           uniRunnerState->devApiMemCacheSize != 0) {
         FLAGCXCHECK(deviceAdaptor->setDevice(comm->heteroComm->cudaDev));
         FLAGCXCHECK(cleanupUniRunnerPersistentState(uniRunnerState, comm));
