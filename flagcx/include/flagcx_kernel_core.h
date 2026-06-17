@@ -170,20 +170,16 @@ constexpr unsigned int flagcxReduceTriggerBitsFifoReserved = 1;
 struct alignas(16) flagcxDevApiKernelOp {
   uint64_t srcPtr;
   uint64_t dstPtr;
+  uint64_t localReadyPtr;
+  uint64_t peerReadyPtr;
+  uint64_t localDonePtr;
+  uint64_t peerDonePtr;
+  uint64_t syncValue;
   uint64_t offsetBytes;
   uint64_t count;
   int32_t peerRank;
   uint32_t datatype;
   uint64_t nbytes;
-};
-
-struct alignas(16) flagcxDevApiRuntime {
-  int32_t rank;
-  int32_t intraRank;
-  int32_t intraSize;
-  int32_t nBarriers;
-  uint64_t **barrierPeers;
-  uint64_t *epochBuffer;
 };
 
 // Kernel launch configuration constants.

@@ -144,83 +144,79 @@ flagcxCopyBytes(uint8_t *dst, const uint8_t *src, size_t bytes) {
   }
 }
 
-FLAGCX_DEVICE_INLINE_DECORATOR void
-flagcxDevApiBarrierSync(const flagcxDevApiRuntime &runtime,
-                        flagcxCoopBlock coop, uint32_t ctaIndex) {
-  if (runtime.intraSize <= 1) {
-    coop.sync();
+FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevApiStoreSync(uint64_t flagPtr,
+                                                          uint64_t value) {
+  if (flagPtr == 0) {
     return;
   }
-  if (runtime.barrierPeers == nullptr || runtime.epochBuffer == nullptr ||
-      runtime.nBarriers <= 0) {
-    coop.sync();
-    return;
-  }
-
-  uint64_t epoch = DeviceAPI::Atomic::load(
-      &runtime.epochBuffer[ctaIndex], flagcxDeviceMemoryOrderRelaxed);
-  coop.sync();
-
-  for (int i = coop.threadRank(); i < runtime.intraSize - 1; i += coop.size()) {
-    int peer = 1 + runtime.intraRank + i;
-    if (peer >= runtime.intraSize)
-      peer -= runtime.intraSize;
-    uint64_t *slot =
-        &runtime.barrierPeers[peer][runtime.intraRank * runtime.nBarriers +
-                                    static_cast<int>(ctaIndex)];
-    DeviceAPI::Atomic::store(slot, epoch + 1, flagcxDeviceMemoryOrderRelease);
-  }
-
-  for (int i = coop.threadRank(); i < runtime.intraSize - 1; i += coop.size()) {
-    int peer = 1 + runtime.intraRank + i;
-    if (peer >= runtime.intraSize)
-      peer -= runtime.intraSize;
-    uint64_t *slot =
-        &runtime.barrierPeers[runtime.intraRank][peer * runtime.nBarriers +
-                                                 static_cast<int>(ctaIndex)];
-    int iter = 0;
-    while (DeviceAPI::Atomic::load(slot, flagcxDeviceMemoryOrderAcquire) <
-           epoch + 1) {
-      DeviceAPI::Intrin::spinBackoff(iter++);
-    }
-  }
-
-  DeviceAPI::Atomic::store(&runtime.epochBuffer[ctaIndex], epoch + 1,
-                           flagcxDeviceMemoryOrderRelaxed);
-  coop.sync();
+  DeviceAPI::Atomic::store(reinterpret_cast<uint64_t *>(flagPtr), value,
+                           flagcxDeviceMemoryOrderRelease);
 }
 
-FLAGCX_DEVICE_INLINE_DECORATOR void
-flagcxDevApiKernel(uint64_t opsPtr, uint64_t numOps, const void *runtimePtr) {
-  if (opsPtr == 0 || numOps == 0 || runtimePtr == nullptr) {
+FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevApiWaitSync(uint64_t flagPtr,
+                                                         uint64_t value) {
+  if (flagPtr == 0 || value == 0) {
+    return;
+  }
+  int iter = 0;
+  while (DeviceAPI::Atomic::load(reinterpret_cast<uint64_t *>(flagPtr),
+                                 flagcxDeviceMemoryOrderAcquire) < value) {
+    DeviceAPI::Intrin::spinBackoff(iter++);
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevApiKernel(uint64_t opsPtr,
+                                                       uint64_t numOps) {
+  if (opsPtr == 0 || numOps == 0) {
     return;
   }
 
-  const flagcxDevApiRuntime *runtime =
-      reinterpret_cast<const flagcxDevApiRuntime *>(runtimePtr);
   flagcxCoopBlock coop;
   const flagcxDevApiKernelOp *ops =
       reinterpret_cast<const flagcxDevApiKernelOp *>(opsPtr);
 
-  flagcxDevApiBarrierSync(*runtime, coop, FLAGCX_BLOCK_IDX_X);
+  // A DevApiCpy node is executable only after DAG parents are done. Publish
+  // that source-readiness to the next rank before reading from the previous
+  // rank's peer-mapped buffer.
+  coop.sync();
+  FLAGCX_DEVICE_THREAD_FENCE();
+  if (coop.threadRank() == 0) {
+    for (uint64_t i = 0; i < numOps; i++) {
+      const flagcxDevApiKernelOp &op = ops[i];
+      flagcxDevApiStoreSync(op.localReadyPtr, op.syncValue);
+    }
+  }
+  coop.sync();
+
   for (uint64_t i = 0; i < numOps; i++) {
     const flagcxDevApiKernelOp &op = ops[i];
-    if (op.srcPtr == 0 || op.dstPtr == 0 || op.count == 0 || op.nbytes == 0) {
-      continue;
+
+    if (coop.threadRank() == 0) {
+      flagcxDevApiWaitSync(op.peerReadyPtr, op.syncValue);
     }
-    const uint8_t *src = reinterpret_cast<const uint8_t *>(op.srcPtr);
-    uint8_t *dst = reinterpret_cast<uint8_t *>(op.dstPtr);
-    if (src == nullptr || dst == nullptr) {
-      continue;
+    coop.sync();
+
+    if (op.srcPtr != 0 && op.dstPtr != 0 && op.count != 0 && op.nbytes != 0) {
+      const uint8_t *src = reinterpret_cast<const uint8_t *>(op.srcPtr);
+      uint8_t *dst = reinterpret_cast<uint8_t *>(op.dstPtr);
+      if (src != nullptr && dst != nullptr) {
+        flagcxCopyBytes(dst, src, op.nbytes);
+      }
     }
-    flagcxCopyBytes(dst, src, op.nbytes);
+
+    coop.sync();
+    FLAGCX_DEVICE_THREAD_FENCE();
+    if (coop.threadRank() == 0) {
+      // The previous rank may release this slice to its children only after
+      // this copy has finished reading it.
+      flagcxDevApiStoreSync(op.localDonePtr, op.syncValue);
+      flagcxDevApiWaitSync(op.peerDonePtr, op.syncValue);
+    }
+    coop.sync();
   }
-  FLAGCX_DEVICE_SYNC_THREADS();
-  flagcxDevApiBarrierSync(*runtime, coop, FLAGCX_BLOCK_IDX_X);
 }
 
-FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer,
-                                                    const void *devApiRuntimePtr) {
+FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
   FLAGCX_SHARED uint64_t shm[16];
   uint64_t *vBuf = (uint64_t *)fifoBuffer;
   int emptyIter = 0; // backoff counter
@@ -337,7 +333,7 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer,
     uint64_t redop = shm[REDOP_IDX];
     uint64_t type = shm[TYPE_IDX];
     if (type == flagcxCollectiveTriggerTypeDevApi) {
-      flagcxDevApiKernel(fst, count, devApiRuntimePtr);
+      flagcxDevApiKernel(fst, count);
     } else {
       flagcxReduceKernel(fst, snd, out, count, nthreads, datatype, redop);
     }
@@ -354,9 +350,7 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer,
 }
 
 void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
-                                  size_t nblocks, flagcxStream_t stream,
-                                  const void *devApiRuntimePtr) {
+                                  size_t nblocks, flagcxStream_t stream) {
   flagcxCollectiveKernel<<<nblocks, nthreads, 0,
-                           *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(
-      fifoBuffer, devApiRuntimePtr);
+                           *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(fifoBuffer);
 }

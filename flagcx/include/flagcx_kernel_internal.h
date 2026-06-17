@@ -55,13 +55,11 @@ enqueueDevApi(void *fifoBuffer, uint64_t opsPtr, size_t numOps,
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
                                                       int *idx);
 
-FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer,
-                                                    const void *devApiRuntimePtr);
+FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer);
 #endif // COMPILE_KERNEL
 
 void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
-                                  size_t nblocks, flagcxStream_t stream,
-                                  const void *devApiRuntimePtr);
+                                  size_t nblocks, flagcxStream_t stream);
 
 // ==========================================================================
 // Device Communicator — Host-side lifecycle management

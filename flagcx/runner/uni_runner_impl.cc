@@ -38,6 +38,7 @@ FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
 namespace {
 
 constexpr char kUniRunnerDagCachePathEnv[] = "FLAGCX_UNIRUNNER_DAG_CACHE_PATH";
+constexpr int kUniRunnerDevApiFinalBarrierTag = 0xD5A1;
 
 struct uniRunnerDagRuntimeBindings {
   const void *inputBase = NULL;
@@ -3508,24 +3509,19 @@ static flagcxResult_t notifyChildrenScheduled(flagcxUniRunnerState *runnerState,
 static flagcxResult_t
 prepareKernelNodeFlagIn(flagcxUniRunnerState *runnerState,
                         uniRunnerDagNode *current, uint64_t *flagIn) {
-  int externalParentCount = 0;
+  int waitParentCount = 0;
   uint64_t singleFlag = 0;
   for (int i = 0; i < current->numParents; i++) {
     int parentIdx = current->parents[i];
-    uniRunnerDagNode *parent = &runnerState->dagNodes[parentIdx];
-    if (getDagNodeExecutionStream(runnerState, parent) ==
-        runnerState->redStream) {
-      continue;
-    }
     singleFlag = (uintptr_t)getDagNodeFlag(runnerState, parentIdx);
-    externalParentCount++;
+    waitParentCount++;
   }
 
-  if (externalParentCount == 0) {
+  if (waitParentCount == 0) {
     *flagIn = 0;
     return flagcxSuccess;
   }
-  if (externalParentCount == 1) {
+  if (waitParentCount == 1) {
     *flagIn = singleFlag;
     return flagcxSuccess;
   }
@@ -3533,11 +3529,6 @@ prepareKernelNodeFlagIn(flagcxUniRunnerState *runnerState,
   void *entryFlag = getDagNodeEntryFlag(runnerState, current->nodeIdx);
   for (int i = 0; i < current->numParents; i++) {
     int parentIdx = current->parents[i];
-    uniRunnerDagNode *parent = &runnerState->dagNodes[parentIdx];
-    if (getDagNodeExecutionStream(runnerState, parent) ==
-        runnerState->redStream) {
-      continue;
-    }
     void *parentFlag = getDagNodeFlag(runnerState, parentIdx);
     FLAGCXCHECK(deviceAdaptor->streamWaitValue64(
         runnerState->ctrlStream, parentFlag, flagcxStreamFlagDone, 0));
@@ -3551,8 +3542,8 @@ prepareKernelNodeFlagIn(flagcxUniRunnerState *runnerState,
 
 // Process ready queue: submit ready nodes to the corresponding execution
 // stream/FIFO. Child readiness is host-scheduled immediately after submission;
-// same-stream execution dependencies rely on launch order, while cross-stream
-// dependencies are enforced via stream flags.
+// kernel-executed nodes carry explicit flagIn dependencies, while p2p/cpy
+// nodes still use stream order for same-stream parents.
 static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
                                         flagcxHeteroComm_t comm) {
   // process p2pReadyQueue
@@ -3619,20 +3610,6 @@ static flagcxResult_t createUniRunnerInvocationDevMem(flagcxComm_t comm,
     return flagcxSuccess;
   }
   return flagcxDevMemCreate(comm, base, bytes, NULL, devMem);
-}
-
-static flagcxResult_t
-initUniRunnerDevCommRequirements(flagcxComm_t comm,
-                                 flagcxDevCommRequirements *reqs) {
-  *reqs = FLAGCX_DEV_COMM_REQUIREMENTS_INITIALIZER;
-  reqs->intraBarrierCount = FLAGCX_DEVICE_CTA_COUNT;
-  int mcSupported = 0;
-  if (deviceAdaptor->symMulticastSupported)
-    deviceAdaptor->symMulticastSupported(&mcSupported);
-  if (mcSupported)
-    reqs->intraMulticast = true;
-
-  return flagcxSuccess;
 }
 
 static flagcxDevMem_t selectDevApiMemHandle(uniRunnerDagBufferType bufferType,
@@ -3710,83 +3687,16 @@ static flagcxResult_t resolveDevApiPeerPtr(flagcxComm_t comm,
 static flagcxResult_t
 prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
                                 flagcxComm_t comm) {
-  runnerState->devApiDevComm = NULL;
-  runnerState->devApiSavedCommHandle = NULL;
   runnerState->devApiInputMem = NULL;
   runnerState->devApiOutputMem = NULL;
   runnerState->devApiScratchMem = NULL;
-  runnerState->devApiRuntimeDevPtr = NULL;
-  runnerState->devApiOwnsDevComm = false;
+  runnerState->devApiSyncMem = NULL;
+  runnerState->devApiSyncFlags = NULL;
+  runnerState->devApiSyncFlagsSize = 0;
+  runnerState->devApiFinalBarrierDone = false;
 
   if (!runnerState->hasDevApiNodes) {
     return flagcxSuccess;
-  }
-
-  if (comm->devCommState != NULL && comm->devCommState->devComm != NULL &&
-      comm->devCommState->devComm->barrierPeers != NULL &&
-      comm->devCommState->devComm->epochBuffer != NULL &&
-      comm->devCommState->devComm->nBarriers > 0) {
-    runnerState->devApiDevComm = comm->devCommState->devComm;
-    INFO(FLAGCX_UNIRUNNER,
-         "uniRunner DevApi: rank %d reusing comm-level default IPC DevComm %p",
-         comm->rank, runnerState->devApiDevComm);
-  } else {
-    flagcxDevCommRequirements reqs;
-    FLAGCXCHECK(initUniRunnerDevCommRequirements(comm, &reqs));
-    if (comm->heteroComm != NULL) {
-      runnerState->devApiSavedCommHandle = comm->heteroComm->devCommHandle;
-    }
-    INFO(FLAGCX_UNIRUNNER,
-         "uniRunner DevApi: rank %d creating DevComm reqs{intraBarrier=%d "
-         "interBarrier=%d barrier=%d interContext=%d interSignal=%d "
-         "interCounter=%d intraMulticast=%d}",
-         comm->rank, reqs.intraBarrierCount, reqs.interBarrierCount,
-         reqs.barrierCount, reqs.interContextCount, reqs.interSignalCount,
-         reqs.interCounterCount, reqs.intraMulticast ? 1 : 0);
-    flagcxInnerComm_t savedHomoComm = comm->homoComm;
-    comm->homoComm = NULL;
-    flagcxResult_t createRes =
-        flagcxDevCommCreate(comm, &reqs, &runnerState->devApiDevComm);
-    comm->homoComm = savedHomoComm;
-    FLAGCXCHECK(createRes);
-    runnerState->devApiOwnsDevComm = true;
-  }
-
-  if (runnerState->devApiDevComm != NULL) {
-    const flagcxDevCommInternal *devComm = runnerState->devApiDevComm;
-    INFO(FLAGCX_UNIRUNNER,
-         "uniRunner DevApi: rank %d DevComm %p state{rank=%d/%d intra=%d/%d "
-         "barrierPeers=%p epochBuffer=%p nBarriers=%d interSignalFlags=%p "
-         "contextCount=%d nInterPeers=%d vendorDevComm=%p}",
-         comm->rank, devComm, devComm->rank, devComm->nRanks,
-         devComm->intraRank, devComm->intraSize, (void *)devComm->barrierPeers,
-         (void *)devComm->epochBuffer, devComm->nBarriers,
-         (void *)devComm->interSignalFlags, devComm->contextCount,
-         devComm->nInterPeers, devComm->devComm);
-
-    if (devComm->intraSize > 1 &&
-        (devComm->barrierPeers == NULL || devComm->epochBuffer == NULL ||
-         devComm->nBarriers <= 0)) {
-      WARN("uniRunner DevApi: rank %d missing IPC barrier resources for "
-           "DevApiCpy (barrierPeers=%p epochBuffer=%p nBarriers=%d)",
-           comm->rank, (void *)devComm->barrierPeers,
-           (void *)devComm->epochBuffer, devComm->nBarriers);
-      return flagcxNotSupported;
-    }
-
-    flagcxDevApiRuntime runtime = {};
-    runtime.rank = devComm->rank;
-    runtime.intraRank = devComm->intraRank;
-    runtime.intraSize = devComm->intraSize;
-    runtime.nBarriers = devComm->nBarriers;
-    runtime.barrierPeers = devComm->barrierPeers;
-    runtime.epochBuffer = devComm->epochBuffer;
-    FLAGCXCHECK(deviceAdaptor->deviceMalloc(&runnerState->devApiRuntimeDevPtr,
-                                            sizeof(runtime), flagcxMemDevice,
-                                            NULL));
-    FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-        runnerState->devApiRuntimeDevPtr, &runtime, sizeof(runtime),
-        flagcxMemcpyHostToDevice, NULL, NULL));
   }
 
   FLAGCXCHECK(createUniRunnerInvocationDevMem(
@@ -3798,6 +3708,18 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
   FLAGCXCHECK(createUniRunnerInvocationDevMem(
       comm, runnerState->scratchBase, runnerState->scratchBytes,
       &runnerState->devApiScratchMem));
+
+  runnerState->devApiSyncFlagsSize =
+      static_cast<size_t>(runnerState->numDagNodes) * 2 * sizeof(uint64_t);
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(&runnerState->devApiSyncFlags,
+                                          runnerState->devApiSyncFlagsSize,
+                                          flagcxMemDevice, NULL));
+  FLAGCXCHECK(deviceAdaptor->deviceMemset(
+      runnerState->devApiSyncFlags, 0, runnerState->devApiSyncFlagsSize,
+      flagcxMemDevice, NULL));
+  FLAGCXCHECK(createUniRunnerInvocationDevMem(
+      comm, runnerState->devApiSyncFlags, runnerState->devApiSyncFlagsSize,
+      &runnerState->devApiSyncMem));
 
   auto logDevMemState = [&](const char *label, flagcxDevMem_t memHandle,
                             void *base, size_t bytes) {
@@ -3823,10 +3745,14 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
                  runnerState->outputBase, runnerState->outputBytes);
   logDevMemState("scratch", runnerState->devApiScratchMem,
                  runnerState->scratchBase, runnerState->scratchBytes);
+  logDevMemState("sync", runnerState->devApiSyncMem,
+                 runnerState->devApiSyncFlags,
+                 runnerState->devApiSyncFlagsSize);
 
   INFO(FLAGCX_UNIRUNNER,
-       "uniRunner DevApi: rank %d runtimeDevPtr=%p numDagNodes=%d",
-       comm->rank, runnerState->devApiRuntimeDevPtr, runnerState->numDagNodes);
+       "uniRunner DevApi: rank %d numDagNodes=%d syncFlags=%p syncBytes=%zu",
+       comm->rank, runnerState->numDagNodes, runnerState->devApiSyncFlags,
+       runnerState->devApiSyncFlagsSize);
 
   for (int i = 0; i < runnerState->numDagNodes; i++) {
     uniRunnerDagNode *node = &runnerState->dagNodes[i];
@@ -3838,6 +3764,9 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
       continue;
     }
     if (runnerState->devApiOutputMem == NULL) {
+      return flagcxInvalidArgument;
+    }
+    if (runnerState->devApiSyncMem == NULL) {
       return flagcxInvalidArgument;
     }
 
@@ -3861,19 +3790,45 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
       FLAGCXCHECK(resolveDevApiLocalPtr(runnerState->devApiOutputMem,
                                         srcOp.buffer.offsetBytes,
                                         &dstOp.dstPtr));
+      int nextRank = (comm->rank + 1) % comm->nranks;
+      // In dev_sliced_ar every copy reads prevRank. The matching nextRank copy
+      // reads this rank's source slice, so done waits are wired in that
+      // opposite direction.
+      int64_t readyOffset =
+          static_cast<int64_t>(2 * static_cast<size_t>(node->nodeIdx) *
+                               sizeof(uint64_t));
+      int64_t doneOffset =
+          readyOffset + static_cast<int64_t>(sizeof(uint64_t));
+      FLAGCXCHECK(resolveDevApiLocalPtr(runnerState->devApiSyncMem,
+                                        readyOffset, &dstOp.localReadyPtr));
+      FLAGCXCHECK(resolveDevApiPeerPtr(comm, runnerState->devApiSyncMem,
+                                       srcOp.peerRank, readyOffset,
+                                       &dstOp.peerReadyPtr));
+      FLAGCXCHECK(resolveDevApiLocalPtr(runnerState->devApiSyncMem,
+                                        doneOffset, &dstOp.localDonePtr));
+      FLAGCXCHECK(resolveDevApiPeerPtr(comm, runnerState->devApiSyncMem,
+                                       nextRank, doneOffset,
+                                       &dstOp.peerDonePtr));
+      dstOp.syncValue = static_cast<uint64_t>(node->nodeIdx) + 1;
       dstOp.offsetBytes = static_cast<uint64_t>(srcOp.buffer.offsetBytes);
       dstOp.count = static_cast<uint64_t>(srcOp.count);
       dstOp.peerRank = srcOp.peerRank;
       dstOp.datatype = static_cast<uint32_t>(srcOp.datatype);
-      dstOp.nbytes =
-          static_cast<uint64_t>(srcOp.count * getFlagcxDataTypeSize(srcOp.datatype));
+      dstOp.nbytes = static_cast<uint64_t>(
+          srcOp.count * getFlagcxDataTypeSize(srcOp.datatype));
       if (i < 4) {
         INFO(FLAGCX_UNIRUNNER,
              "uniRunner DevApi: rank %d node %d op %d host->kernel "
-             "srcPtr=%p dstPtr=%p offset=%llu count=%llu "
+             "srcPtr=%p dstPtr=%p ready=%p peerReady=%p done=%p "
+             "peerDone=%p syncValue=%llu offset=%llu count=%llu "
              "peerRank=%d datatype=%u nbytes=%llu bufferType=%s",
              comm->rank, i, opIdx, (void *)(uintptr_t)dstOp.srcPtr,
              (void *)(uintptr_t)dstOp.dstPtr,
+             (void *)(uintptr_t)dstOp.localReadyPtr,
+             (void *)(uintptr_t)dstOp.peerReadyPtr,
+             (void *)(uintptr_t)dstOp.localDonePtr,
+             (void *)(uintptr_t)dstOp.peerDonePtr,
+             (unsigned long long)dstOp.syncValue,
              (unsigned long long)dstOp.offsetBytes,
              (unsigned long long)dstOp.count, dstOp.peerRank, dstOp.datatype,
              (unsigned long long)dstOp.nbytes,
@@ -3899,12 +3854,6 @@ cleanupUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
     return flagcxSuccess;
   }
 
-  if (runnerState->devApiRuntimeDevPtr != NULL) {
-    FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->devApiRuntimeDevPtr,
-                                          flagcxMemDevice, NULL));
-    runnerState->devApiRuntimeDevPtr = NULL;
-  }
-
   for (int i = 0; i < runnerState->numDagNodes; i++) {
     uniRunnerDagNode *node = &runnerState->dagNodes[i];
     if (node->nodeType == uniRunnerDagNodeTypeDevApiCpy &&
@@ -3915,6 +3864,21 @@ cleanupUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
     }
   }
 
+  if (runnerState->devApiSyncMem != NULL) {
+    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiSyncMem));
+    runnerState->devApiSyncMem = NULL;
+  }
+  if (runnerState->devApiSyncFlags != NULL) {
+    if (!runnerState->devApiFinalBarrierDone) {
+      WARN("uniRunner DevApi: rank %d deferring sync flag free without final "
+           "barrier; this should only happen on an error path",
+           comm != NULL ? comm->rank : -1);
+    }
+    flagcxCommDeferFree(comm, runnerState->devApiSyncFlags, flagcxMemDevice);
+    runnerState->devApiSyncFlags = NULL;
+    runnerState->devApiSyncFlagsSize = 0;
+    runnerState->devApiFinalBarrierDone = false;
+  }
   if (runnerState->devApiScratchMem != NULL) {
     FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiScratchMem));
     runnerState->devApiScratchMem = NULL;
@@ -3927,16 +3891,6 @@ cleanupUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
     FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiInputMem));
     runnerState->devApiInputMem = NULL;
   }
-  if (runnerState->devApiOwnsDevComm && runnerState->devApiDevComm != NULL) {
-    FLAGCXCHECK(flagcxDevCommDestroy(comm, runnerState->devApiDevComm));
-    if (comm->heteroComm != NULL) {
-      comm->heteroComm->devCommHandle = runnerState->devApiSavedCommHandle;
-    }
-  }
-  runnerState->devApiDevComm = NULL;
-  runnerState->devApiRuntimeDevPtr = NULL;
-  runnerState->devApiSavedCommHandle = NULL;
-  runnerState->devApiOwnsDevComm = false;
   return flagcxSuccess;
 }
 
@@ -3954,13 +3908,13 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->inputBytes = 0;
   runnerState->outputBytes = 0;
   runnerState->scratchBytes = 0;
-  runnerState->devApiOwnsDevComm = false;
-  runnerState->devApiDevComm = NULL;
-  runnerState->devApiSavedCommHandle = NULL;
   runnerState->devApiInputMem = NULL;
   runnerState->devApiOutputMem = NULL;
   runnerState->devApiScratchMem = NULL;
-  runnerState->devApiRuntimeDevPtr = NULL;
+  runnerState->devApiSyncMem = NULL;
+  runnerState->devApiSyncFlags = NULL;
+  runnerState->devApiSyncFlagsSize = 0;
+  runnerState->devApiFinalBarrierDone = false;
 
   runnerState->uniRunnerNSlices = flagcxParamUniRunnerNSlices();
   runnerState->uniRunnerNThreads = flagcxParamUniRunnerNThreads();
@@ -4011,12 +3965,9 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
   // the reusable flag-address queue inactive for this invocation.
   flagcxResult_t syncRes = deviceAdaptor->streamSynchronize(redStream);
   if (syncRes != flagcxSuccess && syncRes != flagcxInProgress) {
-    WARN("cleanupUniRunner: rank %d redStream sync failed (%d) hasDevApi=%d "
-         "devComm=%p runtimeDevPtr=%p",
+    WARN("cleanupUniRunner: rank %d redStream sync failed (%d) hasDevApi=%d",
          comm->rank, syncRes,
-         hcomm->proxyState->uniRunnerState.hasDevApiNodes ? 1 : 0,
-         hcomm->proxyState->uniRunnerState.devApiDevComm,
-         hcomm->proxyState->uniRunnerState.devApiRuntimeDevPtr);
+         hcomm->proxyState->uniRunnerState.hasDevApiNodes ? 1 : 0);
     return syncRes;
   }
   syncRes = deviceAdaptor->streamSynchronize(cpyStream);
@@ -4067,14 +4018,13 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   FLAGCXCHECK(prepareDagStreamFlags(runnerState));
   FLAGCXCHECK(prepareDagEntryFlags(runnerState));
   FLAGCXCHECK(prepareUniRunnerDevApiResources(runnerState, comm));
-  size_t kernelBlocks = runnerState->hasDevApiNodes ? 1
-                                                       : runnerState->uniRunnerNBlocks;
+  size_t kernelBlocks = runnerState->uniRunnerNBlocks;
 
 #ifdef COMPILE_KERNEL_HOST
   // Launch collective kernel
-  flagcxLaunchCollectiveKernel(
-      hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads, kernelBlocks,
-      runnerState->redStream, runnerState->devApiRuntimeDevPtr);
+  flagcxLaunchCollectiveKernel(hcomm->uniRunnerFifoBuffer,
+                               runnerState->uniRunnerNThreads, kernelBlocks,
+                               runnerState->redStream);
 #endif
 
   // Main scheduling loop using DAG-based queue scheduling
@@ -4096,9 +4046,8 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
       deviceAdaptor->streamSynchronize(runnerState->redStream);
   if (redSyncRes != flagcxSuccess && redSyncRes != flagcxInProgress) {
     WARN("runUniRunner: rank %d redStream sync after scheduling failed (%d) "
-         "hasDevApi=%d devComm=%p runtimeDevPtr=%p",
-         comm->rank, redSyncRes, runnerState->hasDevApiNodes ? 1 : 0,
-         runnerState->devApiDevComm, runnerState->devApiRuntimeDevPtr);
+         "hasDevApi=%d",
+         comm->rank, redSyncRes, runnerState->hasDevApiNodes ? 1 : 0);
   }
   flagcxResult_t cpySyncRes =
       deviceAdaptor->streamSynchronize(runnerState->cpyStream);
@@ -4117,6 +4066,22 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   if (commSyncRes != flagcxSuccess && commSyncRes != flagcxInProgress) {
     WARN("runUniRunner: rank %d commStream sync after scheduling failed (%d)",
          comm->rank, commSyncRes);
+  }
+
+  if (runnerState->hasDevApiNodes) {
+    if (redSyncRes != flagcxSuccess || cpySyncRes != flagcxSuccess ||
+        ctrlSyncRes != flagcxSuccess || commSyncRes != flagcxSuccess) {
+      WARN("runUniRunner: rank %d skip DevApi final barrier because local "
+           "stream sync failed (red=%d cpy=%d ctrl=%d comm=%d)",
+           comm->rank, redSyncRes, cpySyncRes, ctrlSyncRes, commSyncRes);
+      return redSyncRes != flagcxSuccess ? redSyncRes
+             : cpySyncRes != flagcxSuccess ? cpySyncRes
+             : ctrlSyncRes != flagcxSuccess ? ctrlSyncRes
+                                            : commSyncRes;
+    }
+    FLAGCXCHECK(bootstrapCollBarrier(comm->bootstrap, comm->rank, comm->nranks,
+                                     kUniRunnerDevApiFinalBarrierTag));
+    runnerState->devApiFinalBarrierDone = true;
   }
 
   return flagcxSuccess;

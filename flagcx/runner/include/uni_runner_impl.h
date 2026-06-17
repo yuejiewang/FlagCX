@@ -188,14 +188,14 @@ typedef struct {
   size_t entryFlagsSize;
   size_t entryFlagsCapacity;
 
-  // DeviceAPI runtime resources for kernel-side copy nodes.
-  bool devApiOwnsDevComm;
-  flagcxDevComm_t devApiDevComm;
-  flagcxDevComm_t devApiSavedCommHandle;
+  // DeviceAPI peer-copy resources for kernel-side copy nodes.
   flagcxDevMem_t devApiInputMem;
   flagcxDevMem_t devApiOutputMem;
   flagcxDevMem_t devApiScratchMem;
-  void *devApiRuntimeDevPtr;
+  flagcxDevMem_t devApiSyncMem;
+  void *devApiSyncFlags;
+  size_t devApiSyncFlagsSize;
+  bool devApiFinalBarrierDone;
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
