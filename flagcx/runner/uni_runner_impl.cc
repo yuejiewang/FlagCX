@@ -4202,10 +4202,6 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
                                        nextRank, doneOffset,
                                        &dstOp.peerDonePtr));
       dstOp.syncValue = syncBase + static_cast<uint64_t>(node->nodeIdx);
-      dstOp.offsetBytes = static_cast<uint64_t>(srcOp.buffer.offsetBytes);
-      dstOp.count = static_cast<uint64_t>(srcOp.count);
-      dstOp.peerRank = srcOp.peerRank;
-      dstOp.datatype = static_cast<uint32_t>(srcOp.datatype);
       dstOp.nbytes = static_cast<uint64_t>(
           srcOp.count * getFlagcxDataTypeSize(srcOp.datatype));
       if (i < 4) {
@@ -4221,8 +4217,9 @@ prepareUniRunnerDevApiResources(flagcxUniRunnerState *runnerState,
              (void *)(uintptr_t)dstOp.localDonePtr,
              (void *)(uintptr_t)dstOp.peerDonePtr,
              (unsigned long long)dstOp.syncValue,
-             (unsigned long long)dstOp.offsetBytes,
-             (unsigned long long)dstOp.count, dstOp.peerRank, dstOp.datatype,
+             (unsigned long long)srcOp.buffer.offsetBytes,
+             (unsigned long long)srcOp.count, srcOp.peerRank,
+             static_cast<uint32_t>(srcOp.datatype),
              (unsigned long long)dstOp.nbytes,
              uniRunnerDagBufferTypeToString(srcOp.buffer.bufferType));
       }

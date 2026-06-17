@@ -196,7 +196,7 @@ FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevApiKernel(uint64_t opsPtr,
     }
     coop.sync();
 
-    if (op.srcPtr != 0 && op.dstPtr != 0 && op.count != 0 && op.nbytes != 0) {
+    if (op.srcPtr != 0 && op.dstPtr != 0 && op.nbytes != 0) {
       const uint8_t *src = reinterpret_cast<const uint8_t *>(op.srcPtr);
       uint8_t *dst = reinterpret_cast<uint8_t *>(op.dstPtr);
       if (src != nullptr && dst != nullptr) {

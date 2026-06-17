@@ -175,10 +175,6 @@ struct alignas(16) flagcxDevApiKernelOp {
   uint64_t localDonePtr;
   uint64_t peerDonePtr;
   uint64_t syncValue;
-  uint64_t offsetBytes;
-  uint64_t count;
-  int32_t peerRank;
-  uint32_t datatype;
   uint64_t nbytes;
 };
 
