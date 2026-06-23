@@ -10,6 +10,7 @@
 FLAGCX_PARAM(UniRunnerUseLocRed, "UNIRUNNER_USE_LOCRED", 0);
 FLAGCX_PARAM(UniRunnerUseRingAG, "UNIRUNNER_USE_RINGAG", 0);
 FLAGCX_PARAM(UniRunnerUseSlicedAR, "UNIRUNNER_USE_SLICEDAR", 0);
+FLAGCX_PARAM(UniRunnerUseDevApiTest, "UNIRUNNER_USE_DEVAPI_TEST", 0);
 FLAGCX_PARAM(UniRunnerUseGroupedAG, "UNIRUNNER_USE_GROUPEDAG", 1);
 FLAGCX_PARAM(UniRunnerGroupSize, "UNIRUNNER_GROUPSIZE", 0);
 
@@ -123,7 +124,13 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   FLAGCXCHECK(initUniRunner(comm, stream));
-  if (flagcxParamUniRunnerUseLocRed()) {
+  if (flagcxParamUniRunnerUseDevApiTest()) {
+    /* initialize uniRunnerState for device-api IPC p2p test */
+    FLAGCXCHECKGOTO(initUniRunnerStateDevApiTest(
+                        runnerState, sendbuff, recvbuff, count, datatype, op,
+                        comm),
+                    res, out);
+  } else if (flagcxParamUniRunnerUseLocRed()) {
     /* initialize uniRunnerState for reduce test */
     FLAGCXCHECKGOTO(initUniRunnerStateLocRed(runnerState, sendbuff, recvbuff,
                                              count, datatype, op, comm),

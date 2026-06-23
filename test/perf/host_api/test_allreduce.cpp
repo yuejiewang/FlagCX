@@ -6,10 +6,13 @@ static void collFn(PerfContext &ctx, size_t count) {
 }
 
 static double bwFactorFn(int totalProcs) {
+  const char *envDevApiTest = getenv("FLAGCX_UNIRUNNER_USE_DEVAPI_TEST");
   const char *envLocRed = getenv("FLAGCX_UNIRUNNER_USE_LOCRED");
   const char *envRingAG = getenv("FLAGCX_UNIRUNNER_USE_RINGAG");
   double factor = (double)(2 * (totalProcs - 1)) / (double)(totalProcs);
-  if (envLocRed != NULL && atoi(envLocRed) == 1) {
+  if (envDevApiTest != NULL && atoi(envDevApiTest) == 1) {
+    factor = 1;
+  } else if (envLocRed != NULL && atoi(envLocRed) == 1) {
     factor = 1;
   } else if (envRingAG != NULL && atoi(envRingAG) == 1) {
     factor = (double)(totalProcs - 1) / (double)(totalProcs);
@@ -35,6 +38,7 @@ static void dataInitFn(PerfContext &ctx, size_t size, size_t count) {
 }
 
 static void postIterFn(PerfContext &ctx, size_t size, size_t count) {
+  const char *envDevApiTest = getenv("FLAGCX_UNIRUNNER_USE_DEVAPI_TEST");
   const char *envLocRed = getenv("FLAGCX_UNIRUNNER_USE_LOCRED");
   const char *envRingAG = getenv("FLAGCX_UNIRUNNER_USE_RINGAG");
   memset(ctx.hello, 0, size);
@@ -47,7 +51,21 @@ static void postIterFn(PerfContext &ctx, size_t size, size_t count) {
     }
     printf("\n");
 
-    if (envLocRed != NULL && atoi(envLocRed) == 1) {
+    if (envDevApiTest != NULL && atoi(envDevApiTest) == 1) {
+      /* device-api IPC p2p correctness check */
+      int p2pCorrect = 1;
+      int prevRank = (ctx.proc - 1 + ctx.totalProcs) % ctx.totalProcs;
+      for (size_t i = 0; i < count; i++) {
+        float expected = (float)(i % 10 * (1 << prevRank));
+        if (((float *)ctx.hello)[i] != expected) {
+          printf("rank %d wrong output at offset %lu, expected %f, got %f\n",
+                 ctx.proc, i, expected, ((float *)ctx.hello)[i]);
+          p2pCorrect = 0;
+          break;
+        }
+      }
+      printf("rank %d devapi p2p correctness = %d\n", ctx.proc, p2pCorrect);
+    } else if (envLocRed != NULL && atoi(envLocRed) == 1) {
       /* red correctness check */
       int redCorrect = 1;
       for (size_t i = 0; i < count; i++) {

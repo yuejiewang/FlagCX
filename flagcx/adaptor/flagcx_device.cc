@@ -1224,17 +1224,56 @@ extern "C" flagcxResult_t flagcxDevMemCreate(flagcxComm_t comm, void *buff,
   return flagcxSuccess;
 }
 
+static flagcxResult_t cleanupIpcTableEntry(flagcxComm_t comm, int ipcIndex,
+                                           bool warnIfInUse) {
+  if (comm == nullptr || ipcIndex < 0 || ipcIndex >= FLAGCX_MAX_IPC_ENTRIES) {
+    return flagcxSuccess;
+  }
+
+  struct flagcxIpcTableEntry *e = &comm->ipcTable[ipcIndex];
+  if (e->hostPeerPtrs == nullptr && e->devPeerPtrs == nullptr) {
+    e->inUse = false;
+    e->nPeers = 0;
+    e->basePtr = nullptr;
+    return flagcxSuccess;
+  }
+
+  if (warnIfInUse && e->inUse) {
+    WARN("flagcxCommCleanupIpcTable: entry %d still in use — "
+         "flagcxDevMemDestroy should be called before flagcxCommDestroy",
+         ipcIndex);
+  }
+
+  if (e->hostPeerPtrs != nullptr) {
+    for (int i = 0; i < e->nPeers; i++) {
+      if (e->hostPeerPtrs[i] != nullptr && e->hostPeerPtrs[i] != e->basePtr) {
+        FLAGCXCHECK(deviceAdaptor->ipcMemHandleClose(e->hostPeerPtrs[i]));
+      }
+    }
+    free(e->hostPeerPtrs);
+    e->hostPeerPtrs = nullptr;
+  }
+
+  if (e->devPeerPtrs != nullptr) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(e->devPeerPtrs, flagcxMemDevice,
+                                          NULL));
+    e->devPeerPtrs = nullptr;
+  }
+
+  e->inUse = false;
+  e->nPeers = 0;
+  e->basePtr = nullptr;
+  return flagcxSuccess;
+}
+
 extern "C" flagcxResult_t flagcxDevMemDestroy(flagcxComm_t comm,
                                               flagcxDevMem_t devMem) {
   if (devMem == nullptr) {
     return flagcxSuccess;
   }
 
-  // Mark IPC table entry as no longer in use (actual cleanup deferred to
-  // flagcxCommDestroy.
-  if (comm != nullptr && devMem->ipcIndex >= 0 &&
-      devMem->ipcIndex < FLAGCX_MAX_IPC_ENTRIES) {
-    comm->ipcTable[devMem->ipcIndex].inUse = false;
+  if (devMem->ipcIndex >= 0) {
+    FLAGCXCHECK(cleanupIpcTableEntry(comm, devMem->ipcIndex, false));
   }
 
   // Free window allocation if present
@@ -1376,35 +1415,7 @@ flagcxResult_t flagcxCommCleanupIpcTable(flagcxComm_t comm) {
   }
 
   for (int k = 0; k < FLAGCX_MAX_IPC_ENTRIES; k++) {
-    struct flagcxIpcTableEntry *e = &comm->ipcTable[k];
-    if (e->hostPeerPtrs == nullptr && e->devPeerPtrs == nullptr) {
-      continue; // empty slot
-    }
-
-    if (e->inUse) {
-      WARN("flagcxCommCleanupIpcTable: entry %d still in use — "
-           "flagcxDevMemDestroy should be called before flagcxCommDestroy",
-           k);
-    }
-
-    // Close IPC handles
-    if (e->hostPeerPtrs) {
-      for (int i = 0; i < e->nPeers; i++) {
-        if (e->hostPeerPtrs[i] && e->hostPeerPtrs[i] != e->basePtr) {
-          deviceAdaptor->ipcMemHandleClose(e->hostPeerPtrs[i]);
-        }
-      }
-      free(e->hostPeerPtrs);
-      e->hostPeerPtrs = nullptr;
-    }
-
-    // Free device memory safely
-    if (e->devPeerPtrs) {
-      deviceAdaptor->deviceFree(e->devPeerPtrs, flagcxMemDevice, NULL);
-      e->devPeerPtrs = nullptr;
-    }
-
-    e->inUse = false;
+    FLAGCXCHECK(cleanupIpcTableEntry(comm, k, true));
   }
 
   return flagcxSuccess;

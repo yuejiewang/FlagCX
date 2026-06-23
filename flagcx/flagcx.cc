@@ -2038,6 +2038,13 @@ flagcxResult_t flagcxCommFinalize(flagcxComm_t comm) {
 flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
   FLAGCXCHECK(flagcxEnsureCommReady(comm));
 
+  if (comm->heteroComm != NULL && comm->heteroComm->proxyState != NULL) {
+    FLAGCXCHECK(deviceAdaptor->setDevice(comm->heteroComm->cudaDev));
+    FLAGCXCHECK(
+        cleanupUniRunnerPersistentState(&comm->heteroComm->proxyState
+                                             ->uniRunnerState));
+  }
+
   // Destroy cluster info
   free(comm->clusterIds);
   free(comm->clusterSizes);
@@ -2329,8 +2336,12 @@ flagcxResult_t flagcxAllReduce(const void *sendbuff, void *recvbuff,
                                flagcxStream_t stream) {
   FLAGCXCHECK(flagcxEnsureCommReady(comm));
 
+  const char *devApiTestEnv = flagcxGetEnv("FLAGCX_UNIRUNNER_USE_DEVAPI_TEST");
+  bool useUniRunnerDevApiTest = devApiTestEnv != NULL && devApiTestEnv[0] != '\0' &&
+                                strcmp(devApiTestEnv, "0") != 0;
+
   // Try custom allreduce if registered
-  if (comm->devCommState != NULL &&
+  if (!useUniRunnerDevApiTest && comm->devCommState != NULL &&
       comm->devCommState->customAllReduce != NULL &&
       comm->localRanks == comm->nranks) {
     auto *state = comm->devCommState;

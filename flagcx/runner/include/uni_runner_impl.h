@@ -159,6 +159,22 @@ typedef struct {
   void **streamFlags;
   size_t streamFlagsSize;
   size_t streamFlagsCapacity;
+
+  // Device API resources used by IPC-backed devcpy nodes. DevComm and the flag
+  // pool are communicator-scoped; send/recv DevMem views track the current user
+  // buffers and are refreshed when those buffers change.
+  flagcxComm_t devApiOwner;
+  flagcxDevComm_t devApiComm;
+  flagcxDevMem_t devApiSendMem;
+  flagcxDevMem_t devApiRecvMem;
+  flagcxDevMem_t devApiFlagMem;
+  const void *devApiSendBase;
+  void *devApiRecvBase;
+  size_t devApiDataBytes;
+  void *devApiFlagPool;
+  void **devApiFlags;
+  size_t devApiFlagsSize;
+  size_t devApiFlagsCapacity;
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
@@ -184,6 +200,10 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
                                           size_t count,
                                           flagcxDataType_t datatype,
                                           flagcxRedOp_t op, flagcxComm_t comm);
+flagcxResult_t initUniRunnerStateDevApiTest(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
+    flagcxComm_t comm);
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,

@@ -1,6 +1,8 @@
 #include "uni_runner_impl.h"
 #include "adaptor.h"
+#include "bootstrap.h"
 #include "comm.h"
+#include "device_api/flagcx_device.h"
 #include "flagcx_hetero.h"
 #include "info.h"
 #include "net.h"
@@ -603,6 +605,239 @@ destroyStreamFlagQueue(flagcxUniRunnerState *runnerState) {
   runnerState->streamFlagsSize = 0;
   runnerState->streamFlagsCapacity = 0;
   return flagcxSuccess;
+}
+
+static int getLocalRankForGlobalRank(flagcxComm_t comm, int globalRank) {
+  if (comm == NULL || comm->localRankToRank == NULL) {
+    return -1;
+  }
+  for (int lr = 0; lr < comm->localRanks; lr++) {
+    if (comm->localRankToRank[lr] == globalRank) {
+      return lr;
+    }
+  }
+  return -1;
+}
+
+static void refreshDevApiFlagAddressQueue(flagcxUniRunnerState *runnerState) {
+  if (runnerState->devApiFlagPool == NULL || runnerState->devApiFlags == NULL) {
+    return;
+  }
+
+  char *base = static_cast<char *>(runnerState->devApiFlagPool);
+  for (size_t i = 0; i < runnerState->devApiFlagsCapacity; i++) {
+    runnerState->devApiFlags[i] =
+        static_cast<void *>(base + i * sizeof(uint64_t));
+  }
+}
+
+static flagcxResult_t resizeDevApiFlagAddressQueue(
+    flagcxUniRunnerState *runnerState, size_t newCapacity) {
+  if (newCapacity <= runnerState->devApiFlagsCapacity) {
+    return flagcxSuccess;
+  }
+
+  if (runnerState->devApiFlagsCapacity == 0) {
+    if (runnerState->devApiFlags != NULL) {
+      free(runnerState->devApiFlags);
+      runnerState->devApiFlags = NULL;
+    }
+    FLAGCXCHECK(flagcxCalloc(&runnerState->devApiFlags, newCapacity));
+  } else {
+    FLAGCXCHECK(flagcxRealloc(&runnerState->devApiFlags,
+                              runnerState->devApiFlagsCapacity, newCapacity));
+  }
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+destroyUniRunnerDevApiDataViews(flagcxUniRunnerState *runnerState) {
+  flagcxComm_t comm = runnerState->devApiOwner;
+  if (comm != NULL) {
+    if (runnerState->devApiSendMem != NULL) {
+      FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiSendMem));
+    }
+    if (runnerState->devApiRecvMem != NULL) {
+      FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiRecvMem));
+    }
+  }
+  runnerState->devApiSendMem = NULL;
+  runnerState->devApiRecvMem = NULL;
+  runnerState->devApiSendBase = NULL;
+  runnerState->devApiRecvBase = NULL;
+  runnerState->devApiDataBytes = 0;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+destroyUniRunnerDevApiState(flagcxUniRunnerState *runnerState) {
+  if (runnerState == NULL) {
+    return flagcxSuccess;
+  }
+
+  flagcxComm_t comm = runnerState->devApiOwner;
+  if (comm != NULL && runnerState->devApiComm != NULL) {
+    FLAGCXCHECK(flagcxDevCommDestroy(comm, runnerState->devApiComm));
+  }
+  runnerState->devApiComm = NULL;
+
+  FLAGCXCHECK(destroyUniRunnerDevApiDataViews(runnerState));
+
+  if (comm != NULL && runnerState->devApiFlagMem != NULL) {
+    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiFlagMem));
+  }
+  runnerState->devApiFlagMem = NULL;
+
+  if (runnerState->devApiFlagPool != NULL) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->devApiFlagPool,
+                                          flagcxMemDevice, NULL));
+    runnerState->devApiFlagPool = NULL;
+  }
+  if (runnerState->devApiFlags != NULL) {
+    free(runnerState->devApiFlags);
+    runnerState->devApiFlags = NULL;
+  }
+  runnerState->devApiFlagsSize = 0;
+  runnerState->devApiFlagsCapacity = 0;
+  runnerState->devApiOwner = NULL;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+ensureUniRunnerDevApiComm(flagcxUniRunnerState *runnerState, flagcxComm_t comm) {
+  if (runnerState->devApiComm != NULL) {
+    return flagcxSuccess;
+  }
+  if (comm == NULL || comm->localRanks <= 0) {
+    return flagcxInvalidArgument;
+  }
+
+  flagcxDevCommRequirements reqs = FLAGCX_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  flagcxDevComm_t previousDevCommHandle =
+      comm->heteroComm == NULL ? NULL : comm->heteroComm->devCommHandle;
+  runnerState->devApiOwner = comm;
+  FLAGCXCHECK(flagcxDevCommCreate(comm, &reqs, &runnerState->devApiComm));
+  if (comm->heteroComm != NULL &&
+      previousDevCommHandle != runnerState->devApiComm) {
+    comm->heteroComm->devCommHandle = previousDevCommHandle;
+  }
+  return flagcxSuccess;
+}
+
+static flagcxResult_t ensureUniRunnerDevApiDataViews(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm, const void *sendbuff,
+    void *recvbuff, size_t bytes) {
+  FLAGCXCHECK(ensureUniRunnerDevApiComm(runnerState, comm));
+
+  if (runnerState->devApiSendMem != NULL &&
+      runnerState->devApiRecvMem != NULL &&
+      runnerState->devApiSendBase == sendbuff &&
+      runnerState->devApiRecvBase == recvbuff &&
+      runnerState->devApiDataBytes >= bytes) {
+    return flagcxSuccess;
+  }
+
+  FLAGCXCHECK(destroyUniRunnerDevApiDataViews(runnerState));
+  FLAGCXCHECK(flagcxDevMemCreate(comm, const_cast<void *>(sendbuff), bytes,
+                                 NULL, &runnerState->devApiSendMem));
+  FLAGCXCHECK(flagcxDevMemCreate(comm, recvbuff, bytes, NULL,
+                                 &runnerState->devApiRecvMem));
+  runnerState->devApiSendBase = sendbuff;
+  runnerState->devApiRecvBase = recvbuff;
+  runnerState->devApiDataBytes = bytes;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t ensureUniRunnerDevApiFlags(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm,
+    size_t requiredFlags) {
+  FLAGCXCHECK(ensureUniRunnerDevApiComm(runnerState, comm));
+  if (requiredFlags == 0) {
+    runnerState->devApiFlagsSize = 0;
+    return flagcxSuccess;
+  }
+
+  if (requiredFlags > runnerState->devApiFlagsCapacity) {
+    size_t newCapacity = runnerState->devApiFlagsCapacity == 0
+                             ? 1
+                             : runnerState->devApiFlagsCapacity;
+    while (newCapacity < requiredFlags) {
+      newCapacity *= 2;
+    }
+
+    if (runnerState->devApiFlagMem != NULL) {
+      FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->devApiFlagMem));
+      runnerState->devApiFlagMem = NULL;
+    }
+    if (runnerState->devApiFlagPool != NULL) {
+      FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->devApiFlagPool,
+                                            flagcxMemDevice, NULL));
+      runnerState->devApiFlagPool = NULL;
+    }
+
+    FLAGCXCHECK(resizeDevApiFlagAddressQueue(runnerState, newCapacity));
+    FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+        &runnerState->devApiFlagPool, newCapacity * sizeof(uint64_t),
+        flagcxMemDevice, NULL));
+    runnerState->devApiFlagsCapacity = newCapacity;
+    refreshDevApiFlagAddressQueue(runnerState);
+    FLAGCXCHECK(flagcxDevMemCreate(comm, runnerState->devApiFlagPool,
+                                   newCapacity * sizeof(uint64_t), NULL,
+                                   &runnerState->devApiFlagMem));
+  }
+
+  runnerState->devApiFlagsSize = requiredFlags;
+  FLAGCXCHECK(deviceAdaptor->deviceMemset(runnerState->devApiFlagPool, 0,
+                                          requiredFlags * sizeof(uint64_t),
+                                          flagcxMemDevice, NULL));
+  // Remote signals must not race with another rank's local flag reset.
+  FLAGCXCHECK(deviceAdaptor->deviceSynchronize());
+  FLAGCXCHECK(bootstrapCollBarrier(comm->bootstrap, comm->rank, comm->nranks,
+                                   0xDA71));
+  return flagcxSuccess;
+}
+
+static void *getUniRunnerDevApiPeerPointer(flagcxComm_t comm,
+                                           flagcxDevMem_t devMem,
+                                           int globalRank,
+                                           size_t offsetBytes) {
+  if (comm == NULL || devMem == NULL) {
+    return NULL;
+  }
+
+  int localRank = getLocalRankForGlobalRank(comm, globalRank);
+  if (localRank < 0) {
+    return NULL;
+  }
+  if (localRank == comm->localRank) {
+    return static_cast<void *>(static_cast<char *>(devMem->rawPtr) +
+                               offsetBytes);
+  }
+  if (devMem->ipcIndex < 0 || devMem->ipcIndex >= FLAGCX_MAX_IPC_ENTRIES) {
+    return NULL;
+  }
+  flagcxIpcTableEntry *entry = &comm->ipcTable[devMem->ipcIndex];
+  if (entry->hostPeerPtrs == NULL || localRank >= entry->nPeers ||
+      entry->hostPeerPtrs[localRank] == NULL) {
+    return NULL;
+  }
+  return static_cast<void *>(static_cast<char *>(entry->hostPeerPtrs[localRank]) +
+                             offsetBytes);
+}
+
+static inline void *getUniRunnerDevApiLocalFlag(
+    flagcxUniRunnerState *runnerState, size_t flagIdx) {
+  assert(flagIdx < runnerState->devApiFlagsSize);
+  return runnerState->devApiFlags[flagIdx];
+}
+
+static inline void *getUniRunnerDevApiPeerFlag(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm, int globalRank,
+    size_t flagIdx) {
+  assert(flagIdx < runnerState->devApiFlagsSize);
+  return getUniRunnerDevApiPeerPointer(comm, runnerState->devApiFlagMem,
+                                       globalRank,
+                                       flagIdx * sizeof(uint64_t));
 }
 
 static inline flagcxStream_t
@@ -1838,6 +2073,145 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   return validateDagNodes(runnerState);
 }
 
+static void initDevCpyDagNode(uniRunnerDagNode *node, int nodeIdx,
+                              flagcxDevicePrim prim, void *sendbuff,
+                              void *recvbuff, void *flag, size_t count,
+                              size_t nthreads, flagcxDataType_t datatype,
+                              int peerRank) {
+  node->nodeIdx = nodeIdx;
+  node->nodeType = uniRunnerDagNodeTypeDevCpy;
+  node->nodeData.devcpy.sendbuff = sendbuff;
+  node->nodeData.devcpy.recvbuff = recvbuff;
+  node->nodeData.devcpy.flag = flag;
+  node->nodeData.devcpy.count = count;
+  node->nodeData.devcpy.nthreads = nthreads;
+  node->nodeData.devcpy.datatype = datatype;
+  node->nodeData.devcpy.type = prim;
+  node->nodeData.devcpy.peerRank = peerRank;
+  node->nodeData.devcpy.triggerIdx = -1;
+}
+
+static flagcxResult_t buildUniRunnerStateDevApiTest(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
+    flagcxComm_t comm) {
+  (void)op;
+  if (comm->nranks < 1) {
+    return flagcxInvalidArgument;
+  }
+  if (count == 0) {
+    return flagcxSuccess;
+  }
+  if (comm->localRanks != comm->nranks) {
+    return flagcxNotSupported;
+  }
+
+  const int rank = comm->rank;
+  const int nranks = comm->nranks;
+  const int nextRank = (rank + 1) % nranks;
+  const int prevRank = (rank - 1 + nranks) % nranks;
+  const size_t typeSize = getFlagcxDataTypeSize(datatype);
+  if (typeSize == 0) {
+    return flagcxNotSupported;
+  }
+  const size_t totalBytes = count * typeSize;
+  const size_t putCount = (count + 1) / 2;
+  const size_t getCount = count - putCount;
+  const size_t getOffsetBytes = putCount * typeSize;
+  const int numNodes = getCount == 0 ? 2 : 4;
+
+  FLAGCXCHECK(ensureUniRunnerDevApiDataViews(runnerState, comm, sendbuff,
+                                             recvbuff, totalBytes));
+  FLAGCXCHECK(ensureUniRunnerDevApiFlags(runnerState, comm, 2));
+
+  void *putSrc =
+      getUniRunnerDevApiPeerPointer(comm, runnerState->devApiSendMem, rank, 0);
+  void *putDst = getUniRunnerDevApiPeerPointer(
+      comm, runnerState->devApiRecvMem, nextRank, 0);
+  void *putFlag = getUniRunnerDevApiPeerFlag(runnerState, comm, nextRank, 0);
+  void *waitPutFlag = getUniRunnerDevApiLocalFlag(runnerState, 0);
+  if (putSrc == NULL || putDst == NULL || putFlag == NULL ||
+      waitPutFlag == NULL) {
+    return flagcxNotSupported;
+  }
+
+  void *getSrc = NULL;
+  void *getDst = NULL;
+  void *getFlag = NULL;
+  void *waitGetFlag = NULL;
+  if (getCount != 0) {
+    getSrc = getUniRunnerDevApiPeerPointer(
+        comm, runnerState->devApiSendMem, prevRank, getOffsetBytes);
+    getDst = getUniRunnerDevApiPeerPointer(
+        comm, runnerState->devApiRecvMem, rank, getOffsetBytes);
+    getFlag = getUniRunnerDevApiLocalFlag(runnerState, 1);
+    waitGetFlag = getUniRunnerDevApiLocalFlag(runnerState, 1);
+    if (getSrc == NULL || getDst == NULL || getFlag == NULL ||
+        waitGetFlag == NULL) {
+      return flagcxNotSupported;
+    }
+  }
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initUniRunnerStateDevApiTest count=%lu putCount=%lu "
+        "getCount=%lu prev=%d next=%d",
+        rank, count, putCount, getCount, prevRank, nextRank);
+
+  runnerState->numDagNodes = numNodes;
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                           numNodes * sizeof(struct uniRunnerDagNode)));
+  if (runnerState->dagNodes == NULL) {
+    return flagcxSystemError;
+  }
+
+  initDevCpyDagNode(&runnerState->dagNodes[0], 0, flagcxDevicePrimPut, putSrc,
+                    putDst, putFlag, putCount, runnerState->uniRunnerNThreads,
+                    datatype, nextRank);
+  initDevCpyDagNode(&runnerState->dagNodes[1], 1, flagcxDevicePrimWaitSignal,
+                    NULL, NULL, waitPutFlag, 0,
+                    runnerState->uniRunnerNThreads, datatype, prevRank);
+
+  runnerState->dagNodes[0].numParents = 0;
+  runnerState->dagNodes[0].numChildren = 1;
+  FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[0]));
+  runnerState->dagNodes[0].children[0] = 1;
+  flagcxIntruQueueEnqueue(&runnerState->redReadyQueue,
+                          &runnerState->dagNodes[0]);
+
+  runnerState->dagNodes[1].numParents = 1;
+  runnerState->dagNodes[1].numChildren = getCount == 0 ? 0 : 1;
+  FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[1]));
+  FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[1], 0, 0));
+  if (getCount != 0) {
+    runnerState->dagNodes[1].children[0] = 2;
+  }
+  runnerState->numPendingNodes++;
+
+  if (getCount != 0) {
+    initDevCpyDagNode(&runnerState->dagNodes[2], 2, flagcxDevicePrimGet,
+                      getSrc, getDst, getFlag, getCount,
+                      runnerState->uniRunnerNThreads, datatype, prevRank);
+    initDevCpyDagNode(&runnerState->dagNodes[3], 3,
+                      flagcxDevicePrimWaitSignal, NULL, NULL, waitGetFlag, 0,
+                      runnerState->uniRunnerNThreads, datatype, rank);
+
+    runnerState->dagNodes[2].numParents = 1;
+    runnerState->dagNodes[2].numChildren = 1;
+    FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[2]));
+    FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[2], 0, 1));
+    runnerState->dagNodes[2].children[0] = 3;
+    runnerState->numPendingNodes++;
+
+    runnerState->dagNodes[3].numParents = 1;
+    runnerState->dagNodes[3].numChildren = 0;
+    FLAGCXCHECK(allocDagNodeDeps(&runnerState->dagNodes[3]));
+    FLAGCXCHECK(setDagNodeParent(&runnerState->dagNodes[3], 0, 2));
+    runnerState->numPendingNodes++;
+  }
+
+  return validateDagNodes(runnerState);
+}
+
 static flagcxResult_t buildUniRunnerStateRingRS(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     void *scratchbuff, size_t count, flagcxDataType_t datatype,
@@ -2837,6 +3211,14 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   });
 }
 
+flagcxResult_t initUniRunnerStateDevApiTest(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
+    flagcxComm_t comm) {
+  return buildUniRunnerStateDevApiTest(runnerState, sendbuff, recvbuff, count,
+                                       datatype, op, comm);
+}
+
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,
@@ -3143,6 +3525,8 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
   FLAGCXCHECK(deviceAdaptor->streamSynchronize(cpyStream));
   FLAGCXCHECK(deviceAdaptor->streamSynchronize(commStream));
 
+  FLAGCXCHECK(destroyUniRunnerDevApiDataViews(
+      &hcomm->proxyState->uniRunnerState));
   hcomm->proxyState->uniRunnerState.streamFlagsSize = 0;
 
   // Destroy streams
@@ -3196,5 +3580,6 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
 flagcxResult_t
 cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState) {
   FLAGCXCHECK(cleanupDagScheduler(runnerState));
+  FLAGCXCHECK(destroyUniRunnerDevApiState(runnerState));
   return destroyStreamFlagQueue(runnerState);
 }
