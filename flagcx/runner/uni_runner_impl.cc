@@ -41,9 +41,11 @@ struct uniRunnerDagRuntimeBindings {
   const void *inputBase = NULL;
   void *outputBase = NULL;
   void *scratchBase = NULL;
+  void *flagBase = NULL;
   size_t inputBytes = 0;
   size_t outputBytes = 0;
   size_t scratchBytes = 0;
+  size_t flagBytes = 0;
 };
 
 std::mutex gUniRunnerDagCacheMutex;
@@ -253,6 +255,12 @@ captureBufferRef(const void *ptr, const uniRunnerDagRuntimeBindings &bindings,
     ref->offsetBytes = offsetBytes;
     return flagcxSuccess;
   }
+  if (matchBindingRange(ptr, bindings.flagBase, bindings.flagBytes,
+                        &offsetBytes)) {
+    ref->bufferType = uniRunnerDagBufferTypeFlag;
+    ref->offsetBytes = offsetBytes;
+    return flagcxSuccess;
+  }
   return flagcxInvalidArgument;
 }
 
@@ -276,6 +284,10 @@ resolveBufferRef(const uniRunnerDagBufferRef &ref,
     case uniRunnerDagBufferTypeScratch:
       base = static_cast<const char *>(bindings.scratchBase);
       bytes = bindings.scratchBytes;
+      break;
+    case uniRunnerDagBufferTypeFlag:
+      base = static_cast<const char *>(bindings.flagBase);
+      bytes = bindings.flagBytes;
       break;
     default:
       return flagcxInvalidArgument;
@@ -600,6 +612,7 @@ getDagNodeExecutionStream(flagcxUniRunnerState *runnerState,
     case uniRunnerDagNodeTypeP2p:
       return runnerState->commStream;
     case uniRunnerDagNodeTypeRed:
+    case uniRunnerDagNodeTypeDevCpy:
       return runnerState->redStream;
     case uniRunnerDagNodeTypeCpy:
       return runnerState->cpyStream;
@@ -2491,6 +2504,18 @@ static flagcxResult_t captureUniRunnerDagTemplateFromState(
                                    &nodeDesc.cpy.dst));
       nodeDesc.cpy.count = node->nodeData.cpy.count;
       nodeDesc.cpy.datatype = node->nodeData.cpy.datatype;
+    } else if (node->nodeType == uniRunnerDagNodeTypeDevCpy) {
+      FLAGCXCHECK(captureBufferRef(node->nodeData.devcpy.sendbuff, bindings,
+                                   &nodeDesc.devcpy.sendbuff));
+      FLAGCXCHECK(captureBufferRef(node->nodeData.devcpy.recvbuff, bindings,
+                                   &nodeDesc.devcpy.recvbuff));
+      FLAGCXCHECK(captureBufferRef(node->nodeData.devcpy.flag, bindings,
+                                   &nodeDesc.devcpy.flag));
+      nodeDesc.devcpy.count = node->nodeData.devcpy.count;
+      nodeDesc.devcpy.nthreads = node->nodeData.devcpy.nthreads;
+      nodeDesc.devcpy.peerRank = node->nodeData.devcpy.peerRank;
+      nodeDesc.devcpy.datatype = node->nodeData.devcpy.datatype;
+      nodeDesc.devcpy.type = node->nodeData.devcpy.type;
     } else {
       return flagcxNotSupported;
     }
@@ -2571,12 +2596,26 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
           resolveBufferRef(src.cpy.dst, bindings, &dst->nodeData.cpy.dst));
       dst->nodeData.cpy.count = src.cpy.count;
       dst->nodeData.cpy.datatype = src.cpy.datatype;
+    } else if (dst->nodeType == uniRunnerDagNodeTypeDevCpy) {
+      dst->nodeData.devcpy.triggerIdx = -1;
+      FLAGCXCHECK(resolveBufferRef(src.devcpy.sendbuff, bindings,
+                                   &dst->nodeData.devcpy.sendbuff));
+      FLAGCXCHECK(resolveBufferRef(src.devcpy.recvbuff, bindings,
+                                   &dst->nodeData.devcpy.recvbuff));
+      FLAGCXCHECK(resolveBufferRef(src.devcpy.flag, bindings,
+                                   &dst->nodeData.devcpy.flag));
+      dst->nodeData.devcpy.count = src.devcpy.count;
+      dst->nodeData.devcpy.nthreads = src.devcpy.nthreads;
+      dst->nodeData.devcpy.peerRank = src.devcpy.peerRank;
+      dst->nodeData.devcpy.datatype = src.devcpy.datatype;
+      dst->nodeData.devcpy.type = src.devcpy.type;
     } else {
       return flagcxNotSupported;
     }
 
     if (dst->numParents == 0) {
-      if (dst->nodeType == uniRunnerDagNodeTypeRed) {
+      if (dst->nodeType == uniRunnerDagNodeTypeRed ||
+          dst->nodeType == uniRunnerDagNodeTypeDevCpy) {
         flagcxIntruQueueEnqueue(&runnerState->redReadyQueue, dst);
       } else {
         flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, dst);
@@ -2953,7 +2992,9 @@ static flagcxResult_t enqueueReadyQueue(flagcxUniRunnerState *runnerState,
     flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
                             &runnerState->dagNodes[nodeIdx]);
   } else if (runnerState->dagNodes[nodeIdx].nodeType ==
-             uniRunnerDagNodeTypeRed) {
+                 uniRunnerDagNodeTypeRed ||
+             runnerState->dagNodes[nodeIdx].nodeType ==
+                 uniRunnerDagNodeTypeDevCpy) {
     flagcxIntruQueueEnqueue(&runnerState->redReadyQueue,
                             &runnerState->dagNodes[nodeIdx]);
   } else {
@@ -3001,28 +3042,45 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
             ? 0
             : (uintptr_t)getDagNodeFlag(runnerState, current->parents[0]);
     uint64_t flagOut = (uintptr_t)getDagNodeFlag(runnerState, current->nodeIdx);
-    // The current algorithms only create single-parent RED nodes. Multi-parent
+    // The current FIFO-backed nodes have at most one parent. Multi-parent
     // dependencies are handled for P2P/CPY nodes by emitting one stream wait
-    // per parent; RED nodes would need an explicit fan-in flag if that ever
-    // changes.
+    // per parent; FIFO-backed nodes would need an explicit fan-in flag if that
+    // ever changes.
     if (current->numParents > 1) {
       return flagcxInvalidArgument;
     }
     int idx = -1;
-    FLAGCXCHECK(enqueue(
-        (void *)runnerState->fifo->buffer,
-        (uintptr_t)current->nodeData.red.input1,
-        (uintptr_t)current->nodeData.red.input2,
-        (uintptr_t)current->nodeData.red.output, current->nodeData.red.count,
-        current->nodeData.red.nthreads, current->nodeData.red.datatype,
-        current->nodeData.red.redOp, flagIn, flagOut, &idx));
+    if (current->nodeType == uniRunnerDagNodeTypeRed) {
+      FLAGCXCHECK(enqueue(
+          (void *)runnerState->fifo->buffer,
+          (uintptr_t)current->nodeData.red.input1,
+          (uintptr_t)current->nodeData.red.input2,
+          (uintptr_t)current->nodeData.red.output, current->nodeData.red.count,
+          current->nodeData.red.nthreads, current->nodeData.red.datatype,
+          current->nodeData.red.redOp, flagIn, flagOut, &idx));
+    } else if (current->nodeType == uniRunnerDagNodeTypeDevCpy) {
+      FLAGCXCHECK(enqueueDevCpy(
+          (void *)runnerState->fifo->buffer,
+          (uintptr_t)current->nodeData.devcpy.sendbuff,
+          (uintptr_t)current->nodeData.devcpy.recvbuff,
+          (uintptr_t)current->nodeData.devcpy.flag,
+          current->nodeData.devcpy.count, current->nodeData.devcpy.nthreads,
+          current->nodeData.devcpy.datatype, current->nodeData.devcpy.type,
+          flagIn, flagOut, &idx));
+    } else {
+      return flagcxNotSupported;
+    }
     if (idx == -1) {
       sched_yield();
       break; // FIFO full, skip for now
     }
     // Dequeue
     flagcxIntruQueueDequeue(&runnerState->redReadyQueue);
-    current->nodeData.red.triggerIdx = idx;
+    if (current->nodeType == uniRunnerDagNodeTypeRed) {
+      current->nodeData.red.triggerIdx = idx;
+    } else {
+      current->nodeData.devcpy.triggerIdx = idx;
+    }
     FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
   }
 

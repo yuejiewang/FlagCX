@@ -12,6 +12,7 @@
 #define REDOP_IDX 11
 #define FLAG_IN_IDX 12
 #define FLAG_OUT_IDX 13
+#define TASK_IDX 14
 
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxStreamFlagState
 loadStreamFlagState(uint64_t flagAddr) {
@@ -57,6 +58,10 @@ FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getRedop() {
 FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getState() {
   return value[3] >> flagcxReduceTriggerOffState &
          flagcxTriggerMask(flagcxReduceTriggerBitsState);
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getTask() {
+  return value[3] >> flagcxReduceTriggerOffTask &
+         flagcxTriggerMask(flagcxReduceTriggerBitsTask);
 }
 FLAGCX_DEVICE_INLINE_DECORATOR void flagcxReduceTrigger::setComplete() {
   uint64_t flagOut = getFlagOut();
@@ -124,6 +129,93 @@ flagcxReduceKernel(uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
   }
 }
 
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t
+flagcxDatatypeSizeDevice(uint64_t datatype) {
+  switch (static_cast<flagcxDataType_t>(datatype)) {
+    case flagcxInt8:
+    case flagcxUint8:
+      return 1;
+    case flagcxFloat16:
+    case flagcxBfloat16:
+      return 2;
+    case flagcxInt32:
+    case flagcxUint32:
+    case flagcxFloat32:
+      return 4;
+    case flagcxInt64:
+    case flagcxUint64:
+    case flagcxFloat64:
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevCpySignal(uint64_t flagAddr) {
+  if (flagAddr != 0) {
+    DeviceAPI::Atomic::store(reinterpret_cast<uint64_t *>(flagAddr),
+                             (uint64_t)flagcxStreamFlagDone,
+                             flagcxDeviceMemoryOrderRelease);
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevCpyWait(uint64_t flagAddr,
+                                                     int *emptyIter) {
+  while (flagAddr != 0) {
+    flagcxStreamFlagState flagState = loadStreamFlagState(flagAddr);
+    if (isStreamFlagStateDone(flagState)) {
+      break;
+    }
+    (*emptyIter)++;
+    DeviceAPI::Intrin::spinBackoff(*emptyIter);
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void
+flagcxDevCpyKernel(uint64_t sendbuff, uint64_t recvbuff, uint64_t dataFlag,
+                   uint64_t count, uint64_t nthreads, uint64_t datatype,
+                   uint64_t prim, int *emptyIter) {
+  if (prim == flagcxDevicePrimWait || prim == flagcxDevicePrimWaitSignal) {
+    if (FLAGCX_THREAD_IDX_X == 0) {
+      flagcxDevCpyWait(dataFlag, emptyIter);
+    }
+    return;
+  }
+
+  if (prim == flagcxDevicePrimSignal || prim == flagcxDevicePrimBarrierSignal) {
+    if (FLAGCX_THREAD_IDX_X == 0) {
+      flagcxDevCpySignal(dataFlag);
+    }
+    return;
+  }
+
+  uint64_t bytes = count * flagcxDatatypeSizeDevice(datatype);
+  if (bytes != 0) {
+    uint64_t n = nthreads == 0 ? FLAGCX_BLOCK_DIM_X : nthreads;
+    uint64_t alignMask = sendbuff | recvbuff | bytes;
+    if ((alignMask & 0x7ull) == 0) {
+      uint64_t *dst = reinterpret_cast<uint64_t *>(recvbuff);
+      const uint64_t *src = reinterpret_cast<const uint64_t *>(sendbuff);
+      uint64_t words = bytes >> 3;
+      for (uint64_t i = FLAGCX_THREAD_IDX_X; i < words; i += n) {
+        dst[i] = src[i];
+      }
+    } else {
+      uint8_t *dst = reinterpret_cast<uint8_t *>(recvbuff);
+      const uint8_t *src = reinterpret_cast<const uint8_t *>(sendbuff);
+      for (uint64_t i = FLAGCX_THREAD_IDX_X; i < bytes; i += n) {
+        dst[i] = src[i];
+      }
+    }
+  }
+  FLAGCX_DEVICE_SYNC_THREADS();
+  FLAGCX_DEVICE_THREAD_FENCE();
+
+  if (FLAGCX_THREAD_IDX_X == 0) {
+    flagcxDevCpySignal(dataFlag);
+  }
+}
+
 FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
   FLAGCX_SHARED uint64_t shm[16];
   uint64_t *vBuf = (uint64_t *)fifoBuffer;
@@ -183,6 +275,7 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
         shm[REDOP_IDX] = t->getRedop();
         shm[FLAG_IN_IDX] = t->getFlagIn();
         shm[FLAG_OUT_IDX] = t->getFlagOut();
+        shm[TASK_IDX] = t->getTask();
       }
     }
     FLAGCX_DEVICE_SYNC_THREADS();
@@ -225,7 +318,7 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
       DeviceAPI::Intrin::spinBackoff(emptyIter);
     }
 
-    // (4) perform reduce task
+    // (4) perform fifo task
     emptyIter = 0;
     uint64_t fst = shm[FST_IDX];
     uint64_t snd = shm[SND_IDX];
@@ -234,7 +327,13 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
     uint64_t nthreads = shm[NTHREADS_IDX];
     uint64_t datatype = shm[DATATYPE_IDX];
     uint64_t redop = shm[REDOP_IDX];
-    flagcxReduceKernel(fst, snd, out, count, nthreads, datatype, redop);
+    uint64_t task = shm[TASK_IDX];
+    if (task == flagcxReduceTriggerTaskDevCpy) {
+      flagcxDevCpyKernel(fst, snd, out, count, nthreads, datatype, redop,
+                         &emptyIter);
+    } else {
+      flagcxReduceKernel(fst, snd, out, count, nthreads, datatype, redop);
+    }
     FLAGCX_DEVICE_SYNC_THREADS();
     FLAGCX_DEVICE_THREAD_FENCE();
 

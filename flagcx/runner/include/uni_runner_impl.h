@@ -20,7 +20,8 @@
 typedef enum {
   uniRunnerDagNodeTypeP2p = 0,
   uniRunnerDagNodeTypeRed = 1,
-  uniRunnerDagNodeTypeCpy = 2
+  uniRunnerDagNodeTypeCpy = 2,
+  uniRunnerDagNodeTypeDevCpy = 3
 } uniRunnerDagNodeType;
 
 // Static DAG template algorithm identifiers used by the uniRunner cache.
@@ -93,6 +94,21 @@ struct uniRunnerCpyNodeData {
   flagcxDataType_t datatype;
 };
 
+// Device-API copy node data (operation-specific fields only)
+struct uniRunnerDevCpyNodeData {
+  void *sendbuff;
+  void *recvbuff;
+  void *flag;
+  size_t count;
+  size_t nthreads;
+  int peerRank;
+  flagcxDataType_t datatype;
+  flagcxDevicePrim type;
+
+  // Trigger and state tracking
+  int triggerIdx; // Trigger index in FIFO
+};
+
 // Unified DAG node with common DAG structure fields
 struct uniRunnerDagNode {
   uniRunnerDagNodeType nodeType; // Discriminator for union
@@ -111,6 +127,7 @@ struct uniRunnerDagNode {
     struct uniRunnerP2pNodeData p2p;
     struct uniRunnerRedNodeData red;
     struct uniRunnerCpyNodeData cpy;
+    struct uniRunnerDevCpyNodeData devcpy;
   } nodeData;
 };
 

@@ -20,7 +20,8 @@ enum uniRunnerDagBufferType {
   uniRunnerDagBufferTypeNone = 0,
   uniRunnerDagBufferTypeInput = 1,
   uniRunnerDagBufferTypeOutput = 2,
-  uniRunnerDagBufferTypeScratch = 3
+  uniRunnerDagBufferTypeScratch = 3,
+  uniRunnerDagBufferTypeFlag = 4
 };
 
 struct uniRunnerDagBufferRef {
@@ -53,6 +54,17 @@ struct uniRunnerDagCpyOpDesc {
   flagcxDataType_t datatype = flagcxInt8;
 };
 
+struct uniRunnerDagDevCpyOpDesc {
+  uniRunnerDagBufferRef sendbuff;
+  uniRunnerDagBufferRef recvbuff;
+  uniRunnerDagBufferRef flag;
+  size_t count = 0;
+  size_t nthreads = 0;
+  int peerRank = -1;
+  flagcxDataType_t datatype = flagcxInt8;
+  flagcxDevicePrim type = flagcxDevicePrimPut;
+};
+
 struct uniRunnerDagNodeDesc {
   uniRunnerDagNodeType nodeType = uniRunnerDagNodeTypeP2p;
   int nodeIdx = 0;
@@ -61,6 +73,7 @@ struct uniRunnerDagNodeDesc {
   std::vector<uniRunnerDagP2pOpDesc> p2pOps;
   uniRunnerDagRedOpDesc red;
   uniRunnerDagCpyOpDesc cpy;
+  uniRunnerDagDevCpyOpDesc devcpy;
 };
 
 struct uniRunnerDagTemplate {
@@ -187,6 +200,8 @@ inline const char *uniRunnerDagNodeTypeToString(uniRunnerDagNodeType nodeType) {
       return "red";
     case uniRunnerDagNodeTypeCpy:
       return "cpy";
+    case uniRunnerDagNodeTypeDevCpy:
+      return "devcpy";
     default:
       return "unknown";
   }
@@ -200,6 +215,8 @@ inline bool uniRunnerDagNodeTypeFromString(const std::string &text,
     *nodeType = uniRunnerDagNodeTypeRed;
   } else if (text == "cpy") {
     *nodeType = uniRunnerDagNodeTypeCpy;
+  } else if (text == "devcpy") {
+    *nodeType = uniRunnerDagNodeTypeDevCpy;
   } else {
     return false;
   }
@@ -217,6 +234,8 @@ uniRunnerDagBufferTypeToString(uniRunnerDagBufferType bufferType) {
       return "output";
     case uniRunnerDagBufferTypeScratch:
       return "scratch";
+    case uniRunnerDagBufferTypeFlag:
+      return "flag";
     default:
       return "unknown";
   }
@@ -232,6 +251,8 @@ inline bool uniRunnerDagBufferTypeFromString(const std::string &text,
     *type = uniRunnerDagBufferTypeOutput;
   } else if (text == "scratch") {
     *type = uniRunnerDagBufferTypeScratch;
+  } else if (text == "flag") {
+    *type = uniRunnerDagBufferTypeFlag;
   } else {
     return false;
   }
@@ -400,6 +421,17 @@ uniRunnerDagTemplateToJson(const uniRunnerDagTemplate &dagTemplate) {
           {"count", node.cpy.count},
           {"datatype", static_cast<int>(node.cpy.datatype)},
       };
+    } else if (node.nodeType == uniRunnerDagNodeTypeDevCpy) {
+      nodeJson["devcpy"] = Json{
+          {"type", uniRunnerDevicePrimToString(node.devcpy.type)},
+          {"peer_rank", node.devcpy.peerRank},
+          {"sendbuff", uniRunnerDagBufferRefToJson(node.devcpy.sendbuff)},
+          {"recvbuff", uniRunnerDagBufferRefToJson(node.devcpy.recvbuff)},
+          {"flag", uniRunnerDagBufferRefToJson(node.devcpy.flag)},
+          {"count", node.devcpy.count},
+          {"nthreads", node.devcpy.nthreads},
+          {"datatype", static_cast<int>(node.devcpy.datatype)},
+      };
     }
     nodes.push_back(nodeJson);
   }
@@ -477,6 +509,23 @@ inline bool uniRunnerDagTemplateFromJson(const Json &j,
       node.cpy.count = cpyJson.at("count").get<size_t>();
       node.cpy.datatype =
           static_cast<flagcxDataType_t>(cpyJson.at("datatype").get<int>());
+    } else if (node.nodeType == uniRunnerDagNodeTypeDevCpy) {
+      const Json &devCpyJson = nodeJson.at("devcpy");
+      std::string primType = devCpyJson.at("type").get<std::string>();
+      if (!uniRunnerDevicePrimFromString(primType, &node.devcpy.type) ||
+          !uniRunnerDagBufferRefFromJson(devCpyJson.at("sendbuff"),
+                                         &node.devcpy.sendbuff) ||
+          !uniRunnerDagBufferRefFromJson(devCpyJson.at("recvbuff"),
+                                         &node.devcpy.recvbuff) ||
+          !uniRunnerDagBufferRefFromJson(devCpyJson.at("flag"),
+                                         &node.devcpy.flag)) {
+        return false;
+      }
+      node.devcpy.peerRank = devCpyJson.at("peer_rank").get<int>();
+      node.devcpy.count = devCpyJson.at("count").get<size_t>();
+      node.devcpy.nthreads = devCpyJson.at("nthreads").get<size_t>();
+      node.devcpy.datatype =
+          static_cast<flagcxDataType_t>(devCpyJson.at("datatype").get<int>());
     }
     dagTemplate->nodes.push_back(node);
   }
@@ -503,7 +552,8 @@ inline Json uniRunnerSerializeDagCacheFile(
   return Json{{"format_version", kUniRunnerDagCacheFormatVersion},
               {"address_model", "buffer_kind+offset_bytes"},
               {"buffer_kinds",
-               Json::array({Json("input"), Json("output"), Json("scratch")})},
+               Json::array({Json("input"), Json("output"), Json("scratch"),
+                            Json("flag")})},
               {"entries", entries}};
 }
 

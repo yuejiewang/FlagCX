@@ -58,6 +58,11 @@ typedef enum {
 } flagcxReduceTriggerState;
 
 typedef enum {
+  flagcxReduceTriggerTaskRed = 0,
+  flagcxReduceTriggerTaskDevCpy = 1
+} flagcxReduceTriggerTask;
+
+typedef enum {
   flagcxStreamFlagIdle = 0,
   flagcxStreamFlagPend = 1,
   flagcxStreamFlagDone = 2
@@ -156,7 +161,11 @@ constexpr unsigned int flagcxReduceTriggerOffState =
     flagcxReduceTriggerOffRedop + flagcxReduceTriggerBitsRedop;
 /* op state: 0 for available, 1 for enqueued, 2 for in-progress, 3 for done */
 constexpr unsigned int flagcxReduceTriggerBitsState = 2;
-constexpr unsigned int flagcxReduceTriggerBitsFifoReserved = 1;
+constexpr unsigned int flagcxReduceTriggerOffTask =
+    flagcxReduceTriggerOffState + flagcxReduceTriggerBitsState;
+constexpr unsigned int flagcxReduceTriggerBitsTask = 3;
+constexpr unsigned int flagcxReduceTriggerBitsFifoReserved =
+    64 - (flagcxReduceTriggerOffTask + flagcxReduceTriggerBitsTask);
 
 // Kernel launch configuration constants.
 // Also defined in device_api/flagcx_device.h (with same include guard).
@@ -215,6 +224,7 @@ struct alignas(16) flagcxReduceTrigger {
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getDatatype();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getRedop();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getState();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getTask();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getFlagIn();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getFlagOut();
   FLAGCX_DEVICE_INLINE_DECORATOR void setComplete();
@@ -224,7 +234,9 @@ struct alignas(16) flagcxReduceTrigger {
                                       flagcxDataType_t datatype,
                                       flagcxRedOp_t redOp,
                                       flagcxReduceTriggerState state,
-                                      uint64_t flagIn, uint64_t flagOut);
+                                      uint64_t flagIn, uint64_t flagOut,
+                                      flagcxReduceTriggerTask task =
+                                          flagcxReduceTriggerTaskRed);
   FLAGCX_HOST_DECORATOR uint64_t pollState();
   FLAGCX_HOST_DECORATOR void setState(int state);
 };
