@@ -14,8 +14,6 @@
 
 using Json = nlohmann::json;
 
-inline constexpr int kUniRunnerDagCacheFormatVersion = 1;
-
 enum uniRunnerDagBufferType {
   uniRunnerDagBufferTypeNone = 0,
   uniRunnerDagBufferTypeInput = 1,
@@ -54,7 +52,7 @@ struct uniRunnerDagCpyOpDesc {
   flagcxDataType_t datatype = flagcxInt8;
 };
 
-struct uniRunnerDagDevCpyOpDesc {
+struct uniRunnerDagDevApiOpDesc {
   uniRunnerDagBufferRef sendbuff;
   uniRunnerDagBufferRef recvbuff;
   uniRunnerDagBufferRef flag;
@@ -73,7 +71,7 @@ struct uniRunnerDagNodeDesc {
   std::vector<uniRunnerDagP2pOpDesc> p2pOps;
   uniRunnerDagRedOpDesc red;
   uniRunnerDagCpyOpDesc cpy;
-  uniRunnerDagDevCpyOpDesc devcpy;
+  uniRunnerDagDevApiOpDesc devapi;
 };
 
 struct uniRunnerDagTemplate {
@@ -208,8 +206,8 @@ inline const char *uniRunnerDagNodeTypeToString(uniRunnerDagNodeType nodeType) {
       return "red";
     case uniRunnerDagNodeTypeCpy:
       return "cpy";
-    case uniRunnerDagNodeTypeDevCpy:
-      return "devcpy";
+    case uniRunnerDagNodeTypeDevApi:
+      return "devapi";
     default:
       return "unknown";
   }
@@ -223,8 +221,8 @@ inline bool uniRunnerDagNodeTypeFromString(const std::string &text,
     *nodeType = uniRunnerDagNodeTypeRed;
   } else if (text == "cpy") {
     *nodeType = uniRunnerDagNodeTypeCpy;
-  } else if (text == "devcpy") {
-    *nodeType = uniRunnerDagNodeTypeDevCpy;
+  } else if (text == "devapi") {
+    *nodeType = uniRunnerDagNodeTypeDevApi;
   } else {
     return false;
   }
@@ -343,7 +341,6 @@ inline bool uniRunnerDagBufferRefFromJson(const Json &j,
 
 inline Json uniRunnerDagCacheKeyToJson(const uniRunnerDagCacheKey &key) {
   return Json{
-      {"format_version", key.formatVersion},
       {"algo", uniRunnerDagAlgoTypeToString(key.algoType)},
       {"comm_op", uniRunnerCommOpToString(key.commOp)},
       {"count", key.count},
@@ -371,7 +368,6 @@ inline bool uniRunnerDagCacheKeyFromJson(const Json &j,
       !uniRunnerCommOpFromString(commOpName, &key->commOp)) {
     return false;
   }
-  key->formatVersion = j.at("format_version").get<int>();
   key->count = j.at("count").get<size_t>();
   key->datatype = static_cast<flagcxDataType_t>(j.at("datatype").get<int>());
   key->redOp = static_cast<flagcxRedOp_t>(j.at("red_op").get<int>());
@@ -429,16 +425,16 @@ uniRunnerDagTemplateToJson(const uniRunnerDagTemplate &dagTemplate) {
           {"count", node.cpy.count},
           {"datatype", static_cast<int>(node.cpy.datatype)},
       };
-    } else if (node.nodeType == uniRunnerDagNodeTypeDevCpy) {
-      nodeJson["devcpy"] = Json{
-          {"type", uniRunnerDevicePrimToString(node.devcpy.type)},
-          {"peer_rank", node.devcpy.peerRank},
-          {"sendbuff", uniRunnerDagBufferRefToJson(node.devcpy.sendbuff)},
-          {"recvbuff", uniRunnerDagBufferRefToJson(node.devcpy.recvbuff)},
-          {"flag", uniRunnerDagBufferRefToJson(node.devcpy.flag)},
-          {"count", node.devcpy.count},
-          {"nthreads", node.devcpy.nthreads},
-          {"datatype", static_cast<int>(node.devcpy.datatype)},
+    } else if (node.nodeType == uniRunnerDagNodeTypeDevApi) {
+      nodeJson["devapi"] = Json{
+          {"type", uniRunnerDevicePrimToString(node.devapi.type)},
+          {"peer_rank", node.devapi.peerRank},
+          {"sendbuff", uniRunnerDagBufferRefToJson(node.devapi.sendbuff)},
+          {"recvbuff", uniRunnerDagBufferRefToJson(node.devapi.recvbuff)},
+          {"flag", uniRunnerDagBufferRefToJson(node.devapi.flag)},
+          {"count", node.devapi.count},
+          {"nthreads", node.devapi.nthreads},
+          {"datatype", static_cast<int>(node.devapi.datatype)},
       };
     }
     nodes.push_back(nodeJson);
@@ -517,23 +513,23 @@ inline bool uniRunnerDagTemplateFromJson(const Json &j,
       node.cpy.count = cpyJson.at("count").get<size_t>();
       node.cpy.datatype =
           static_cast<flagcxDataType_t>(cpyJson.at("datatype").get<int>());
-    } else if (node.nodeType == uniRunnerDagNodeTypeDevCpy) {
-      const Json &devCpyJson = nodeJson.at("devcpy");
-      std::string primType = devCpyJson.at("type").get<std::string>();
-      if (!uniRunnerDevicePrimFromString(primType, &node.devcpy.type) ||
-          !uniRunnerDagBufferRefFromJson(devCpyJson.at("sendbuff"),
-                                         &node.devcpy.sendbuff) ||
-          !uniRunnerDagBufferRefFromJson(devCpyJson.at("recvbuff"),
-                                         &node.devcpy.recvbuff) ||
-          !uniRunnerDagBufferRefFromJson(devCpyJson.at("flag"),
-                                         &node.devcpy.flag)) {
+    } else if (node.nodeType == uniRunnerDagNodeTypeDevApi) {
+      const Json &devApiJson = nodeJson.at("devapi");
+      std::string primType = devApiJson.at("type").get<std::string>();
+      if (!uniRunnerDevicePrimFromString(primType, &node.devapi.type) ||
+          !uniRunnerDagBufferRefFromJson(devApiJson.at("sendbuff"),
+                                         &node.devapi.sendbuff) ||
+          !uniRunnerDagBufferRefFromJson(devApiJson.at("recvbuff"),
+                                         &node.devapi.recvbuff) ||
+          !uniRunnerDagBufferRefFromJson(devApiJson.at("flag"),
+                                         &node.devapi.flag)) {
         return false;
       }
-      node.devcpy.peerRank = devCpyJson.at("peer_rank").get<int>();
-      node.devcpy.count = devCpyJson.at("count").get<size_t>();
-      node.devcpy.nthreads = devCpyJson.at("nthreads").get<size_t>();
-      node.devcpy.datatype =
-          static_cast<flagcxDataType_t>(devCpyJson.at("datatype").get<int>());
+      node.devapi.peerRank = devApiJson.at("peer_rank").get<int>();
+      node.devapi.count = devApiJson.at("count").get<size_t>();
+      node.devapi.nthreads = devApiJson.at("nthreads").get<size_t>();
+      node.devapi.datatype =
+          static_cast<flagcxDataType_t>(devApiJson.at("datatype").get<int>());
     }
     dagTemplate->nodes.push_back(node);
   }
@@ -557,8 +553,7 @@ inline Json uniRunnerSerializeDagCacheFile(
     entries.push_back(uniRunnerSerializeDagTemplate(dagTemplate));
   }
 
-  return Json{{"format_version", kUniRunnerDagCacheFormatVersion},
-              {"address_model", "buffer_kind+offset_bytes"},
+  return Json{{"address_model", "buffer_kind+offset_bytes"},
               {"buffer_kinds",
                Json::array({Json("input"), Json("output"), Json("scratch"),
                             Json("flag")})},
@@ -567,10 +562,6 @@ inline Json uniRunnerSerializeDagCacheFile(
 
 inline bool uniRunnerDeserializeDagCacheFile(
     const Json &root, std::vector<uniRunnerDagTemplate> *dagTemplates) {
-  if (root.contains("format_version") &&
-      root["format_version"].get<int>() != kUniRunnerDagCacheFormatVersion) {
-    return false;
-  }
   if (!root.contains("entries") || !root["entries"].is_array()) {
     return false;
   }

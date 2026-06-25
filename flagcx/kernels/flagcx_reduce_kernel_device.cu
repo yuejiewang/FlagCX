@@ -151,7 +151,7 @@ flagcxDatatypeSizeDevice(uint64_t datatype) {
   }
 }
 
-FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevCpySignal(uint64_t flagAddr) {
+FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevApiSignal(uint64_t flagAddr) {
   if (flagAddr != 0) {
     DeviceAPI::Atomic::store(reinterpret_cast<uint64_t *>(flagAddr),
                              (uint64_t)flagcxStreamFlagDone,
@@ -159,7 +159,7 @@ FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevCpySignal(uint64_t flagAddr) {
   }
 }
 
-FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevCpyWait(uint64_t flagAddr,
+FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevApiWait(uint64_t flagAddr,
                                                      int *emptyIter) {
   while (flagAddr != 0) {
     flagcxStreamFlagState flagState = loadStreamFlagState(flagAddr);
@@ -172,19 +172,19 @@ FLAGCX_DEVICE_INLINE_DECORATOR void flagcxDevCpyWait(uint64_t flagAddr,
 }
 
 FLAGCX_DEVICE_INLINE_DECORATOR void
-flagcxDevCpyKernel(uint64_t sendbuff, uint64_t recvbuff, uint64_t dataFlag,
+flagcxDevApiKernel(uint64_t sendbuff, uint64_t recvbuff, uint64_t dataFlag,
                    uint64_t count, uint64_t nthreads, uint64_t datatype,
                    uint64_t prim, int *emptyIter) {
   if (prim == flagcxDevicePrimWait || prim == flagcxDevicePrimWaitSignal) {
     if (FLAGCX_THREAD_IDX_X == 0) {
-      flagcxDevCpyWait(dataFlag, emptyIter);
+      flagcxDevApiWait(dataFlag, emptyIter);
     }
     return;
   }
 
   if (prim == flagcxDevicePrimSignal || prim == flagcxDevicePrimBarrierSignal) {
     if (FLAGCX_THREAD_IDX_X == 0) {
-      flagcxDevCpySignal(dataFlag);
+      flagcxDevApiSignal(dataFlag);
     }
     return;
   }
@@ -212,7 +212,7 @@ flagcxDevCpyKernel(uint64_t sendbuff, uint64_t recvbuff, uint64_t dataFlag,
   FLAGCX_DEVICE_THREAD_FENCE();
 
   if (FLAGCX_THREAD_IDX_X == 0) {
-    flagcxDevCpySignal(dataFlag);
+    flagcxDevApiSignal(dataFlag);
   }
 }
 
@@ -328,8 +328,8 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
     uint64_t datatype = shm[DATATYPE_IDX];
     uint64_t redop = shm[REDOP_IDX];
     uint64_t task = shm[TASK_IDX];
-    if (task == flagcxReduceTriggerTaskDevCpy) {
-      flagcxDevCpyKernel(fst, snd, out, count, nthreads, datatype, redop,
+    if (task == flagcxReduceTriggerTaskDevApi) {
+      flagcxDevApiKernel(fst, snd, out, count, nthreads, datatype, redop,
                          &emptyIter);
     } else {
       flagcxReduceKernel(fst, snd, out, count, nthreads, datatype, redop);

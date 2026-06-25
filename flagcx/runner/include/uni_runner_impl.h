@@ -21,7 +21,7 @@ typedef enum {
   uniRunnerDagNodeTypeP2p = 0,
   uniRunnerDagNodeTypeRed = 1,
   uniRunnerDagNodeTypeCpy = 2,
-  uniRunnerDagNodeTypeDevCpy = 3
+  uniRunnerDagNodeTypeDevApi = 3
 } uniRunnerDagNodeType;
 
 // Static DAG template algorithm identifiers used by the uniRunner cache.
@@ -40,7 +40,6 @@ typedef enum {
 
 // Cache key describing a reusable uniRunner DAG template.
 struct uniRunnerDagCacheKey {
-  int formatVersion;
   uniRunnerDagAlgoType algoType;
   flagcxCommOp_t commOp;
   size_t count;
@@ -97,8 +96,8 @@ struct uniRunnerCpyNodeData {
   flagcxDataType_t datatype;
 };
 
-// Device-API copy node data (operation-specific fields only)
-struct uniRunnerDevCpyNodeData {
+// Device API node data (operation-specific fields only)
+struct uniRunnerDevApiNodeData {
   void *sendbuff;
   void *recvbuff;
   void *flag;
@@ -130,7 +129,7 @@ struct uniRunnerDagNode {
     struct uniRunnerP2pNodeData p2p;
     struct uniRunnerRedNodeData red;
     struct uniRunnerCpyNodeData cpy;
-    struct uniRunnerDevCpyNodeData devcpy;
+    struct uniRunnerDevApiNodeData devapi;
   } nodeData;
 };
 
@@ -163,7 +162,7 @@ typedef struct {
   size_t streamFlagsSize;
   size_t streamFlagsCapacity;
 
-  // Device API resources used by IPC-backed devcpy nodes. DevComm and the flag
+  // Device API resources used by IPC-backed DevApi nodes. DevComm and the flag
   // pool are communicator-scoped; send/recv DevMem views track the current user
   // buffers and are refreshed when those buffers change.
   flagcxComm_t devApiOwner;

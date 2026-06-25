@@ -82,7 +82,7 @@ enqueue(void *fifoBuffer, uint64_t addr1, uint64_t addr2, uint64_t addr3,
   return flagcxSuccess;
 }
 
-FLAGCX_HOST_DECORATOR flagcxResult_t enqueueDevCpy(
+FLAGCX_HOST_DECORATOR flagcxResult_t enqueueDevApi(
     void *fifoBuffer, uint64_t sendbuff, uint64_t recvbuff, uint64_t dataFlag,
     size_t count, size_t nthreads, flagcxDataType_t datatype,
     flagcxDevicePrim prim, uint64_t flagIn, uint64_t flagOut, int *ret) {
@@ -107,11 +107,11 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueueDevCpy(
   trigger->setValue(sendbuff, recvbuff, dataFlag, count, nthreads, datatype,
                     static_cast<flagcxRedOp_t>(prim),
                     flagcxReduceTriggerEnqueued, flagIn, flagOut,
-                    flagcxReduceTriggerTaskDevCpy);
+                    flagcxReduceTriggerTaskDevApi);
   __atomic_fetch_add(buffer + flagcxFifoIdxProduced, 1ul, __ATOMIC_RELEASE);
   *ret = idx;
   TRACE(FLAGCX_KERNEL,
-        "enqueue devcpy: count=%lu, nthreads=%lu, datatype=%d, prim=%d, "
+        "enqueue devapi: count=%lu, nthreads=%lu, datatype=%d, prim=%d, "
         "idx=%d",
         count, nthreads, datatype, prim, idx);
 

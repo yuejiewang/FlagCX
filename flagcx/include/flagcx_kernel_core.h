@@ -59,7 +59,7 @@ typedef enum {
 
 typedef enum {
   flagcxReduceTriggerTaskRed = 0,
-  flagcxReduceTriggerTaskDevCpy = 1
+  flagcxReduceTriggerTaskDevApi = 1
 } flagcxReduceTriggerTask;
 
 typedef enum {

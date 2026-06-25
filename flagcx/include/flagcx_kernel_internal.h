@@ -49,7 +49,7 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr1,
                                              uint64_t flagIn,
                                              uint64_t flagOut, int *idx);
 FLAGCX_HOST_DECORATOR flagcxResult_t
-enqueueDevCpy(void *fifoBuffer, uint64_t sendbuff, uint64_t recvbuff,
+enqueueDevApi(void *fifoBuffer, uint64_t sendbuff, uint64_t recvbuff,
               uint64_t dataFlag, size_t count, size_t nthreads,
               flagcxDataType_t datatype, flagcxDevicePrim prim,
               uint64_t flagIn, uint64_t flagOut, int *idx);

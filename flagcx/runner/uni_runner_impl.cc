@@ -61,8 +61,7 @@ static size_t hashCombine(size_t seed, size_t value) {
 
 static bool uniRunnerDagCacheKeysEqual(const uniRunnerDagCacheKey &lhs,
                                        const uniRunnerDagCacheKey &rhs) {
-  return lhs.formatVersion == rhs.formatVersion &&
-         lhs.algoType == rhs.algoType && lhs.commOp == rhs.commOp &&
+  return lhs.algoType == rhs.algoType && lhs.commOp == rhs.commOp &&
          lhs.count == rhs.count && lhs.datatype == rhs.datatype &&
          lhs.redOp == rhs.redOp && lhs.rank == rhs.rank &&
          lhs.nranks == rhs.nranks && lhs.root == rhs.root &&
@@ -329,7 +328,6 @@ static uniRunnerDagCacheKey makeUniRunnerDagCacheKey(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm, const void *sendbuff,
     void *recvbuff, void *scratchbuff) {
   uniRunnerDagCacheKey key{};
-  key.formatVersion = kUniRunnerDagCacheFormatVersion;
   key.algoType = algoType;
   key.commOp = commOp;
   key.count = count;
@@ -389,7 +387,6 @@ static flagcxResult_t cacheUniRunnerDagTemplate(
 
 size_t getUniRunnerDagPatternHash(const uniRunnerDagCacheKey &key) {
   size_t hashValue = 0;
-  hashValue = hashCombine(hashValue, static_cast<size_t>(key.formatVersion));
   hashValue = hashCombine(hashValue, static_cast<size_t>(key.algoType));
   hashValue = hashCombine(hashValue, static_cast<size_t>(key.commOp));
   hashValue = hashCombine(hashValue, key.count);
@@ -847,7 +844,7 @@ getDagNodeExecutionStream(flagcxUniRunnerState *runnerState,
     case uniRunnerDagNodeTypeP2p:
       return runnerState->commStream;
     case uniRunnerDagNodeTypeRed:
-    case uniRunnerDagNodeTypeDevCpy:
+    case uniRunnerDagNodeTypeDevApi:
       return runnerState->redStream;
     case uniRunnerDagNodeTypeCpy:
       return runnerState->cpyStream;
@@ -2073,22 +2070,22 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   return validateDagNodes(runnerState);
 }
 
-static void initDevCpyDagNode(uniRunnerDagNode *node, int nodeIdx,
+static void initDevApiDagNode(uniRunnerDagNode *node, int nodeIdx,
                               flagcxDevicePrim prim, void *sendbuff,
                               void *recvbuff, void *flag, size_t count,
                               size_t nthreads, flagcxDataType_t datatype,
                               int peerRank) {
   node->nodeIdx = nodeIdx;
-  node->nodeType = uniRunnerDagNodeTypeDevCpy;
-  node->nodeData.devcpy.sendbuff = sendbuff;
-  node->nodeData.devcpy.recvbuff = recvbuff;
-  node->nodeData.devcpy.flag = flag;
-  node->nodeData.devcpy.count = count;
-  node->nodeData.devcpy.nthreads = nthreads;
-  node->nodeData.devcpy.datatype = datatype;
-  node->nodeData.devcpy.type = prim;
-  node->nodeData.devcpy.peerRank = peerRank;
-  node->nodeData.devcpy.triggerIdx = -1;
+  node->nodeType = uniRunnerDagNodeTypeDevApi;
+  node->nodeData.devapi.sendbuff = sendbuff;
+  node->nodeData.devapi.recvbuff = recvbuff;
+  node->nodeData.devapi.flag = flag;
+  node->nodeData.devapi.count = count;
+  node->nodeData.devapi.nthreads = nthreads;
+  node->nodeData.devapi.datatype = datatype;
+  node->nodeData.devapi.type = prim;
+  node->nodeData.devapi.peerRank = peerRank;
+  node->nodeData.devapi.triggerIdx = -1;
 }
 
 static void initCpyDagNode(uniRunnerDagNode *node, int nodeIdx, void *src,
@@ -2219,7 +2216,7 @@ static flagcxResult_t finalizeDevARDag(flagcxUniRunnerState *runnerState,
   for (int i = 0; i < newNum; i++) {
     if (newDag[i].numParents == 0) {
       if (newDag[i].nodeType == uniRunnerDagNodeTypeRed ||
-          newDag[i].nodeType == uniRunnerDagNodeTypeDevCpy) {
+          newDag[i].nodeType == uniRunnerDagNodeTypeDevApi) {
         flagcxIntruQueueEnqueue(&runnerState->redReadyQueue, &newDag[i]);
       } else {
         flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, &newDag[i]);
@@ -2338,7 +2335,7 @@ static flagcxResult_t buildUniRunnerStateDevAR(
       int waitReadyIdx = newIdx++;
       int getIdx = newIdx++;
 
-      initDevCpyDagNode(&newDag[signalIdx], signalIdx, flagcxDevicePrimPut,
+      initDevApiDagNode(&newDag[signalIdx], signalIdx, flagcxDevicePrimPut,
                         NULL, NULL, remoteFlag, 0,
                         runnerState->uniRunnerNThreads, datatype, nextRank);
       initCpyDagNode(&newDag[waitReadyIdx], waitReadyIdx, NULL, NULL,
@@ -2362,7 +2359,7 @@ static flagcxResult_t buildUniRunnerStateDevAR(
         return flagcxNotSupported;
       }
 
-      initDevCpyDagNode(&newDag[getIdx], getIdx, flagcxDevicePrimGet,
+      initDevApiDagNode(&newDag[getIdx], getIdx, flagcxDevicePrimGet,
                         remoteSrc, localRecv, NULL, recvOp->count,
                         runnerState->uniRunnerNThreads, datatype, prevRank);
 
@@ -2378,7 +2375,7 @@ static flagcxResult_t buildUniRunnerStateDevAR(
       int putIdx = newIdx++;
       int waitIdx = newIdx++;
 
-      initDevCpyDagNode(&newDag[putIdx], putIdx, flagcxDevicePrimPut,
+      initDevApiDagNode(&newDag[putIdx], putIdx, flagcxDevicePrimPut,
                         localSend, remoteRecv, remoteFlag, sendOp->count,
                         runnerState->uniRunnerNThreads, datatype, nextRank);
       initCpyDagNode(&newDag[waitIdx], waitIdx, NULL, NULL, localFlag, 0,
@@ -2488,10 +2485,10 @@ static flagcxResult_t buildUniRunnerStateDevApiTest(
     return flagcxSystemError;
   }
 
-  initDevCpyDagNode(&runnerState->dagNodes[0], 0, flagcxDevicePrimPut, putSrc,
+  initDevApiDagNode(&runnerState->dagNodes[0], 0, flagcxDevicePrimPut, putSrc,
                     putDst, putFlag, putCount, runnerState->uniRunnerNThreads,
                     datatype, nextRank);
-  initDevCpyDagNode(&runnerState->dagNodes[1], 1, flagcxDevicePrimWaitSignal,
+  initDevApiDagNode(&runnerState->dagNodes[1], 1, flagcxDevicePrimWaitSignal,
                     NULL, NULL, waitPutFlag, 0,
                     runnerState->uniRunnerNThreads, datatype, prevRank);
 
@@ -2512,10 +2509,10 @@ static flagcxResult_t buildUniRunnerStateDevApiTest(
   runnerState->numPendingNodes++;
 
   if (getCount != 0) {
-    initDevCpyDagNode(&runnerState->dagNodes[2], 2, flagcxDevicePrimGet,
+    initDevApiDagNode(&runnerState->dagNodes[2], 2, flagcxDevicePrimGet,
                       getSrc, getDst, getFlag, getCount,
                       runnerState->uniRunnerNThreads, datatype, prevRank);
-    initDevCpyDagNode(&runnerState->dagNodes[3], 3,
+    initDevApiDagNode(&runnerState->dagNodes[3], 3,
                       flagcxDevicePrimWaitSignal, NULL, NULL, waitGetFlag, 0,
                       runnerState->uniRunnerNThreads, datatype, rank);
 
@@ -3202,18 +3199,18 @@ static flagcxResult_t captureUniRunnerDagTemplateFromState(
                                    &nodeDesc.cpy.dst));
       nodeDesc.cpy.count = node->nodeData.cpy.count;
       nodeDesc.cpy.datatype = node->nodeData.cpy.datatype;
-    } else if (node->nodeType == uniRunnerDagNodeTypeDevCpy) {
-      FLAGCXCHECK(captureBufferRef(node->nodeData.devcpy.sendbuff, bindings,
-                                   &nodeDesc.devcpy.sendbuff));
-      FLAGCXCHECK(captureBufferRef(node->nodeData.devcpy.recvbuff, bindings,
-                                   &nodeDesc.devcpy.recvbuff));
-      FLAGCXCHECK(captureBufferRef(node->nodeData.devcpy.flag, bindings,
-                                   &nodeDesc.devcpy.flag));
-      nodeDesc.devcpy.count = node->nodeData.devcpy.count;
-      nodeDesc.devcpy.nthreads = node->nodeData.devcpy.nthreads;
-      nodeDesc.devcpy.peerRank = node->nodeData.devcpy.peerRank;
-      nodeDesc.devcpy.datatype = node->nodeData.devcpy.datatype;
-      nodeDesc.devcpy.type = node->nodeData.devcpy.type;
+    } else if (node->nodeType == uniRunnerDagNodeTypeDevApi) {
+      FLAGCXCHECK(captureBufferRef(node->nodeData.devapi.sendbuff, bindings,
+                                   &nodeDesc.devapi.sendbuff));
+      FLAGCXCHECK(captureBufferRef(node->nodeData.devapi.recvbuff, bindings,
+                                   &nodeDesc.devapi.recvbuff));
+      FLAGCXCHECK(captureBufferRef(node->nodeData.devapi.flag, bindings,
+                                   &nodeDesc.devapi.flag));
+      nodeDesc.devapi.count = node->nodeData.devapi.count;
+      nodeDesc.devapi.nthreads = node->nodeData.devapi.nthreads;
+      nodeDesc.devapi.peerRank = node->nodeData.devapi.peerRank;
+      nodeDesc.devapi.datatype = node->nodeData.devapi.datatype;
+      nodeDesc.devapi.type = node->nodeData.devapi.type;
     } else {
       return flagcxNotSupported;
     }
@@ -3294,26 +3291,26 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
           resolveBufferRef(src.cpy.dst, bindings, &dst->nodeData.cpy.dst));
       dst->nodeData.cpy.count = src.cpy.count;
       dst->nodeData.cpy.datatype = src.cpy.datatype;
-    } else if (dst->nodeType == uniRunnerDagNodeTypeDevCpy) {
-      dst->nodeData.devcpy.triggerIdx = -1;
-      FLAGCXCHECK(resolveBufferRef(src.devcpy.sendbuff, bindings,
-                                   &dst->nodeData.devcpy.sendbuff));
-      FLAGCXCHECK(resolveBufferRef(src.devcpy.recvbuff, bindings,
-                                   &dst->nodeData.devcpy.recvbuff));
-      FLAGCXCHECK(resolveBufferRef(src.devcpy.flag, bindings,
-                                   &dst->nodeData.devcpy.flag));
-      dst->nodeData.devcpy.count = src.devcpy.count;
-      dst->nodeData.devcpy.nthreads = src.devcpy.nthreads;
-      dst->nodeData.devcpy.peerRank = src.devcpy.peerRank;
-      dst->nodeData.devcpy.datatype = src.devcpy.datatype;
-      dst->nodeData.devcpy.type = src.devcpy.type;
+    } else if (dst->nodeType == uniRunnerDagNodeTypeDevApi) {
+      dst->nodeData.devapi.triggerIdx = -1;
+      FLAGCXCHECK(resolveBufferRef(src.devapi.sendbuff, bindings,
+                                   &dst->nodeData.devapi.sendbuff));
+      FLAGCXCHECK(resolveBufferRef(src.devapi.recvbuff, bindings,
+                                   &dst->nodeData.devapi.recvbuff));
+      FLAGCXCHECK(resolveBufferRef(src.devapi.flag, bindings,
+                                   &dst->nodeData.devapi.flag));
+      dst->nodeData.devapi.count = src.devapi.count;
+      dst->nodeData.devapi.nthreads = src.devapi.nthreads;
+      dst->nodeData.devapi.peerRank = src.devapi.peerRank;
+      dst->nodeData.devapi.datatype = src.devapi.datatype;
+      dst->nodeData.devapi.type = src.devapi.type;
     } else {
       return flagcxNotSupported;
     }
 
     if (dst->numParents == 0) {
       if (dst->nodeType == uniRunnerDagNodeTypeRed ||
-          dst->nodeType == uniRunnerDagNodeTypeDevCpy) {
+          dst->nodeType == uniRunnerDagNodeTypeDevApi) {
         flagcxIntruQueueEnqueue(&runnerState->redReadyQueue, dst);
       } else {
         flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, dst);
@@ -3731,7 +3728,7 @@ static flagcxResult_t enqueueReadyQueue(flagcxUniRunnerState *runnerState,
   } else if (runnerState->dagNodes[nodeIdx].nodeType ==
                  uniRunnerDagNodeTypeRed ||
              runnerState->dagNodes[nodeIdx].nodeType ==
-                 uniRunnerDagNodeTypeDevCpy) {
+                 uniRunnerDagNodeTypeDevApi) {
     flagcxIntruQueueEnqueue(&runnerState->redReadyQueue,
                             &runnerState->dagNodes[nodeIdx]);
   } else {
@@ -3795,14 +3792,14 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
           (uintptr_t)current->nodeData.red.output, current->nodeData.red.count,
           current->nodeData.red.nthreads, current->nodeData.red.datatype,
           current->nodeData.red.redOp, flagIn, flagOut, &idx));
-    } else if (current->nodeType == uniRunnerDagNodeTypeDevCpy) {
-      FLAGCXCHECK(enqueueDevCpy(
+    } else if (current->nodeType == uniRunnerDagNodeTypeDevApi) {
+      FLAGCXCHECK(enqueueDevApi(
           (void *)runnerState->fifo->buffer,
-          (uintptr_t)current->nodeData.devcpy.sendbuff,
-          (uintptr_t)current->nodeData.devcpy.recvbuff,
-          (uintptr_t)current->nodeData.devcpy.flag,
-          current->nodeData.devcpy.count, current->nodeData.devcpy.nthreads,
-          current->nodeData.devcpy.datatype, current->nodeData.devcpy.type,
+          (uintptr_t)current->nodeData.devapi.sendbuff,
+          (uintptr_t)current->nodeData.devapi.recvbuff,
+          (uintptr_t)current->nodeData.devapi.flag,
+          current->nodeData.devapi.count, current->nodeData.devapi.nthreads,
+          current->nodeData.devapi.datatype, current->nodeData.devapi.type,
           flagIn, flagOut, &idx));
     } else {
       return flagcxNotSupported;
@@ -3816,7 +3813,7 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
     if (current->nodeType == uniRunnerDagNodeTypeRed) {
       current->nodeData.red.triggerIdx = idx;
     } else {
-      current->nodeData.devcpy.triggerIdx = idx;
+      current->nodeData.devapi.triggerIdx = idx;
     }
     FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
   }
