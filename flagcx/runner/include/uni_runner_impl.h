@@ -33,7 +33,9 @@ typedef enum {
   uniRunnerDagAlgoRingAR = 4,
   uniRunnerDagAlgoSlicedAR = 5,
   uniRunnerDagAlgoRingRS = 6,
-  uniRunnerDagAlgoTreeRed = 7
+  uniRunnerDagAlgoTreeRed = 7,
+  uniRunnerDagAlgoDevARPut = 8,
+  uniRunnerDagAlgoDevARGet = 9
 } uniRunnerDagAlgoType;
 
 // Cache key describing a reusable uniRunner DAG template.
@@ -90,6 +92,7 @@ struct uniRunnerRedNodeData {
 struct uniRunnerCpyNodeData {
   void *src;
   void *dst;
+  void *waitFlag;
   size_t count;
   flagcxDataType_t datatype;
 };
@@ -204,6 +207,16 @@ flagcxResult_t initUniRunnerStateDevApiTest(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
     flagcxComm_t comm);
+flagcxResult_t initUniRunnerStateDevARPut(flagcxUniRunnerState *runnerState,
+                                          const void *sendbuff, void *recvbuff,
+                                          size_t count,
+                                          flagcxDataType_t datatype,
+                                          flagcxRedOp_t op, flagcxComm_t comm);
+flagcxResult_t initUniRunnerStateDevARGet(flagcxUniRunnerState *runnerState,
+                                          const void *sendbuff, void *recvbuff,
+                                          size_t count,
+                                          flagcxDataType_t datatype,
+                                          flagcxRedOp_t op, flagcxComm_t comm);
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,

@@ -2091,6 +2091,330 @@ static void initDevCpyDagNode(uniRunnerDagNode *node, int nodeIdx,
   node->nodeData.devcpy.triggerIdx = -1;
 }
 
+static void initCpyDagNode(uniRunnerDagNode *node, int nodeIdx, void *src,
+                           void *dst, void *waitFlag, size_t count,
+                           flagcxDataType_t datatype) {
+  node->nodeIdx = nodeIdx;
+  node->nodeType = uniRunnerDagNodeTypeCpy;
+  node->nodeData.cpy.src = src;
+  node->nodeData.cpy.dst = dst;
+  node->nodeData.cpy.waitFlag = waitFlag;
+  node->nodeData.cpy.count = count;
+  node->nodeData.cpy.datatype = datatype;
+}
+
+static void freeDagNodeStorage(uniRunnerDagNode *dagNodes, int numDagNodes) {
+  if (dagNodes == NULL) {
+    return;
+  }
+  for (int i = 0; i < numDagNodes; i++) {
+    if (dagNodes[i].nodeType == uniRunnerDagNodeTypeP2p &&
+        dagNodes[i].nodeData.p2p.ops != NULL) {
+      free(dagNodes[i].nodeData.p2p.ops);
+    }
+    if (dagNodes[i].parents != NULL) {
+      free(dagNodes[i].parents);
+    }
+    if (dagNodes[i].children != NULL) {
+      free(dagNodes[i].children);
+    }
+  }
+  free(dagNodes);
+}
+
+static bool getBufferOffsetBytes(const void *ptr, const void *base,
+                                 size_t bytes, size_t *offsetBytes) {
+  if (ptr == NULL || base == NULL) {
+    return false;
+  }
+  uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+  uintptr_t b = reinterpret_cast<uintptr_t>(base);
+  if (p < b || p - b >= bytes) {
+    return false;
+  }
+  *offsetBytes = static_cast<size_t>(p - b);
+  return true;
+}
+
+static flagcxResult_t getDevApiPointerForLocalBuffer(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm, const void *sendbuff,
+    void *recvbuff, size_t totalBytes, const void *ptr, int globalRank,
+    void **devPtr, size_t *offsetBytes) {
+  flagcxDevMem_t devMem = NULL;
+  size_t offset = 0;
+
+  // Prefer recvbuff when buffers alias; either DevMem points at the same raw
+  // address, and recvbuff is the destination surface for the ring pipeline.
+  if (getBufferOffsetBytes(ptr, recvbuff, totalBytes, &offset)) {
+    devMem = runnerState->devApiRecvMem;
+  } else if (getBufferOffsetBytes(ptr, sendbuff, totalBytes, &offset)) {
+    devMem = runnerState->devApiSendMem;
+  } else {
+    return flagcxInvalidArgument;
+  }
+
+  void *peerPtr =
+      getUniRunnerDevApiPeerPointer(comm, devMem, globalRank, offset);
+  if (peerPtr == NULL) {
+    return flagcxNotSupported;
+  }
+  *devPtr = peerPtr;
+  if (offsetBytes != NULL) {
+    *offsetBytes = offset;
+  }
+  return flagcxSuccess;
+}
+
+static const uniRunnerP2pOpData *
+findP2pOpOfType(const uniRunnerDagNode *node, flagcxDevicePrim type) {
+  if (node == NULL || node->nodeType != uniRunnerDagNodeTypeP2p) {
+    return NULL;
+  }
+  for (int i = 0; i < node->nodeData.p2p.numOps; i++) {
+    const uniRunnerP2pOpData *op = &node->nodeData.p2p.ops[i];
+    if (op->type == type) {
+      return op;
+    }
+  }
+  return NULL;
+}
+
+static flagcxResult_t addDevARDagEdge(std::vector<std::vector<int>> *parents,
+                                      std::vector<std::vector<int>> *children,
+                                      int parentIdx, int childIdx) {
+  if (parentIdx < 0 || childIdx < 0 ||
+      parentIdx >= static_cast<int>(children->size()) ||
+      childIdx >= static_cast<int>(parents->size()) ||
+      parentIdx == childIdx) {
+    return flagcxInternalError;
+  }
+  (*children)[parentIdx].push_back(childIdx);
+  (*parents)[childIdx].push_back(parentIdx);
+  return flagcxSuccess;
+}
+
+static flagcxResult_t finalizeDevARDag(flagcxUniRunnerState *runnerState,
+                                       uniRunnerDagNode *newDag, int newNum,
+                                       uniRunnerDagNode *oldDag, int oldNum,
+                                       std::vector<std::vector<int>> &parents,
+                                       std::vector<std::vector<int>> &children) {
+  for (int i = 0; i < newNum; i++) {
+    newDag[i].numParents = static_cast<int>(parents[i].size());
+    newDag[i].numChildren = static_cast<int>(children[i].size());
+    FLAGCXCHECK(allocDagNodeDeps(&newDag[i]));
+    for (int p = 0; p < newDag[i].numParents; p++) {
+      FLAGCXCHECK(setDagNodeParent(&newDag[i], p, parents[i][p]));
+    }
+    for (int c = 0; c < newDag[i].numChildren; c++) {
+      newDag[i].children[c] = children[i][c];
+    }
+  }
+
+  freeDagNodeStorage(oldDag, oldNum);
+  runnerState->dagNodes = newDag;
+  runnerState->numDagNodes = newNum;
+  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
+  runnerState->numPendingNodes = 0;
+  for (int i = 0; i < newNum; i++) {
+    if (newDag[i].numParents == 0) {
+      if (newDag[i].nodeType == uniRunnerDagNodeTypeRed ||
+          newDag[i].nodeType == uniRunnerDagNodeTypeDevCpy) {
+        flagcxIntruQueueEnqueue(&runnerState->redReadyQueue, &newDag[i]);
+      } else {
+        flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, &newDag[i]);
+      }
+    } else {
+      runnerState->numPendingNodes++;
+    }
+  }
+  return validateDagNodes(runnerState);
+}
+
+static flagcxResult_t buildUniRunnerStateDevAR(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
+    flagcxComm_t comm, bool useGet) {
+  if (comm->localRanks != comm->nranks) {
+    return flagcxNotSupported;
+  }
+  if (count == 0 || comm->nranks <= 1) {
+    return buildUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff, count,
+                                       datatype, op, comm);
+  }
+
+  size_t typeSize = getFlagcxDataTypeSize(datatype);
+  if (typeSize == 0) {
+    return flagcxNotSupported;
+  }
+  size_t totalBytes = count * typeSize;
+
+  FLAGCXCHECK(buildUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff,
+                                          count, datatype, op, comm));
+  uniRunnerDagNode *oldDag = runnerState->dagNodes;
+  int oldNum = runnerState->numDagNodes;
+
+  int p2pCount = 0;
+  int newNum = 0;
+  for (int i = 0; i < oldNum; i++) {
+    if (oldDag[i].nodeType == uniRunnerDagNodeTypeP2p) {
+      p2pCount++;
+      newNum += (oldDag[i].numParents > 1 ? 1 : 0) + (useGet ? 3 : 2);
+    } else {
+      newNum++;
+    }
+  }
+
+  FLAGCXCHECK(ensureUniRunnerDevApiDataViews(runnerState, comm, sendbuff,
+                                             recvbuff, totalBytes));
+  FLAGCXCHECK(ensureUniRunnerDevApiFlags(runnerState, comm, p2pCount));
+
+  uniRunnerDagNode *newDag = NULL;
+  FLAGCXCHECK(flagcxCalloc(&newDag, newNum * sizeof(struct uniRunnerDagNode)));
+  if (newDag == NULL) {
+    return flagcxSystemError;
+  }
+
+  std::vector<std::vector<int>> parents(newNum);
+  std::vector<std::vector<int>> children(newNum);
+  std::vector<int> startMap(oldNum, -1);
+  std::vector<int> completeMap(oldNum, -1);
+
+  int nextRank = (comm->rank + 1) % comm->nranks;
+  int prevRank = (comm->rank - 1 + comm->nranks) % comm->nranks;
+  int newIdx = 0;
+  int p2pOrdinal = 0;
+
+  for (int oldIdx = 0; oldIdx < oldNum; oldIdx++) {
+    uniRunnerDagNode *oldNode = &oldDag[oldIdx];
+    if (oldNode->nodeType == uniRunnerDagNodeTypeRed) {
+      int redIdx = newIdx++;
+      newDag[redIdx].nodeIdx = redIdx;
+      newDag[redIdx].nodeType = uniRunnerDagNodeTypeRed;
+      newDag[redIdx].nodeData.red = oldNode->nodeData.red;
+      newDag[redIdx].nodeData.red.triggerIdx = -1;
+      startMap[oldIdx] = redIdx;
+      completeMap[oldIdx] = redIdx;
+      continue;
+    }
+    if (oldNode->nodeType != uniRunnerDagNodeTypeP2p) {
+      return flagcxNotSupported;
+    }
+
+    const uniRunnerP2pOpData *sendOp =
+        findP2pOpOfType(oldNode, flagcxDevicePrimSend);
+    const uniRunnerP2pOpData *recvOp =
+        findP2pOpOfType(oldNode, flagcxDevicePrimRecv);
+    if (sendOp == NULL || recvOp == NULL) {
+      return flagcxNotSupported;
+    }
+
+    int joinIdx = -1;
+    if (oldNode->numParents > 1) {
+      joinIdx = newIdx++;
+      initCpyDagNode(&newDag[joinIdx], joinIdx, NULL, NULL, NULL, 0, datatype);
+    }
+
+    size_t sendOffset = 0;
+    void *localSend = NULL;
+    FLAGCXCHECK(getDevApiPointerForLocalBuffer(
+        runnerState, comm, sendbuff, recvbuff, totalBytes, sendOp->addr,
+        comm->rank, &localSend, &sendOffset));
+
+    void *remoteRecv =
+        useGet ? NULL
+               : getUniRunnerDevApiPeerPointer(
+                     comm, runnerState->devApiRecvMem, nextRank, sendOffset);
+    void *remoteFlag =
+        getUniRunnerDevApiPeerFlag(runnerState, comm, nextRank, p2pOrdinal);
+    void *localFlag = getUniRunnerDevApiLocalFlag(runnerState, p2pOrdinal);
+    if ((!useGet && remoteRecv == NULL) || remoteFlag == NULL ||
+        localFlag == NULL) {
+      return flagcxNotSupported;
+    }
+
+    if (useGet) {
+      int signalIdx = newIdx++;
+      int waitReadyIdx = newIdx++;
+      int getIdx = newIdx++;
+
+      initDevCpyDagNode(&newDag[signalIdx], signalIdx, flagcxDevicePrimPut,
+                        NULL, NULL, remoteFlag, 0,
+                        runnerState->uniRunnerNThreads, datatype, nextRank);
+      initCpyDagNode(&newDag[waitReadyIdx], waitReadyIdx, NULL, NULL,
+                     localFlag, 0, datatype);
+
+      size_t recvOffset = 0;
+      void *localRecv = NULL;
+      FLAGCXCHECK(getDevApiPointerForLocalBuffer(
+          runnerState, comm, sendbuff, recvbuff, totalBytes, recvOp->addr,
+          comm->rank, &localRecv, &recvOffset));
+
+      flagcxDevMem_t remoteSrcMem =
+          getBufferOffsetBytes(sendOp->addr, recvbuff, totalBytes,
+                               &sendOffset)
+              ? runnerState->devApiRecvMem
+              : runnerState->devApiSendMem;
+      void *remoteSrc =
+          getUniRunnerDevApiPeerPointer(comm, remoteSrcMem, prevRank,
+                                        recvOffset);
+      if (remoteSrc == NULL || localRecv == NULL) {
+        return flagcxNotSupported;
+      }
+
+      initDevCpyDagNode(&newDag[getIdx], getIdx, flagcxDevicePrimGet,
+                        remoteSrc, localRecv, NULL, recvOp->count,
+                        runnerState->uniRunnerNThreads, datatype, prevRank);
+
+      if (joinIdx >= 0) {
+        FLAGCXCHECK(addDevARDagEdge(&parents, &children, joinIdx, signalIdx));
+      }
+      FLAGCXCHECK(
+          addDevARDagEdge(&parents, &children, signalIdx, waitReadyIdx));
+      FLAGCXCHECK(addDevARDagEdge(&parents, &children, waitReadyIdx, getIdx));
+      startMap[oldIdx] = joinIdx >= 0 ? joinIdx : signalIdx;
+      completeMap[oldIdx] = getIdx;
+    } else {
+      int putIdx = newIdx++;
+      int waitIdx = newIdx++;
+
+      initDevCpyDagNode(&newDag[putIdx], putIdx, flagcxDevicePrimPut,
+                        localSend, remoteRecv, remoteFlag, sendOp->count,
+                        runnerState->uniRunnerNThreads, datatype, nextRank);
+      initCpyDagNode(&newDag[waitIdx], waitIdx, NULL, NULL, localFlag, 0,
+                     datatype);
+
+      if (joinIdx >= 0) {
+        FLAGCXCHECK(addDevARDagEdge(&parents, &children, joinIdx, putIdx));
+      }
+      FLAGCXCHECK(addDevARDagEdge(&parents, &children, putIdx, waitIdx));
+      startMap[oldIdx] = joinIdx >= 0 ? joinIdx : putIdx;
+      completeMap[oldIdx] = waitIdx;
+    }
+    p2pOrdinal++;
+  }
+
+  if (newIdx != newNum || p2pOrdinal != p2pCount) {
+    return flagcxInternalError;
+  }
+
+  for (int oldIdx = 0; oldIdx < oldNum; oldIdx++) {
+    for (int c = 0; c < oldDag[oldIdx].numChildren; c++) {
+      int oldChild = oldDag[oldIdx].children[c];
+      FLAGCXCHECK(addDevARDagEdge(&parents, &children, completeMap[oldIdx],
+                                  startMap[oldChild]));
+    }
+  }
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initialized DevAR %s from SlicedAR, oldNodes=%d newNodes=%d "
+        "p2p=%d",
+        comm->rank, useGet ? "get" : "put", oldNum, newNum, p2pCount);
+
+  return finalizeDevARDag(runnerState, newDag, newNum, oldDag, oldNum, parents,
+                          children);
+}
+
 static flagcxResult_t buildUniRunnerStateDevApiTest(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
@@ -3219,6 +3543,24 @@ flagcxResult_t initUniRunnerStateDevApiTest(
                                        datatype, op, comm);
 }
 
+flagcxResult_t initUniRunnerStateDevARPut(flagcxUniRunnerState *runnerState,
+                                          const void *sendbuff, void *recvbuff,
+                                          size_t count,
+                                          flagcxDataType_t datatype,
+                                          flagcxRedOp_t op, flagcxComm_t comm) {
+  return buildUniRunnerStateDevAR(runnerState, sendbuff, recvbuff, count,
+                                  datatype, op, comm, false);
+}
+
+flagcxResult_t initUniRunnerStateDevARGet(flagcxUniRunnerState *runnerState,
+                                          const void *sendbuff, void *recvbuff,
+                                          size_t count,
+                                          flagcxDataType_t datatype,
+                                          flagcxRedOp_t op, flagcxComm_t comm) {
+  return buildUniRunnerStateDevAR(runnerState, sendbuff, recvbuff, count,
+                                  datatype, op, comm, true);
+}
+
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,
@@ -3348,12 +3690,25 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
             comm->rank, current->nodeIdx, parentIdx);
     }
 
-    // Launch copy
-    FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-        current->nodeData.cpy.dst, current->nodeData.cpy.src,
-        current->nodeData.cpy.count *
-            getFlagcxDataTypeSize(current->nodeData.cpy.datatype),
-        flagcxMemcpyDeviceToDevice, runnerState->cpyStream, NULL));
+    if (current->nodeData.cpy.waitFlag != NULL) {
+      FLAGCXCHECK(deviceAdaptor->streamWaitValue64(
+          runnerState->cpyStream, current->nodeData.cpy.waitFlag,
+          flagcxStreamFlagDone, 0));
+      TRACE(FLAGCX_UNIRUNNER,
+            "rank %d cpy op %d streamWait ipc flag %p: DONE", comm->rank,
+            current->nodeIdx, current->nodeData.cpy.waitFlag);
+    }
+
+    // Launch copy when this cpy node carries a real transfer. Some DevAR
+    // nodes use the copy stream only as a fan-in or IPC flag wait.
+    if (current->nodeData.cpy.count != 0 && current->nodeData.cpy.src != NULL &&
+        current->nodeData.cpy.dst != NULL) {
+      FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+          current->nodeData.cpy.dst, current->nodeData.cpy.src,
+          current->nodeData.cpy.count *
+              getFlagcxDataTypeSize(current->nodeData.cpy.datatype),
+          flagcxMemcpyDeviceToDevice, runnerState->cpyStream, NULL));
+    }
 
     // Write flag to stream
     TRACE(FLAGCX_UNIRUNNER, "rank %d cpy op %d streamWrite flag %d: DONE",
@@ -3570,9 +3925,9 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
 
     FLAGCXCHECK(processReadyQueue(runnerState, hcomm));
   }
-  deviceAdaptor->streamSynchronize(runnerState->redStream);
-  deviceAdaptor->streamSynchronize(runnerState->cpyStream);
-  deviceAdaptor->streamSynchronize(runnerState->commStream);
+  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->redStream));
+  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->cpyStream));
+  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->commStream));
 
   return flagcxSuccess;
 }

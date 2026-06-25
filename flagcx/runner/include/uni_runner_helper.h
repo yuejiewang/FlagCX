@@ -100,6 +100,10 @@ inline const char *uniRunnerDagAlgoTypeToString(uniRunnerDagAlgoType algoType) {
       return "ring_rs";
     case uniRunnerDagAlgoTreeRed:
       return "tree_red";
+    case uniRunnerDagAlgoDevARPut:
+      return "dev_ar_put";
+    case uniRunnerDagAlgoDevARGet:
+      return "dev_ar_get";
     default:
       return "unknown";
   }
@@ -123,6 +127,10 @@ inline bool uniRunnerDagAlgoTypeFromString(const std::string &text,
     *algoType = uniRunnerDagAlgoRingRS;
   } else if (text == "tree_red") {
     *algoType = uniRunnerDagAlgoTreeRed;
+  } else if (text == "dev_ar_put") {
+    *algoType = uniRunnerDagAlgoDevARPut;
+  } else if (text == "dev_ar_get") {
+    *algoType = uniRunnerDagAlgoDevARGet;
   } else {
     return false;
   }
