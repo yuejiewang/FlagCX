@@ -1,3 +1,5 @@
+import json
+import os
 from typing import *
 from enum import *
 from itertools import count
@@ -42,3 +44,198 @@ class Primitive(Enum):
     Nop = 11
     LocCpy = 12
     LocRed = 13
+
+
+class DataType(Enum):
+    int8 = 0
+    uint8 = 1
+    int32 = 2
+    uint32 = 3
+    int64 = 4
+    uint64 = 5
+    float16 = 6
+    float32 = 7
+    float = 7
+    float64 = 8
+    bfloat16 = 9
+
+
+class BufferKind(str, Enum):
+    none = "none"
+    input = "input"
+    output = "output"
+    scratch = "scratch"
+
+
+class P2pType(str, Enum):
+    send = "send"
+    recv = "recv"
+    term = "term"
+    wait = "wait"
+    put = "put"
+    signal = "signal"
+    barrier_signal = "barrier_signal"
+    wait_signal = "wait_signal"
+    put_value = "put_value"
+    put_signal = "put_signal"
+    get = "get"
+
+
+class AlgoType(str, Enum):
+    dummy = "dummy"
+    loc_red = "loc_red"
+    grouped_ag = "grouped_ag"
+    ring_ag = "ring_ag"
+    ring_ar = "ring_ar"
+    sliced_ar = "sliced_ar"
+    ring_rs = "ring_rs"
+    tree_red = "tree_red"
+
+
+FORMAT_VERSION = 1
+DEFAULT_NUM_SLICES = 1
+DEFAULT_NUM_RED_SLICES = 0
+DEFAULT_RED_SLICE_SIZE = 65536
+DEFAULT_NTHREADS = 32
+SIZE_T_MASK = (1 << 64) - 1
+HASH_CONSTANT = 0x9E3779B97F4A7C15
+
+DATA_TYPE_SIZES = {
+    DataType.int8: 1,
+    DataType.uint8: 1,
+    DataType.int32: 4,
+    DataType.uint32: 4,
+    DataType.int64: 8,
+    DataType.uint64: 8,
+    DataType.float16: 2,
+    DataType.float32: 4,
+    DataType.float64: 8,
+    DataType.bfloat16: 2,
+}
+
+ALGO_TO_INT = {
+    "dummy": 0,
+    "loc_red": 1,
+    "grouped_ag": 2,
+    "ring_ag": 3,
+    "ring_ar": 4,
+    "sliced_ar": 5,
+    "ring_rs": 6,
+    "tree_red": 7,
+}
+
+COMM_OP_TO_INT = {
+    "send": 0,
+    "recv": 1,
+    "broadcast": 2,
+    "gather": 3,
+    "scatter": 4,
+    "reduce": 5,
+    "all_reduce": 6,
+    "all_gather": 7,
+    "reduce_scatter": 8,
+    "all_to_all": 9,
+    "all_to_allv": 10,
+    "noop": 11,
+}
+
+COLLECTIVE_TO_COMM_OP = {
+    Collective.P2P: "send",
+    Collective.Custom: "noop",
+    Collective.Broadcast: "broadcast",
+    Collective.Gather: "gather",
+    Collective.Scatter: "scatter",
+    Collective.Reduce: "reduce",
+    Collective.AllReduce: "all_reduce",
+    Collective.AllGather: "all_gather",
+    Collective.ReduceScatter: "reduce_scatter",
+    Collective.AlltoAll: "all_to_all",
+    Collective.AlltoAllv: "all_to_allv",
+    Collective.Nop: "noop",
+}
+
+
+def _enum_value(value):
+    return value.value if isinstance(value, Enum) else value
+
+
+def _datatype_value(datatype: Union[DataType, int]) -> int:
+    return int(_enum_value(datatype))
+
+
+def _datatype_size(datatype: Union[DataType, int]) -> int:
+    if isinstance(datatype, DataType):
+        return DATA_TYPE_SIZES[datatype]
+    for candidate, size in DATA_TYPE_SIZES.items():
+        if candidate.value == datatype:
+            return size
+    raise ValueError(f"Unsupported datatype value {datatype}")
+
+
+def _red_op_value(red_op: Union[RedOp, int]) -> int:
+    return int(_enum_value(red_op))
+
+
+def _red_op_from_value(red_op: Union[RedOp, int]) -> RedOp:
+    if isinstance(red_op, RedOp):
+        return red_op
+    return RedOp(red_op)
+
+
+def _comm_op_name(collective: Collective, comm_op: Optional[str]) -> str:
+    if comm_op is not None:
+        return comm_op
+    return COLLECTIVE_TO_COMM_OP[collective]
+
+
+def _hash_combine(seed: int, value: int) -> int:
+    return (
+        seed
+        ^ ((value & SIZE_T_MASK) + HASH_CONSTANT + ((seed << 6) & SIZE_T_MASK) + (seed >> 2))
+    ) & SIZE_T_MASK
+
+
+def _write_json_file(path: str, payload: Mapping):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+
+def _rank_chunk(count: int, nranks: int, chunk: int) -> Tuple[int, int]:
+    base = count // nranks
+    remainder = count % nranks
+    chunk_count = base + (1 if chunk < remainder else 0)
+    offset = chunk * base + min(chunk, remainder)
+    return offset, chunk_count
+
+
+def _slice_chunk(count: int, num_slices: int, slice_idx: int) -> Tuple[int, int]:
+    base = count // num_slices
+    remainder = count % num_slices
+    slice_count = base + (1 if slice_idx < remainder else 0)
+    offset = slice_idx * base + min(slice_idx, remainder)
+    return offset, slice_count
+
+
+def _effective_red_slices(
+    count: int,
+    nranks: int,
+    num_slices: int,
+    num_red_slices: int,
+    red_slice_size: int,
+) -> int:
+    if num_red_slices != 0:
+        return num_red_slices
+    if count == 0 or red_slice_size == 0 or num_slices == 0 or nranks <= 0:
+        return 1
+    divisor = nranks * num_slices * red_slice_size
+    return max(1, (count + divisor - 1) // divisor)
+
+
+def _rank_slice(count: int, nranks: int, num_slices: int, chunk: int, slice_idx: int) -> Tuple[int, int]:
+    chunk_offset, chunk_count = _rank_chunk(count, nranks, chunk)
+    slice_offset, slice_count = _slice_chunk(chunk_count, num_slices, slice_idx)
+    return chunk_offset + slice_offset, slice_count

@@ -75,8 +75,8 @@ Use `workflow.write_rank_files(cache_dir)` to write those files.
 ## Basic DSL
 
 ```python
-from uni_runner import DataType, UniRunnerWorkflow
-from utils import Collective, RedOp
+from uni_runner import UniRunnerWorkflow
+from utils import Collective, DataType, RedOp
 
 with UniRunnerWorkflow(
     "my_allreduce",
@@ -167,10 +167,11 @@ all nodes are present.
 
 ## Built-In Examples
 
-`flagcx/tools/uni_runner_examples.py` defines two complete example algorithms.
+`flagcx/tools/test_uni_runner.py` defines two complete example algorithms and
+also contains the Python-only tests.
 
 ```bash
-python flagcx/tools/uni_runner_examples.py --output-dir /tmp/unirunner-dsl
+python flagcx/tools/test_uni_runner.py --generate-examples --output-dir /tmp/unirunner-dsl
 ```
 
 This writes:
@@ -182,7 +183,7 @@ This writes:
 The example builders are also importable:
 
 ```python
-from uni_runner_examples import build_groupedag_example, build_slicedar_example
+from test_uni_runner import build_groupedag_example, build_slicedar_example
 
 groupedag = build_groupedag_example()
 slicedar = build_slicedar_example()
