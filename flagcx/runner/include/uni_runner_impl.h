@@ -32,7 +32,8 @@ typedef enum {
   uniRunnerDagAlgoRingAR = 4,
   uniRunnerDagAlgoSlicedAR = 5,
   uniRunnerDagAlgoRingRS = 6,
-  uniRunnerDagAlgoTreeRed = 7
+  uniRunnerDagAlgoTreeRed = 7,
+  uniRunnerDagAlgoHierarchicalSlicedAR = 8
 } uniRunnerDagAlgoType;
 
 // Cache key describing a reusable uniRunner DAG template.
@@ -167,6 +168,10 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
                                           size_t count,
                                           flagcxDataType_t datatype,
                                           flagcxRedOp_t op, flagcxComm_t comm);
+flagcxResult_t initUniRunnerStateHierarchicalSlicedAR(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    void *scratchbuff, size_t count, flagcxDataType_t datatype,
+    flagcxRedOp_t op, flagcxComm_t comm, int groupSize);
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,

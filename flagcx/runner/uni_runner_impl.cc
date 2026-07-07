@@ -2798,6 +2798,50 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   });
 }
 
+flagcxResult_t initUniRunnerStateHierarchicalSlicedAR(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    void *scratchbuff, size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
+    flagcxComm_t comm, int groupSize) {
+  if (groupSize <= 0 || groupSize > comm->nranks ||
+      comm->nranks % groupSize != 0) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "rank %d hierarchical SlicedAR groupSize %d invalid for nranks %d",
+          comm->rank, groupSize, comm->nranks);
+    return flagcxInvalidArgument;
+  }
+
+  size_t typeSize = getFlagcxDataTypeSize(datatype);
+  runnerState->uniRunnerNRedSlices =
+      resolveEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
+
+  uniRunnerDagRuntimeBindings bindings;
+  bindings.inputBase = sendbuff;
+  bindings.outputBase = recvbuff;
+  bindings.scratchBase = scratchbuff;
+  bindings.inputBytes = count * typeSize;
+  bindings.outputBytes = count * typeSize;
+  bindings.scratchBytes = count * typeSize;
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initUniRunnerStateHierarchicalSlicedAR called, count=%lu, "
+        "groupSize=%d, numSlices=%lu, numRedSlices=%lu",
+        comm->rank, count, groupSize, runnerState->uniRunnerNSlices,
+        runnerState->uniRunnerNRedSlices);
+
+  uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
+      uniRunnerDagAlgoHierarchicalSlicedAR, flagcxCommOpAllReduce, count,
+      datatype, op, -1, groupSize, runnerState, comm, sendbuff, recvbuff,
+      scratchbuff);
+  return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
+    TRACE(FLAGCX_UNIRUNNER,
+          "hierarchical SlicedAR requires a cached DSL DAG, algo=%s commOp=%s "
+          "groupSize=%d",
+          uniRunnerDagAlgoTypeToString(uniRunnerDagAlgoHierarchicalSlicedAR),
+          uniRunnerCommOpToString(flagcxCommOpAllReduce), groupSize);
+    return flagcxInvalidUsage;
+  });
+}
+
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,

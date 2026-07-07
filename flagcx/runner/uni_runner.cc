@@ -10,8 +10,12 @@
 FLAGCX_PARAM(UniRunnerUseLocRed, "UNIRUNNER_USE_LOCRED", 0);
 FLAGCX_PARAM(UniRunnerUseRingAG, "UNIRUNNER_USE_RINGAG", 0);
 FLAGCX_PARAM(UniRunnerUseSlicedAR, "UNIRUNNER_USE_SLICEDAR", 0);
+FLAGCX_PARAM(UniRunnerUseHierarchicalSlicedAR,
+             "UNIRUNNER_USE_HIERARCHICAL_SLICEDAR", 0);
 FLAGCX_PARAM(UniRunnerUseGroupedAG, "UNIRUNNER_USE_GROUPEDAG", 1);
 FLAGCX_PARAM(UniRunnerGroupSize, "UNIRUNNER_GROUPSIZE", 0);
+
+static constexpr int kDefaultHierarchicalSlicedARGroupSize = 8;
 
 static int resolveUniRunnerGroupedAGGroupSize(flagcxComm_t comm) {
   if (comm->nranks <= 0) {
@@ -27,6 +31,26 @@ static int resolveUniRunnerGroupedAGGroupSize(flagcxComm_t comm) {
     TRACE(FLAGCX_UNIRUNNER,
           "rank %d groupedAG groupSize %d invalid for nranks %d, fallback to "
           "nranks",
+          comm->rank, groupSize, comm->nranks);
+    groupSize = comm->nranks;
+  }
+  return groupSize;
+}
+
+static int resolveUniRunnerHierarchicalSlicedARGroupSize(flagcxComm_t comm) {
+  if (comm->nranks <= 0) {
+    return 0;
+  }
+
+  int groupSize = flagcxParamUniRunnerGroupSize();
+  if (groupSize <= 0) {
+    groupSize = kDefaultHierarchicalSlicedARGroupSize;
+  }
+  if (groupSize <= 0 || groupSize > comm->nranks ||
+      comm->nranks % groupSize != 0) {
+    TRACE(FLAGCX_UNIRUNNER,
+          "rank %d hierarchical SlicedAR groupSize %d invalid for nranks %d, "
+          "fallback to nranks",
           comm->rank, groupSize, comm->nranks);
     groupSize = comm->nranks;
   }
@@ -122,6 +146,7 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
   flagcxResult_t res = flagcxSuccess;
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  void *scratchbuff = nullptr;
   FLAGCXCHECK(initUniRunner(comm, stream));
   if (flagcxParamUniRunnerUseLocRed()) {
     /* initialize uniRunnerState for reduce test */
@@ -132,6 +157,17 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
     /* initialize uniRunnerState for p2p test */
     FLAGCXCHECKGOTO(initUniRunnerStateRingAG(runnerState, sendbuff, recvbuff,
                                              count, datatype, op, comm),
+                    res, out);
+  } else if (flagcxParamUniRunnerUseHierarchicalSlicedAR()) {
+    /* load the DSL-defined hierarchical SlicedAR DAG with a distinct key */
+    int groupSize = resolveUniRunnerHierarchicalSlicedARGroupSize(comm);
+    FLAGCXCHECKGOTO(deviceAdaptor->deviceMalloc(
+                        &scratchbuff, count * getFlagcxDataTypeSize(datatype),
+                        flagcxMemDevice, stream),
+                    res, out);
+    FLAGCXCHECKGOTO(initUniRunnerStateHierarchicalSlicedAR(
+                        runnerState, sendbuff, recvbuff, scratchbuff, count,
+                        datatype, op, comm, groupSize),
                     res, out);
   } else if (flagcxParamUniRunnerUseSlicedAR()) {
     /* initialize uniRunnerState for sliced AllReduce */
@@ -144,8 +180,12 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
                                              count, datatype, op, comm),
                     res, out);
   }
-  FLAGCXCHECK(runUniRunner(comm));
+  FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
 out:
+  if (scratchbuff != nullptr) {
+    FLAGCXCHECK(
+        deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream));
+  }
   FLAGCXCHECK(cleanupUniRunner(comm));
   return res;
 }

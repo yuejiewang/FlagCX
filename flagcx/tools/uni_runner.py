@@ -433,6 +433,8 @@ class UniRunnerWorkflow:
             )
         if semantic is None:
             return SemanticCheckResult(False, ["custom workflows need an explicit semantic specification"])
+        if semantic.scratch_count < self.scratch_count:
+            semantic.scratch_count = self.scratch_count
         return check_dag_semantics(self, semantic)
 
     def cache_key(self, rank: int) -> UniRunnerDagCacheKey:

@@ -90,6 +90,7 @@ class AlgoType(str, Enum):
     sliced_ar = "sliced_ar"
     ring_rs = "ring_rs"
     tree_red = "tree_red"
+    hierarchical_sliced_ar = "hierarchical_sliced_ar"
 
 
 FORMAT_VERSION = 1
@@ -122,6 +123,7 @@ ALGO_TO_INT = {
     "sliced_ar": 5,
     "ring_rs": 6,
     "tree_red": 7,
+    "hierarchical_sliced_ar": 8,
 }
 
 COMM_OP_TO_INT = {

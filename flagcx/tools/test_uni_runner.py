@@ -7,10 +7,13 @@ import sys
 import tempfile
 import unittest
 from typing import List, Optional, Tuple, Union
+from unittest.mock import patch
 
 TOOLS_DIR = os.path.dirname(__file__)
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
+REPO_ROOT = os.path.abspath(os.path.join(TOOLS_DIR, "..", ".."))
+DEFAULT_OUTPUT_DIR = os.path.join(REPO_ROOT, "algo_output")
 
 from semantics import CollectiveSemantics
 from uni_runner import P2pOp, UniRunnerWorkflow
@@ -23,10 +26,15 @@ from utils import (
     DataType,
     RedOp,
     _effective_red_slices,
+    _rank_chunk,
     _rank_slice,
     _red_op_from_value,
     _slice_chunk,
 )
+
+
+DEFAULT_HIERARCHICAL_GROUP_SIZE = 8
+HIERARCHICAL_GROUP_SIZE_ENV = "UNIRUNNER_GROUPSIZE"
 
 
 def build_groupedag(
@@ -245,6 +253,293 @@ def build_slicedar(
     return workflow
 
 
+def build_hierarchical_slicedar(
+    name: str = "hierarchical_slicedar",
+    world_size: int = 16,
+    count: int = 16,
+    group_size: Optional[int] = None,
+    datatype: Union[DataType, int] = DataType.float32,
+    red_op: Union[RedOp, int] = RedOp.sum,
+    num_slices: int = 2,
+    num_red_slices: int = 0,
+    red_slice_size: int = DEFAULT_RED_SLICE_SIZE,
+    nthreads: int = DEFAULT_NTHREADS,
+) -> UniRunnerWorkflow:
+    group_size = _resolve_hierarchical_group_size(world_size, group_size)
+    n_groups = world_size // group_size
+    red_op_enum = _red_op_from_value(red_op)
+    effective_red_slices = _effective_red_slices(
+        count, world_size, num_slices, num_red_slices, red_slice_size
+    )
+
+    with UniRunnerWorkflow(
+        name,
+        collective=Collective.AllReduce,
+        world_size=world_size,
+        count=count,
+        datatype=datatype,
+        red_op=red_op_enum,
+        algo=AlgoType.hierarchical_sliced_ar,
+        group_size=group_size,
+        num_slices=num_slices,
+        num_red_slices=effective_red_slices,
+        red_slice_size=red_slice_size,
+        nthreads=nthreads,
+        input_count=count,
+        output_count=count,
+        scratch_count=count,
+    ) as workflow:
+        if world_size == 1:
+            with workflow.rank(0) as rb:
+                rb.cpy(workflow.input(0), workflow.output(0), count, name="self_copy")
+            return workflow
+
+        for rank in workflow.ranks():
+            group_idx = rank // group_size
+            loc_rank = rank % group_size
+            next_local_rank = group_idx * group_size + (loc_rank + 1) % group_size
+            prev_local_rank = group_idx * group_size + (loc_rank - 1 + group_size) % group_size
+            next_group_rank = ((group_idx + 1) % n_groups) * group_size + loc_rank
+            prev_group_rank = ((group_idx - 1 + n_groups) % n_groups) * group_size + loc_rank
+            owner_chunk = (loc_rank + 1) % group_size if group_size > 1 else 0
+            owner_offset, owner_count = _rank_chunk(count, group_size, owner_chunk)
+
+            with workflow.rank(rank) as rb:
+                phase_tail: List[int] = []
+
+                if group_size == 1:
+                    phase_tail = [
+                        rb.cpy(workflow.input(0), workflow.output(0), count, name="local_copy")
+                    ]
+                else:
+                    phase_tail = _add_local_reduce_scatter(
+                        workflow,
+                        rb,
+                        rank=rank,
+                        loc_rank=loc_rank,
+                        group_size=group_size,
+                        next_rank=next_local_rank,
+                        prev_rank=prev_local_rank,
+                        count=count,
+                        num_slices=num_slices,
+                        effective_red_slices=effective_red_slices,
+                        red_op=red_op_enum,
+                        parents=phase_tail,
+                    )
+
+                if n_groups > 1:
+                    phase_tail = _add_inter_node_allreduce_for_chunk(
+                        workflow,
+                        rb,
+                        group_idx=group_idx,
+                        n_groups=n_groups,
+                        next_rank=next_group_rank,
+                        prev_rank=prev_group_rank,
+                        chunk_offset=owner_offset,
+                        chunk_count=owner_count,
+                        num_slices=num_slices,
+                        effective_red_slices=effective_red_slices,
+                        red_op=red_op_enum,
+                        parents=phase_tail,
+                    )
+
+                if group_size > 1:
+                    phase_tail = _add_local_allgather(
+                        workflow,
+                        rb,
+                        loc_rank=loc_rank,
+                        group_size=group_size,
+                        next_rank=next_local_rank,
+                        prev_rank=prev_local_rank,
+                        count=count,
+                        num_slices=num_slices,
+                        parents=phase_tail,
+                    )
+    return workflow
+
+
+def _resolve_hierarchical_group_size(world_size: int, group_size: Optional[int]) -> int:
+    if group_size is None:
+        group_size_text = os.environ.get(HIERARCHICAL_GROUP_SIZE_ENV)
+        group_size = int(group_size_text) if group_size_text else DEFAULT_HIERARCHICAL_GROUP_SIZE
+    if group_size <= 0:
+        raise ValueError("group_size must be positive")
+    if group_size > world_size or world_size % group_size != 0:
+        raise ValueError("group_size must divide world_size and must not exceed world_size")
+    return group_size
+
+
+def _add_local_reduce_scatter(
+    workflow: UniRunnerWorkflow,
+    rb,
+    rank: int,
+    loc_rank: int,
+    group_size: int,
+    next_rank: int,
+    prev_rank: int,
+    count: int,
+    num_slices: int,
+    effective_red_slices: int,
+    red_op: RedOp,
+    parents: List[int],
+) -> List[int]:
+    phase_tail = list(parents)
+    for slice_idx in range(num_slices):
+        for step in range(group_size - 1):
+            tx_chunk = (loc_rank - step + group_size) % group_size
+            rx_chunk = (loc_rank - step - 1 + group_size) % group_size
+            tx_offset, tx_count = _rank_slice(count, group_size, num_slices, tx_chunk, slice_idx)
+            rx_offset, rx_count = _rank_slice(count, group_size, num_slices, rx_chunk, slice_idx)
+            send_ref = workflow.input(tx_offset) if step == 0 else workflow.output(tx_offset)
+            p2p = rb.p2p(
+                [
+                    workflow.send(next_rank, send_ref, tx_count),
+                    workflow.recv(prev_rank, workflow.output(rx_offset), rx_count),
+                ],
+                parents=phase_tail,
+                name=f"local_rs_rank{rank}_s{slice_idx}_step{step}",
+            )
+            phase_tail = _add_reduce_slices(
+                workflow,
+                rb,
+                input1_kind="output",
+                input2_kind="input",
+                output_kind="output",
+                offset=rx_offset,
+                count=rx_count,
+                effective_red_slices=effective_red_slices,
+                red_op=red_op,
+                parents=[p2p],
+                name=f"local_rs_red_rank{rank}_s{slice_idx}_step{step}",
+            )
+    return phase_tail
+
+
+def _add_inter_node_allreduce_for_chunk(
+    workflow: UniRunnerWorkflow,
+    rb,
+    group_idx: int,
+    n_groups: int,
+    next_rank: int,
+    prev_rank: int,
+    chunk_offset: int,
+    chunk_count: int,
+    num_slices: int,
+    effective_red_slices: int,
+    red_op: RedOp,
+    parents: List[int],
+) -> List[int]:
+    phase_tail = list(parents)
+    for slice_idx in range(num_slices):
+        for step in range(n_groups - 1):
+            tx_chunk = (group_idx - step + n_groups) % n_groups
+            rx_chunk = (group_idx - step - 1 + n_groups) % n_groups
+            tx_rel_offset, tx_count = _rank_slice(chunk_count, n_groups, num_slices, tx_chunk, slice_idx)
+            rx_rel_offset, rx_count = _rank_slice(chunk_count, n_groups, num_slices, rx_chunk, slice_idx)
+            tx_offset = chunk_offset + tx_rel_offset
+            rx_offset = chunk_offset + rx_rel_offset
+            p2p = rb.p2p(
+                [
+                    workflow.send(next_rank, workflow.output(tx_offset), tx_count),
+                    workflow.recv(prev_rank, workflow.scratch(rx_offset), rx_count),
+                ],
+                parents=phase_tail,
+                name=f"inter_rs_s{slice_idx}_step{step}",
+            )
+            phase_tail = _add_reduce_slices(
+                workflow,
+                rb,
+                input1_kind="output",
+                input2_kind="scratch",
+                output_kind="output",
+                offset=rx_offset,
+                count=rx_count,
+                effective_red_slices=effective_red_slices,
+                red_op=red_op,
+                parents=[p2p],
+                name=f"inter_rs_red_s{slice_idx}_step{step}",
+            )
+
+        for step in range(n_groups - 1):
+            tx_chunk = (group_idx - step + 1 + n_groups) % n_groups
+            rx_chunk = (group_idx - step + n_groups) % n_groups
+            tx_rel_offset, tx_count = _rank_slice(chunk_count, n_groups, num_slices, tx_chunk, slice_idx)
+            rx_rel_offset, rx_count = _rank_slice(chunk_count, n_groups, num_slices, rx_chunk, slice_idx)
+            phase_tail = [
+                rb.p2p(
+                    [
+                        workflow.send(next_rank, workflow.output(chunk_offset + tx_rel_offset), tx_count),
+                        workflow.recv(prev_rank, workflow.output(chunk_offset + rx_rel_offset), rx_count),
+                    ],
+                    parents=phase_tail,
+                    name=f"inter_ag_s{slice_idx}_step{step}",
+                )
+            ]
+    return phase_tail
+
+
+def _add_local_allgather(
+    workflow: UniRunnerWorkflow,
+    rb,
+    loc_rank: int,
+    group_size: int,
+    next_rank: int,
+    prev_rank: int,
+    count: int,
+    num_slices: int,
+    parents: List[int],
+) -> List[int]:
+    phase_tail = list(parents)
+    for slice_idx in range(num_slices):
+        for step in range(group_size - 1):
+            tx_chunk = (loc_rank - step + 1 + group_size) % group_size
+            rx_chunk = (loc_rank - step + group_size) % group_size
+            tx_offset, tx_count = _rank_slice(count, group_size, num_slices, tx_chunk, slice_idx)
+            rx_offset, rx_count = _rank_slice(count, group_size, num_slices, rx_chunk, slice_idx)
+            phase_tail = [
+                rb.p2p(
+                    [
+                        workflow.send(next_rank, workflow.output(tx_offset), tx_count),
+                        workflow.recv(prev_rank, workflow.output(rx_offset), rx_count),
+                    ],
+                    parents=phase_tail,
+                    name=f"local_ag_s{slice_idx}_step{step}",
+                )
+            ]
+    return phase_tail
+
+
+def _add_reduce_slices(
+    workflow: UniRunnerWorkflow,
+    rb,
+    input1_kind: str,
+    input2_kind: str,
+    output_kind: str,
+    offset: int,
+    count: int,
+    effective_red_slices: int,
+    red_op: RedOp,
+    parents: List[int],
+    name: str,
+) -> List[int]:
+    red_nodes: List[int] = []
+    for red_slice in range(effective_red_slices):
+        red_rel_offset, red_count = _slice_chunk(count, effective_red_slices, red_slice)
+        red_offset = offset + red_rel_offset
+        red_nodes.append(
+            rb.red(
+                workflow.buffer(input1_kind, red_offset),
+                workflow.buffer(input2_kind, red_offset),
+                workflow.buffer(output_kind, red_offset),
+                red_count,
+                red_op=red_op,
+                parents=parents,
+                name=f"{name}_r{red_slice}",
+            )
+        )
+    return red_nodes
+
+
 def build_groupedag_example():
     return build_groupedag(
         name="groupedag_example",
@@ -267,9 +562,23 @@ def build_slicedar_example():
     )
 
 
-def write_examples(output_dir: str) -> Tuple[str, str]:
+def build_hierarchical_slicedar_example():
+    return build_hierarchical_slicedar(
+        name="hierarchical_slicedar_example",
+        world_size=16,
+        count=17,
+        group_size=DEFAULT_HIERARCHICAL_GROUP_SIZE,
+        datatype=DataType.float32,
+        red_op=RedOp.sum,
+        num_slices=2,
+        num_red_slices=2,
+    )
+
+
+def write_examples(output_dir: str) -> Tuple[str, str, str]:
     groupedag_dir = os.path.join(output_dir, "groupedag")
     slicedar_dir = os.path.join(output_dir, "slicedar")
+    hierarchical_slicedar_dir = os.path.join(output_dir, "hierarchical_slicedar")
 
     groupedag = build_groupedag_example()
     groupedag.semantic_check().raise_for_error()
@@ -281,7 +590,14 @@ def write_examples(output_dir: str) -> Tuple[str, str]:
     slicedar.write_rank_files(slicedar_dir)
     slicedar.write_dag_json(os.path.join(slicedar_dir, "slicedar_dag.json"))
 
-    return groupedag_dir, slicedar_dir
+    hierarchical_slicedar = build_hierarchical_slicedar_example()
+    hierarchical_slicedar.semantic_check().raise_for_error()
+    hierarchical_slicedar.write_rank_files(hierarchical_slicedar_dir)
+    hierarchical_slicedar.write_dag_json(
+        os.path.join(hierarchical_slicedar_dir, "hierarchical_slicedar_dag.json")
+    )
+
+    return groupedag_dir, slicedar_dir, hierarchical_slicedar_dir
 
 
 class UniRunnerDslTest(unittest.TestCase):
@@ -316,6 +632,57 @@ class UniRunnerDslTest(unittest.TestCase):
         self.assertIn("p2p", node_types)
         self.assertIn("red", node_types)
         self.assertEqual(entry["dag"]["num_nodes"], 24)
+
+    def test_hierarchical_slicedar_semantics_and_runtime_json(self):
+        workflow = build_hierarchical_slicedar(
+            name="hierarchical_slicedar_test",
+            world_size=4,
+            count=17,
+            group_size=2,
+            datatype=DataType.float32,
+            red_op=RedOp.sum,
+            num_slices=2,
+            num_red_slices=2,
+        )
+
+        workflow.semantic_check().raise_for_error()
+        entry = workflow.runtime_entry(rank=0)
+        first_p2p_ops = entry["dag"]["nodes"][0]["p2p_ops"]
+        node_types = [node["node_type"] for node in entry["dag"]["nodes"]]
+        self.assertEqual(entry["key"]["algo"], "hierarchical_sliced_ar")
+        self.assertEqual(entry["key"]["comm_op"], "all_reduce")
+        self.assertEqual(entry["key"]["group_size"], 2)
+        self.assertEqual(first_p2p_ops[0]["peer_rank"], 1)
+        scratch_recvs = [
+            op
+            for node in entry["dag"]["nodes"]
+            if node["node_type"] == "p2p"
+            for op in node["p2p_ops"]
+            if op["type"] == "recv" and op["buffer"]["buffer"] == "scratch"
+        ]
+        self.assertTrue(scratch_recvs)
+        self.assertIn("p2p", node_types)
+        self.assertIn("red", node_types)
+        self.assertEqual(entry["dag"]["num_nodes"], 16)
+
+    def test_hierarchical_slicedar_default_group_size_env(self):
+        with patch.dict(os.environ, {HIERARCHICAL_GROUP_SIZE_ENV: "8"}):
+            workflow = build_hierarchical_slicedar(
+                name="hierarchical_slicedar_default_group_size_test",
+                world_size=16,
+                count=17,
+                group_size=None,
+                datatype=DataType.float32,
+                red_op=RedOp.sum,
+                num_slices=2,
+                num_red_slices=2,
+            )
+
+        workflow.semantic_check().raise_for_error()
+        entry = workflow.runtime_entry(rank=0)
+        self.assertEqual(entry["key"]["algo"], "hierarchical_sliced_ar")
+        self.assertEqual(entry["key"]["group_size"], 8)
+        self.assertEqual(entry["dag"]["num_nodes"], 64)
 
     def test_custom_semantics_for_identity_copy(self):
         expected = [
@@ -355,19 +722,20 @@ def main():
     parser.add_argument(
         "--generate-examples",
         action="store_true",
-        help="Generate groupedag and slicedar example runtime cache files instead of running tests.",
+        help="Generate groupedag, slicedar, and hierarchical_slicedar example runtime cache files instead of running tests.",
     )
     parser.add_argument(
         "--output-dir",
-        default=os.path.join(os.path.dirname(__file__), "output", "unirunner"),
+        default=DEFAULT_OUTPUT_DIR,
         help="Directory where generated example files should be written.",
     )
     args, unittest_args = parser.parse_known_args()
 
     if args.generate_examples:
-        groupedag_dir, slicedar_dir = write_examples(args.output_dir)
+        groupedag_dir, slicedar_dir, hierarchical_slicedar_dir = write_examples(args.output_dir)
         print(f"groupedag runtime cache: {groupedag_dir}")
         print(f"slicedar runtime cache: {slicedar_dir}")
+        print(f"hierarchical_slicedar runtime cache: {hierarchical_slicedar_dir}")
         return
 
     unittest.main(argv=[sys.argv[0]] + unittest_args)
