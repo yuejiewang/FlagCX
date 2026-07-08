@@ -15,7 +15,10 @@
 #include <algorithm>
 #include <assert.h>
 #include <cerrno>
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <math.h>
 #include <mutex>
 #include <string>
@@ -31,11 +34,12 @@ FLAGCX_PARAM(UniRunnerNSlices, "UNIRUNNER_NSLICES", 1);
 FLAGCX_PARAM(UniRunnerNThreads, "UNIRUNNER_NTHREADS", 32);
 FLAGCX_PARAM(UniRunnerNBlocks, "UNIRUNNER_NBLOCKS", 1);
 FLAGCX_PARAM(UniRunnerNRedSlices, "UNIRUNNER_NREDSLICES", 0);
-FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
 
 namespace {
 
-constexpr char kUniRunnerDagCachePathEnv[] = "FLAGCX_UNIRUNNER_DAG_CACHE_PATH";
+constexpr char kUniRunnerAlgoPathEnv[] = "FLAGCX_UNIRUNNER_ALGO_PATH";
+constexpr char kUniRunnerRedSliceSizeEnv[] = "FLAGCX_UNIRUNNER_REDSLICESIZE";
+constexpr uint64_t kDefaultUniRunnerRedSliceSize = 65536;
 
 struct uniRunnerDagRuntimeBindings {
   const void *inputBase = NULL;
@@ -111,7 +115,78 @@ static std::string getUniRunnerDagEnvPath(const char *envName) {
 }
 
 static std::string getUniRunnerDagCacheDirFromEnv() {
-  return getUniRunnerDagEnvPath(kUniRunnerDagCachePathEnv);
+  return getUniRunnerDagEnvPath(kUniRunnerAlgoPathEnv);
+}
+
+static bool parseUniRunnerSizeSuffix(const char *cursor,
+                                     uint64_t *multiplier) {
+  while (*cursor != '\0' &&
+         std::isspace(static_cast<unsigned char>(*cursor))) {
+    cursor++;
+  }
+
+  if (*cursor == '\0') {
+    *multiplier = 1;
+    return true;
+  }
+
+  char suffix = *cursor++;
+  if (suffix == 'K' || suffix == 'k') {
+    *multiplier = 1024;
+  } else if (suffix == 'M' || suffix == 'm') {
+    *multiplier = 1024ull * 1024ull;
+  } else if (suffix == 'G' || suffix == 'g') {
+    *multiplier = 1024ull * 1024ull * 1024ull;
+  } else {
+    return false;
+  }
+
+  while (*cursor != '\0' &&
+         std::isspace(static_cast<unsigned char>(*cursor))) {
+    cursor++;
+  }
+  return *cursor == '\0';
+}
+
+static uint64_t parseUniRunnerSizeCountEnv(const char *envName,
+                                           uint64_t defaultValue) {
+  const char *text = flagcxGetEnv(envName);
+  if (text == NULL || text[0] == '\0') {
+    return defaultValue;
+  }
+
+  const char *numberStart = text;
+  while (*numberStart != '\0' &&
+         std::isspace(static_cast<unsigned char>(*numberStart))) {
+    numberStart++;
+  }
+  if (*numberStart == '-') {
+    INFO(FLAGCX_ALL, "Invalid value %s for %s, using default %llu.", text,
+         envName, static_cast<unsigned long long>(defaultValue));
+    return defaultValue;
+  }
+
+  errno = 0;
+  char *end = NULL;
+  unsigned long long base = strtoull(numberStart, &end, 0);
+  if (end == numberStart || errno == ERANGE) {
+    INFO(FLAGCX_ALL, "Invalid value %s for %s, using default %llu.", text,
+         envName, static_cast<unsigned long long>(defaultValue));
+    return defaultValue;
+  }
+
+  uint64_t multiplier = 1;
+  if (!parseUniRunnerSizeSuffix(end, &multiplier) ||
+      base > std::numeric_limits<uint64_t>::max() / multiplier) {
+    INFO(FLAGCX_ALL, "Invalid value %s for %s, using default %llu.", text,
+         envName, static_cast<unsigned long long>(defaultValue));
+    return defaultValue;
+  }
+
+  uint64_t value = static_cast<uint64_t>(base) * multiplier;
+  INFO(FLAGCX_ENV, "%s set by environment to %llu.", envName,
+       static_cast<unsigned long long>(value));
+  return value;
 }
 
 static std::string makeUniRunnerDagFileName(size_t hashValue, int rank) {
@@ -3067,7 +3142,8 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->uniRunnerNThreads = flagcxParamUniRunnerNThreads();
   runnerState->uniRunnerNBlocks = flagcxParamUniRunnerNBlocks();
   runnerState->uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
-  runnerState->uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
+  runnerState->uniRunnerRedSliceSize = parseUniRunnerSizeCountEnv(
+      kUniRunnerRedSliceSizeEnv, kDefaultUniRunnerRedSliceSize);
 
   // Set device context
   FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));

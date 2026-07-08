@@ -100,6 +100,11 @@ DEFAULT_RED_SLICE_SIZE = 65536
 DEFAULT_NTHREADS = 32
 SIZE_T_MASK = (1 << 64) - 1
 HASH_CONSTANT = 0x9E3779B97F4A7C15
+SIZE_COUNT_SUFFIXES = {
+    "K": 1024,
+    "M": 1024**2,
+    "G": 1024**3,
+}
 
 DATA_TYPE_SIZES = {
     DataType.int8: 1,
@@ -172,6 +177,53 @@ def _datatype_size(datatype: Union[DataType, int]) -> int:
         if candidate.value == datatype:
             return size
     raise ValueError(f"Unsupported datatype value {datatype}")
+
+
+def parse_size_count(value: Union[str, int], name: str = "value") -> int:
+    """Parse a size/count value, accepting optional binary K/M/G suffixes."""
+    if isinstance(value, int):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            raise ValueError(f"{name} must not be empty")
+        suffix = text[-1].upper()
+        multiplier = SIZE_COUNT_SUFFIXES.get(suffix, 1)
+        number_text = (
+            text[:-1].strip() if suffix in SIZE_COUNT_SUFFIXES else text
+        )
+        if not number_text:
+            raise ValueError(f"{name} has no numeric part: {value!r}")
+        try:
+            parsed = int(number_text, 0) * multiplier
+        except ValueError as exc:
+            raise ValueError(f"Invalid {name}: {value!r}") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return parsed
+
+
+def parse_env_size_count(
+    env_name: str, default: Optional[Union[str, int]] = None
+) -> Optional[int]:
+    """Read an environment variable as a size/count with optional K/M/G suffix."""
+    value = os.environ.get(env_name)
+    if value is None or not value.strip():
+        return None if default is None else parse_size_count(default, env_name)
+    return parse_size_count(value, env_name)
+
+
+def count_from_size_bytes(
+    size_bytes: Union[str, int], datatype: Union[DataType, int]
+) -> int:
+    """Convert a byte size such as '1M' into an element count for a datatype."""
+    parsed_size = parse_size_count(size_bytes, "size_bytes")
+    type_size = _datatype_size(datatype)
+    if parsed_size % type_size != 0:
+        raise ValueError(
+            f"size_bytes={parsed_size} is not divisible by datatype size {type_size}"
+        )
+    return parsed_size // type_size
 
 
 def _red_op_value(red_op: Union[RedOp, int]) -> int:

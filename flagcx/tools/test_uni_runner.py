@@ -30,6 +30,9 @@ from utils import (
     _rank_slice,
     _red_op_from_value,
     _slice_chunk,
+    count_from_size_bytes,
+    parse_env_size_count,
+    parse_size_count,
 )
 
 
@@ -116,14 +119,16 @@ def build_groupedag(
 def build_slicedar(
     name: str = "slicedar",
     world_size: int = 4,
-    count: int = 16,
+    count: Union[int, str] = 16,
     datatype: Union[DataType, int] = DataType.float32,
     red_op: Union[RedOp, int] = RedOp.sum,
     num_slices: int = 2,
     num_red_slices: int = 0,
-    red_slice_size: int = DEFAULT_RED_SLICE_SIZE,
+    red_slice_size: Union[int, str] = DEFAULT_RED_SLICE_SIZE,
     nthreads: int = DEFAULT_NTHREADS,
 ) -> UniRunnerWorkflow:
+    count = parse_size_count(count, "count")
+    red_slice_size = parse_size_count(red_slice_size, "red_slice_size")
     red_op_enum = _red_op_from_value(red_op)
     effective_red_slices = _effective_red_slices(
         count, world_size, num_slices, num_red_slices, red_slice_size
@@ -256,15 +261,17 @@ def build_slicedar(
 def build_hierarchical_slicedar(
     name: str = "hierarchical_slicedar",
     world_size: int = 16,
-    count: int = 16,
+    count: Union[int, str] = 16,
     group_size: Optional[int] = None,
     datatype: Union[DataType, int] = DataType.float32,
     red_op: Union[RedOp, int] = RedOp.sum,
     num_slices: int = 2,
     num_red_slices: int = 0,
-    red_slice_size: int = DEFAULT_RED_SLICE_SIZE,
+    red_slice_size: Union[int, str] = DEFAULT_RED_SLICE_SIZE,
     nthreads: int = DEFAULT_NTHREADS,
 ) -> UniRunnerWorkflow:
+    count = parse_size_count(count, "count")
+    red_slice_size = parse_size_count(red_slice_size, "red_slice_size")
     group_size = _resolve_hierarchical_group_size(world_size, group_size)
     n_groups = world_size // group_size
     red_op_enum = _red_op_from_value(red_op)
@@ -601,6 +608,36 @@ def write_examples(output_dir: str) -> Tuple[str, str, str]:
 
 
 class UniRunnerDslTest(unittest.TestCase):
+    def test_size_count_parser_accepts_binary_suffixes(self):
+        self.assertEqual(parse_size_count("1K"), 1024)
+        self.assertEqual(parse_size_count("1M"), 1024 * 1024)
+        self.assertEqual(parse_size_count("1G"), 1024 * 1024 * 1024)
+        self.assertEqual(parse_size_count("0x10"), 16)
+        self.assertEqual(count_from_size_bytes("1M", DataType.float32), 262144)
+
+        with patch.dict(os.environ, {"UNIRUNNER_TEST_SIZE": "2M"}):
+            self.assertEqual(
+                parse_env_size_count("UNIRUNNER_TEST_SIZE"), 2 * 1024 * 1024
+            )
+        self.assertEqual(parse_env_size_count("UNIRUNNER_TEST_SIZE", "4K"), 4096)
+
+    def test_hierarchical_slicedar_red_slice_size_suffix(self):
+        workflow = build_hierarchical_slicedar(
+            name="hierarchical_slicedar_red_slice_size_suffix_test",
+            world_size=8,
+            count=count_from_size_bytes("128M", DataType.float32),
+            group_size=2,
+            datatype=DataType.float32,
+            red_op=RedOp.sum,
+            num_slices=2,
+            num_red_slices=0,
+            red_slice_size="1M",
+        )
+
+        entry = workflow.runtime_entry(rank=0)
+        self.assertEqual(entry["key"]["red_slice_size"], 1024 * 1024)
+        self.assertEqual(entry["key"]["num_red_slices"], 2)
+
     def test_groupedag_example_semantics_and_runtime_json(self):
         workflow = build_groupedag_example()
 

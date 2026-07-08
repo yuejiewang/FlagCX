@@ -5,7 +5,7 @@ building uniRunner algorithm DAGs. The DSL follows the same high-level idea as
 MSCCL-style workflow builders: an algorithm is described in Python inside a
 `with UniRunnerWorkflow(...)` block, and the block adds typed operation nodes
 plus dependencies. The generated JSON can be written in the cache format that
-the existing uniRunner runtime loads from `FLAGCX_UNIRUNNER_DAG_CACHE_PATH`.
+the existing uniRunner runtime loads from `FLAGCX_UNIRUNNER_ALGO_PATH`.
 
 ## Goals
 
@@ -66,7 +66,7 @@ use a separate cache directory if multiple variants must coexist. The runtime
 then tries to load:
 
 ```bash
-FLAGCX_UNIRUNNER_DAG_CACHE_PATH=/path/to/cache
+FLAGCX_UNIRUNNER_ALGO_PATH=/path/to/cache
 /path/to/your/flagcx/test
 ```
 
@@ -126,6 +126,12 @@ workflow.write_dag_json("algo_output/my_allreduce_dag.json")
 `workflow.input(i)`, `workflow.output(i)`, and `workflow.scratch(i)` use element
 offsets. The emitted JSON stores byte offsets. Use `input_bytes`,
 `output_bytes`, or `scratch_bytes` only when you already have byte offsets.
+
+Size/count helper functions in `utils.py` accept binary suffixes. `1K`, `1M`,
+and `1G` are parsed as powers of 1024. Use `parse_size_count("1M")` when the
+value is already an element count or byte count, and use
+`count_from_size_bytes("1M", DataType.float32)` when a message size in bytes
+must become a typed element count.
 
 ## Nodes
 
@@ -226,6 +232,8 @@ workflow = build_hierarchical_slicedar(
     world_size=16,
     count=1024,
     group_size=None,  # read UNIRUNNER_GROUPSIZE, defaulting to 8
+    num_red_slices=0,
+    red_slice_size="1M",
 )
 ```
 
@@ -235,7 +243,8 @@ runtime, enable this path separately from the original SlicedAR loader:
 ```bash
 export FLAGCX_UNIRUNNER_USE_HIERARCHICAL_SLICEDAR=1
 export FLAGCX_UNIRUNNER_GROUPSIZE=8
-export FLAGCX_UNIRUNNER_DAG_CACHE_PATH=algo_output/hierarchical_slicedar
+export FLAGCX_UNIRUNNER_ALGO_PATH=algo_output/hierarchical_slicedar
+export FLAGCX_UNIRUNNER_REDSLICESIZE=1M
 ```
 
 `FLAGCX_UNIRUNNER_USE_SLICEDAR=1` still selects the original `sliced_ar` loader. The
