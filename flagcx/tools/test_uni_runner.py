@@ -684,6 +684,85 @@ class UniRunnerDslTest(unittest.TestCase):
         self.assertEqual(entry["key"]["group_size"], 8)
         self.assertEqual(entry["dag"]["num_nodes"], 64)
 
+    def test_cache_hash_tracks_dsl_dag_arguments_only(self):
+        baseline = build_hierarchical_slicedar(
+            name="hierarchical_slicedar_hash_baseline",
+            world_size=16,
+            count=17,
+            group_size=2,
+            datatype=DataType.float32,
+            red_op=RedOp.sum,
+            num_slices=2,
+            num_red_slices=2,
+            red_slice_size=65536,
+            nthreads=32,
+        )
+        tuning_only = build_hierarchical_slicedar(
+            name="hierarchical_slicedar_hash_tuning_only",
+            world_size=16,
+            count=17,
+            group_size=4,
+            datatype=DataType.float32,
+            red_op=RedOp.sum,
+            num_slices=4,
+            num_red_slices=3,
+            red_slice_size=1048576,
+            nthreads=512,
+        )
+        count_only = build_hierarchical_slicedar(
+            name="hierarchical_slicedar_hash_count_only",
+            world_size=16,
+            count=33,
+            group_size=2,
+            datatype=DataType.float32,
+            red_op=RedOp.sum,
+            num_slices=2,
+            num_red_slices=2,
+            red_slice_size=65536,
+            nthreads=32,
+        )
+        datatype_only = build_hierarchical_slicedar(
+            name="hierarchical_slicedar_hash_datatype_only",
+            world_size=16,
+            count=17,
+            group_size=2,
+            datatype=DataType.float64,
+            red_op=RedOp.sum,
+            num_slices=2,
+            num_red_slices=2,
+        )
+        red_op_only = build_hierarchical_slicedar(
+            name="hierarchical_slicedar_hash_red_op_only",
+            world_size=16,
+            count=17,
+            group_size=2,
+            datatype=DataType.float32,
+            red_op=RedOp.max,
+            num_slices=2,
+            num_red_slices=2,
+        )
+
+        self.assertEqual(
+            baseline.cache_key(0).hash_value(),
+            tuning_only.cache_key(0).hash_value(),
+        )
+        self.assertNotEqual(
+            baseline.cache_key(0).hash_value(),
+            count_only.cache_key(0).hash_value(),
+        )
+        self.assertNotEqual(
+            baseline.cache_key(0).hash_value(),
+            datatype_only.cache_key(0).hash_value(),
+        )
+        self.assertNotEqual(
+            baseline.cache_key(0).hash_value(),
+            red_op_only.cache_key(0).hash_value(),
+        )
+        self.assertNotEqual(
+            baseline.cache_key(0).hash_value(),
+            baseline.cache_key(1).hash_value(),
+        )
+
     def test_custom_semantics_for_identity_copy(self):
         expected = [
             [(RedOp.nop, [0]), (RedOp.nop, [1])],

@@ -56,7 +56,13 @@ uses the single-template file form for rank files:
 
 The key must match the C++ initialization path that will be called at runtime.
 For example, `initUniRunnerStateSlicedAR` looks for `algo = "sliced_ar"` and
-`comm_op = "all_reduce"`. The runtime builds the same hash from the key and
+`comm_op = "all_reduce"`. The runtime builds the file hash from the full DAG
+identity arguments that are independent variables of the DSL DAG: format
+version, algorithm, collective operation, count, datatype, reduction op, rank,
+number of ranks, and root. Tuning and variant parameters such as group size,
+number of slices, number of red slices, red-slice size, red thread count, and
+buffer alias flags are not hashed directly; encode them in the algorithm name or
+use a separate cache directory if multiple variants must coexist. The runtime
 then tries to load:
 
 ```bash
@@ -206,8 +212,9 @@ same `p2p` / `red` / `cpy` primitives as SlicedAR:
 2. Inter-node sliced AllReduce across ranks with the same local rank.
 3. Intra-node allgather to distribute the globally reduced chunks.
 
-The group size is the number of GPUs per node. It can be passed directly or read
-from `UNIRUNNER_GROUPSIZE`; if neither is set, the DSL uses `8`.
+The group size is the number of GPUs per node. It can be passed directly to the
+Python builder or read by the builder from `UNIRUNNER_GROUPSIZE`; if neither is
+set, the DSL uses `8`.
 The inter-node reduce-scatter phase receives into `scratch` and reduces into
 `output`, so the runtime allocates one `count`-element scratch buffer for this
 loader.
@@ -222,17 +229,16 @@ workflow = build_hierarchical_slicedar(
 )
 ```
 
-The emitted runtime key uses `hierarchical_sliced_ar` / `all_reduce`, with the
-group size included in the cache key. At runtime, enable this path separately
-from the original SlicedAR loader:
+The emitted runtime key uses `hierarchical_sliced_ar` / `all_reduce`. At
+runtime, enable this path separately from the original SlicedAR loader:
 
 ```bash
-export UNIRUNNER_USE_HIERARCHICAL_SLICEDAR=1
-export UNIRUNNER_GROUPSIZE=8
+export FLAGCX_UNIRUNNER_USE_HIERARCHICAL_SLICEDAR=1
+export FLAGCX_UNIRUNNER_GROUPSIZE=8
 export FLAGCX_UNIRUNNER_DAG_CACHE_PATH=algo_output/hierarchical_slicedar
 ```
 
-`UNIRUNNER_USE_SLICEDAR=1` still selects the original `sliced_ar` loader. The
+`FLAGCX_UNIRUNNER_USE_SLICEDAR=1` still selects the original `sliced_ar` loader. The
 hierarchical loader expects a matching DSL-generated cache file and does not
 silently fall back to the original SlicedAR DAG.
 

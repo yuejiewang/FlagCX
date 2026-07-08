@@ -186,14 +186,6 @@ class UniRunnerDagCacheKey:
             self.rank,
             self.nranks,
             self.root + 1,
-            self.group_size + 1,
-            self.num_slices,
-            self.num_red_slices,
-            self.red_slice_size,
-            self.nthreads,
-            self.input_output_aliased,
-            self.input_scratch_aliased,
-            self.output_scratch_aliased,
         ]
         for value in values:
             hash_value = _hash_combine(hash_value, int(value))

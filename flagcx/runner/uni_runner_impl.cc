@@ -61,13 +61,7 @@ static bool uniRunnerDagCacheKeysEqual(const uniRunnerDagCacheKey &lhs,
          lhs.algoType == rhs.algoType && lhs.commOp == rhs.commOp &&
          lhs.count == rhs.count && lhs.datatype == rhs.datatype &&
          lhs.redOp == rhs.redOp && lhs.rank == rhs.rank &&
-         lhs.nranks == rhs.nranks && lhs.root == rhs.root &&
-         lhs.groupSize == rhs.groupSize && lhs.numSlices == rhs.numSlices &&
-         lhs.numRedSlices == rhs.numRedSlices &&
-         lhs.redSliceSize == rhs.redSliceSize && lhs.nthreads == rhs.nthreads &&
-         lhs.inputOutputAliased == rhs.inputOutputAliased &&
-         lhs.inputScratchAliased == rhs.inputScratchAliased &&
-         lhs.outputScratchAliased == rhs.outputScratchAliased;
+         lhs.nranks == rhs.nranks && lhs.root == rhs.root;
 }
 
 static flagcxResult_t insertUniRunnerDagTemplateLocked(
@@ -384,17 +378,6 @@ size_t getUniRunnerDagPatternHash(const uniRunnerDagCacheKey &key) {
   hashValue = hashCombine(hashValue, static_cast<size_t>(key.rank));
   hashValue = hashCombine(hashValue, static_cast<size_t>(key.nranks));
   hashValue = hashCombine(hashValue, static_cast<size_t>(key.root + 1));
-  hashValue = hashCombine(hashValue, static_cast<size_t>(key.groupSize + 1));
-  hashValue = hashCombine(hashValue, static_cast<size_t>(key.numSlices));
-  hashValue = hashCombine(hashValue, static_cast<size_t>(key.numRedSlices));
-  hashValue = hashCombine(hashValue, static_cast<size_t>(key.redSliceSize));
-  hashValue = hashCombine(hashValue, static_cast<size_t>(key.nthreads));
-  hashValue =
-      hashCombine(hashValue, static_cast<size_t>(key.inputOutputAliased));
-  hashValue =
-      hashCombine(hashValue, static_cast<size_t>(key.inputScratchAliased));
-  hashValue =
-      hashCombine(hashValue, static_cast<size_t>(key.outputScratchAliased));
   return hashValue;
 }
 
