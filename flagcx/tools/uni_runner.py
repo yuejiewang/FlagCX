@@ -9,10 +9,6 @@ try:
     from .utils import (
         ALGO_TO_INT,
         COMM_OP_TO_INT,
-        DEFAULT_NTHREADS,
-        DEFAULT_NUM_RED_SLICES,
-        DEFAULT_NUM_SLICES,
-        DEFAULT_RED_SLICE_SIZE,
         FORMAT_VERSION,
         AlgoType,
         BufferKind,
@@ -34,10 +30,6 @@ except ImportError:  # Keep compatibility with direct execution from flagcx/tool
     from utils import (
         ALGO_TO_INT,
         COMM_OP_TO_INT,
-        DEFAULT_NTHREADS,
-        DEFAULT_NUM_RED_SLICES,
-        DEFAULT_NUM_SLICES,
-        DEFAULT_RED_SLICE_SIZE,
         FORMAT_VERSION,
         AlgoType,
         BufferKind,
@@ -93,7 +85,6 @@ class RedOpDesc:
     input2: BufferRef
     output: BufferRef
     count: int
-    nthreads: int
     datatype: int
     red_op: RedOp
 
@@ -103,7 +94,6 @@ class RedOpDesc:
             "input2": self.input2.to_json(),
             "output": self.output.to_json(),
             "count": self.count,
-            "nthreads": self.nthreads,
             "datatype": self.datatype,
             "red_op": self.red_op.value,
         }
@@ -164,14 +154,6 @@ class UniRunnerDagCacheKey:
     rank: int
     nranks: int
     root: int = -1
-    group_size: int = 0
-    num_slices: int = DEFAULT_NUM_SLICES
-    num_red_slices: int = DEFAULT_NUM_RED_SLICES
-    red_slice_size: int = DEFAULT_RED_SLICE_SIZE
-    nthreads: int = DEFAULT_NTHREADS
-    input_output_aliased: int = 0
-    input_scratch_aliased: int = 0
-    output_scratch_aliased: int = 0
     format_version: int = FORMAT_VERSION
 
     def hash_value(self) -> int:
@@ -205,14 +187,6 @@ class UniRunnerDagCacheKey:
             "rank": self.rank,
             "nranks": self.nranks,
             "root": self.root,
-            "group_size": self.group_size,
-            "num_slices": self.num_slices,
-            "num_red_slices": self.num_red_slices,
-            "red_slice_size": self.red_slice_size,
-            "nthreads": self.nthreads,
-            "input_output_aliased": self.input_output_aliased,
-            "input_scratch_aliased": self.input_scratch_aliased,
-            "output_scratch_aliased": self.output_scratch_aliased,
         }
 
 
@@ -256,11 +230,6 @@ class UniRunnerWorkflow:
         root: int = -1,
         algo: Union[AlgoType, str] = AlgoType.dummy,
         comm_op: Optional[str] = None,
-        group_size: int = 0,
-        num_slices: int = DEFAULT_NUM_SLICES,
-        num_red_slices: int = DEFAULT_NUM_RED_SLICES,
-        red_slice_size: int = DEFAULT_RED_SLICE_SIZE,
-        nthreads: int = DEFAULT_NTHREADS,
         input_count: Optional[int] = None,
         output_count: Optional[int] = None,
         scratch_count: int = 0,
@@ -278,11 +247,6 @@ class UniRunnerWorkflow:
         self.root = root
         self.algo = _enum_value(algo)
         self.comm_op = _comm_op_name(collective, comm_op)
-        self.group_size = group_size
-        self.num_slices = num_slices
-        self.num_red_slices = num_red_slices
-        self.red_slice_size = red_slice_size
-        self.nthreads = nthreads
         self.input_count = count if input_count is None else input_count
         self.output_count = count if output_count is None else output_count
         self.scratch_count = scratch_count
@@ -366,7 +330,6 @@ class UniRunnerWorkflow:
             input2=input2 or BufferRef.none(),
             output=output or BufferRef.none(),
             count=count,
-            nthreads=self.nthreads,
             datatype=self.datatype,
             red_op=self.red_op if red_op is None else _red_op_from_value(red_op),
         )
@@ -440,11 +403,6 @@ class UniRunnerWorkflow:
             rank=rank,
             nranks=self.world_size,
             root=self.root,
-            group_size=self.group_size,
-            num_slices=self.num_slices,
-            num_red_slices=self.num_red_slices,
-            red_slice_size=self.red_slice_size,
-            nthreads=self.nthreads,
         )
 
     def runtime_entry(self, rank: int) -> Dict:

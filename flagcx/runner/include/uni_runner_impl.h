@@ -47,14 +47,6 @@ struct uniRunnerDagCacheKey {
   int rank;
   int nranks;
   int root;
-  int groupSize;
-  uint64_t numSlices;
-  uint64_t numRedSlices;
-  uint64_t redSliceSize;
-  uint64_t nthreads;
-  int inputOutputAliased;
-  int inputScratchAliased;
-  int outputScratchAliased;
 };
 
 // Single P2P operation data

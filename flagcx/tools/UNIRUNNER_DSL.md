@@ -37,15 +37,7 @@ uses the single-template file form for rank files:
     "red_op": 0,
     "rank": 0,
     "nranks": 4,
-    "root": -1,
-    "group_size": 0,
-    "num_slices": 2,
-    "num_red_slices": 2,
-    "red_slice_size": 65536,
-    "nthreads": 32,
-    "input_output_aliased": 0,
-    "input_scratch_aliased": 0,
-    "output_scratch_aliased": 0
+    "root": -1
   },
   "dag": {
     "num_nodes": 1,
@@ -59,10 +51,13 @@ For example, `initUniRunnerStateSlicedAR` looks for `algo = "sliced_ar"` and
 `comm_op = "all_reduce"`. The runtime builds the file hash from the full DAG
 identity arguments that are independent variables of the DSL DAG: format
 version, algorithm, collective operation, count, datatype, reduction op, rank,
-number of ranks, and root. Tuning and variant parameters such as group size,
-number of slices, number of red slices, red-slice size, red thread count, and
-buffer alias flags are not hashed directly; encode them in the algorithm name or
-use a separate cache directory if multiple variants must coexist. The runtime
+number of ranks, and root. Runtime environment knobs and builder-local tiling
+parameters such as group size, number of slices, number of red slices,
+red-slice size, red thread count, and buffer alias flags are intentionally not
+part of the workflow cache key. Once a DAG is generated, those choices are
+already reflected by the concrete node offsets, counts, buffers, and
+dependencies. Regenerate the files or use a separate algorithm directory when
+multiple generated variants for the same runtime key must coexist. The runtime
 then tries to load:
 
 ```bash
@@ -78,6 +73,11 @@ dag_hash_<computed_hash>_rank_<rank>.json
 
 Use `workflow.write_rank_files(cache_dir)` to write those files.
 
+RED nodes in JSON only store operation parameters: inputs, output, count,
+datatype, and reduction op. The runtime loader binds RED execution to
+`FLAGCX_UNIRUNNER_NTHREADS` when the DAG is materialized, keeping the reduce
+kernel launch block size and the per-node loop stride consistent.
+
 ## Basic DSL
 
 ```python
@@ -92,8 +92,6 @@ with UniRunnerWorkflow(
     datatype=DataType.float32,
     red_op=RedOp.sum,
     algo="sliced_ar",
-    num_slices=2,
-    num_red_slices=2,
     output_count=1024,
 ) as workflow:
     for rank in workflow.ranks():
@@ -237,6 +235,12 @@ workflow = build_hierarchical_slicedar(
 )
 ```
 
+`group_size`, `num_red_slices`, and `red_slice_size` are builder-local inputs in
+this example. They control how the Python helper expands the concrete DAG, but
+they are not stored in `UniRunnerWorkflow` and are not serialized in the runtime
+cache key. The runtime `FLAGCX_UNIRUNNER_GROUPSIZE` should still match the
+generated hierarchical topology.
+
 The emitted runtime key uses `hierarchical_sliced_ar` / `all_reduce`. At
 runtime, enable this path separately from the original SlicedAR loader:
 
@@ -244,7 +248,6 @@ runtime, enable this path separately from the original SlicedAR loader:
 export FLAGCX_UNIRUNNER_USE_HIERARCHICAL_SLICEDAR=1
 export FLAGCX_UNIRUNNER_GROUPSIZE=8
 export FLAGCX_UNIRUNNER_ALGO_PATH=algo_output/hierarchical_slicedar
-export FLAGCX_UNIRUNNER_REDSLICESIZE=1M
 ```
 
 `FLAGCX_UNIRUNNER_USE_SLICEDAR=1` still selects the original `sliced_ar` loader. The

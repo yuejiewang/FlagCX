@@ -18,8 +18,6 @@ DEFAULT_OUTPUT_DIR = os.path.join(REPO_ROOT, "algo_output")
 from semantics import CollectiveSemantics
 from uni_runner import P2pOp, UniRunnerWorkflow
 from utils import (
-    DEFAULT_NTHREADS,
-    DEFAULT_NUM_SLICES,
     DEFAULT_RED_SLICE_SIZE,
     AlgoType,
     Collective,
@@ -46,8 +44,6 @@ def build_groupedag(
     count: int = 8,
     group_size: int = 2,
     datatype: Union[DataType, int] = DataType.float32,
-    num_slices: int = DEFAULT_NUM_SLICES,
-    nthreads: int = DEFAULT_NTHREADS,
 ) -> UniRunnerWorkflow:
     if group_size <= 0 or world_size % group_size != 0:
         raise ValueError("group_size must divide world_size")
@@ -59,10 +55,6 @@ def build_groupedag(
         datatype=datatype,
         red_op=RedOp.nop,
         algo=AlgoType.grouped_ag,
-        group_size=group_size,
-        num_slices=num_slices,
-        num_red_slices=0,
-        nthreads=nthreads,
         input_count=count,
         output_count=count * world_size,
     ) as workflow:
@@ -125,7 +117,6 @@ def build_slicedar(
     num_slices: int = 2,
     num_red_slices: int = 0,
     red_slice_size: Union[int, str] = DEFAULT_RED_SLICE_SIZE,
-    nthreads: int = DEFAULT_NTHREADS,
 ) -> UniRunnerWorkflow:
     count = parse_size_count(count, "count")
     red_slice_size = parse_size_count(red_slice_size, "red_slice_size")
@@ -141,10 +132,6 @@ def build_slicedar(
         datatype=datatype,
         red_op=red_op_enum,
         algo=AlgoType.sliced_ar,
-        num_slices=num_slices,
-        num_red_slices=effective_red_slices,
-        red_slice_size=red_slice_size,
-        nthreads=nthreads,
         input_count=count,
         output_count=count,
     ) as workflow:
@@ -268,7 +255,6 @@ def build_hierarchical_slicedar(
     num_slices: int = 2,
     num_red_slices: int = 0,
     red_slice_size: Union[int, str] = DEFAULT_RED_SLICE_SIZE,
-    nthreads: int = DEFAULT_NTHREADS,
 ) -> UniRunnerWorkflow:
     count = parse_size_count(count, "count")
     red_slice_size = parse_size_count(red_slice_size, "red_slice_size")
@@ -287,11 +273,6 @@ def build_hierarchical_slicedar(
         datatype=datatype,
         red_op=red_op_enum,
         algo=AlgoType.hierarchical_sliced_ar,
-        group_size=group_size,
-        num_slices=num_slices,
-        num_red_slices=effective_red_slices,
-        red_slice_size=red_slice_size,
-        nthreads=nthreads,
         input_count=count,
         output_count=count,
         scratch_count=count,
@@ -608,6 +589,17 @@ def write_examples(output_dir: str) -> Tuple[str, str, str]:
 
 
 class UniRunnerDslTest(unittest.TestCase):
+    LEGACY_RUNTIME_FIELDS = {
+        "group_size",
+        "num_slices",
+        "num_red_slices",
+        "red_slice_size",
+        "nthreads",
+        "input_output_aliased",
+        "input_scratch_aliased",
+        "output_scratch_aliased",
+    }
+
     def test_size_count_parser_accepts_binary_suffixes(self):
         self.assertEqual(parse_size_count("1K"), 1024)
         self.assertEqual(parse_size_count("1M"), 1024 * 1024)
@@ -635,8 +627,13 @@ class UniRunnerDslTest(unittest.TestCase):
         )
 
         entry = workflow.runtime_entry(rank=0)
-        self.assertEqual(entry["key"]["red_slice_size"], 1024 * 1024)
-        self.assertEqual(entry["key"]["num_red_slices"], 2)
+        red_nodes = [
+            node for node in entry["dag"]["nodes"] if node["node_type"] == "red"
+        ]
+        self.assertEqual(len(red_nodes), 16)
+        self.assertTrue(
+            all("nthreads" not in node["red"] for node in red_nodes)
+        )
 
     def test_groupedag_example_semantics_and_runtime_json(self):
         workflow = build_groupedag_example()
@@ -655,6 +652,7 @@ class UniRunnerDslTest(unittest.TestCase):
             with open(paths[0], "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             self.assertEqual(payload["hash"], entry["hash"])
+            self.assertFalse(self.LEGACY_RUNTIME_FIELDS & set(payload["key"]))
             self.assertEqual(payload["dag"]["nodes"][0]["node_type"], "p2p")
 
     def test_slicedar_example_semantics_and_runtime_json(self):
@@ -665,9 +663,13 @@ class UniRunnerDslTest(unittest.TestCase):
         node_types = [node["node_type"] for node in entry["dag"]["nodes"]]
         self.assertEqual(entry["key"]["algo"], "sliced_ar")
         self.assertEqual(entry["key"]["comm_op"], "all_reduce")
-        self.assertEqual(entry["key"]["num_red_slices"], 2)
+        self.assertFalse(self.LEGACY_RUNTIME_FIELDS & set(entry["key"]))
         self.assertIn("p2p", node_types)
         self.assertIn("red", node_types)
+        self.assertEqual(
+            sum(1 for node in entry["dag"]["nodes"] if node["node_type"] == "red"),
+            12,
+        )
         self.assertEqual(entry["dag"]["num_nodes"], 24)
 
     def test_hierarchical_slicedar_semantics_and_runtime_json(self):
@@ -688,7 +690,7 @@ class UniRunnerDslTest(unittest.TestCase):
         node_types = [node["node_type"] for node in entry["dag"]["nodes"]]
         self.assertEqual(entry["key"]["algo"], "hierarchical_sliced_ar")
         self.assertEqual(entry["key"]["comm_op"], "all_reduce")
-        self.assertEqual(entry["key"]["group_size"], 2)
+        self.assertFalse(self.LEGACY_RUNTIME_FIELDS & set(entry["key"]))
         self.assertEqual(first_p2p_ops[0]["peer_rank"], 1)
         scratch_recvs = [
             op
@@ -718,7 +720,7 @@ class UniRunnerDslTest(unittest.TestCase):
         workflow.semantic_check().raise_for_error()
         entry = workflow.runtime_entry(rank=0)
         self.assertEqual(entry["key"]["algo"], "hierarchical_sliced_ar")
-        self.assertEqual(entry["key"]["group_size"], 8)
+        self.assertFalse(self.LEGACY_RUNTIME_FIELDS & set(entry["key"]))
         self.assertEqual(entry["dag"]["num_nodes"], 64)
 
     def test_cache_hash_tracks_dsl_dag_arguments_only(self):
@@ -732,7 +734,6 @@ class UniRunnerDslTest(unittest.TestCase):
             num_slices=2,
             num_red_slices=2,
             red_slice_size=65536,
-            nthreads=32,
         )
         tuning_only = build_hierarchical_slicedar(
             name="hierarchical_slicedar_hash_tuning_only",
@@ -744,7 +745,6 @@ class UniRunnerDslTest(unittest.TestCase):
             num_slices=4,
             num_red_slices=3,
             red_slice_size=1048576,
-            nthreads=512,
         )
         count_only = build_hierarchical_slicedar(
             name="hierarchical_slicedar_hash_count_only",
@@ -756,7 +756,6 @@ class UniRunnerDslTest(unittest.TestCase):
             num_slices=2,
             num_red_slices=2,
             red_slice_size=65536,
-            nthreads=32,
         )
         datatype_only = build_hierarchical_slicedar(
             name="hierarchical_slicedar_hash_datatype_only",

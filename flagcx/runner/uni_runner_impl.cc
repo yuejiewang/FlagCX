@@ -380,9 +380,8 @@ resolveEffectiveUniRunnerRedSlices(const flagcxUniRunnerState *runnerState,
 
 static uniRunnerDagCacheKey makeUniRunnerDagCacheKey(
     uniRunnerDagAlgoType algoType, flagcxCommOp_t commOp, size_t count,
-    flagcxDataType_t datatype, flagcxRedOp_t redOp, int root, int groupSize,
-    flagcxUniRunnerState *runnerState, flagcxComm_t comm, const void *sendbuff,
-    void *recvbuff, void *scratchbuff) {
+    flagcxDataType_t datatype, flagcxRedOp_t redOp, int root,
+    flagcxComm_t comm) {
   uniRunnerDagCacheKey key{};
   key.formatVersion = kUniRunnerDagCacheFormatVersion;
   key.algoType = algoType;
@@ -393,14 +392,6 @@ static uniRunnerDagCacheKey makeUniRunnerDagCacheKey(
   key.rank = comm->rank;
   key.nranks = comm->nranks;
   key.root = root;
-  key.groupSize = groupSize;
-  key.numSlices = runnerState->uniRunnerNSlices;
-  key.numRedSlices = runnerState->uniRunnerNRedSlices;
-  key.redSliceSize = runnerState->uniRunnerRedSliceSize;
-  key.nthreads = runnerState->uniRunnerNThreads;
-  key.inputOutputAliased = sendbuff == recvbuff;
-  key.inputScratchAliased = sendbuff == scratchbuff;
-  key.outputScratchAliased = recvbuff == scratchbuff;
   return key;
 }
 
@@ -2539,7 +2530,6 @@ static flagcxResult_t captureUniRunnerDagTemplateFromState(
       FLAGCXCHECK(captureBufferRef(node->nodeData.red.output, bindings,
                                    &nodeDesc.red.output));
       nodeDesc.red.count = node->nodeData.red.count;
-      nodeDesc.red.nthreads = node->nodeData.red.nthreads;
       nodeDesc.red.datatype = node->nodeData.red.datatype;
       nodeDesc.red.redOp = node->nodeData.red.redOp;
     } else if (node->nodeType == uniRunnerDagNodeTypeCpy) {
@@ -2619,7 +2609,11 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
       FLAGCXCHECK(resolveBufferRef(src.red.output, bindings,
                                    &dst->nodeData.red.output));
       dst->nodeData.red.count = src.red.count;
-      dst->nodeData.red.nthreads = src.red.nthreads;
+      // The reduce kernel uses nthreads as its per-trigger loop stride, so it
+      // must match the block size used to launch the persistent RED kernel.
+      // Loaded DAG JSON stores only operation DAG parameters; nthreads comes
+      // from the runtime launch setting.
+      dst->nodeData.red.nthreads = runnerState->uniRunnerNThreads;
       dst->nodeData.red.datatype = src.red.datatype;
       dst->nodeData.red.redOp = src.red.redOp;
     } else if (dst->nodeType == uniRunnerDagNodeTypeCpy) {
@@ -2762,8 +2756,8 @@ flagcxResult_t initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
   bindings.outputBytes = count * typeSize;
 
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
-      uniRunnerDagAlgoLocRed, flagcxCommOpAllReduce, count, datatype, op, -1, 0,
-      runnerState, comm, sendbuff, recvbuff, NULL);
+      uniRunnerDagAlgoLocRed, flagcxCommOpAllReduce, count, datatype, op, -1,
+      comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateLocRed(runnerState, sendbuff, recvbuff, count,
                                      datatype, op, comm);
@@ -2784,8 +2778,7 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
 
   uniRunnerDagCacheKey key =
       makeUniRunnerDagCacheKey(uniRunnerDagAlgoGroupedAG, flagcxCommOpAllGather,
-                               count, datatype, flagcxRedNoOp, -1, groupSize,
-                               runnerState, comm, sendbuff, recvbuff, NULL);
+                               count, datatype, flagcxRedNoOp, -1, comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateGroupedAG(runnerState, sendbuff, recvbuff, count,
                                         datatype, comm, groupSize);
@@ -2805,7 +2798,7 @@ flagcxResult_t initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
 
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
       uniRunnerDagAlgoRingAG, flagcxCommOpAllReduce, count, datatype,
-      flagcxRedNoOp, -1, 0, runnerState, comm, sendbuff, recvbuff, NULL);
+      flagcxRedNoOp, -1, comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateRingAG(runnerState, sendbuff, recvbuff, count,
                                      datatype, op, comm);
@@ -2824,8 +2817,8 @@ flagcxResult_t initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
   bindings.outputBytes = count * typeSize;
 
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
-      uniRunnerDagAlgoRingAR, flagcxCommOpAllReduce, count, datatype, op, -1, 0,
-      runnerState, comm, sendbuff, recvbuff, NULL);
+      uniRunnerDagAlgoRingAR, flagcxCommOpAllReduce, count, datatype, op, -1,
+      comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateRingAR(runnerState, sendbuff, recvbuff, count,
                                      datatype, op, comm);
@@ -2849,7 +2842,7 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
 
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
       uniRunnerDagAlgoSlicedAR, flagcxCommOpAllReduce, count, datatype, op, -1,
-      0, runnerState, comm, sendbuff, recvbuff, NULL);
+      comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff, count,
                                        datatype, op, comm);
@@ -2888,8 +2881,7 @@ flagcxResult_t initUniRunnerStateHierarchicalSlicedAR(
 
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
       uniRunnerDagAlgoHierarchicalSlicedAR, flagcxCommOpAllReduce, count,
-      datatype, op, -1, groupSize, runnerState, comm, sendbuff, recvbuff,
-      scratchbuff);
+      datatype, op, -1, comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     TRACE(FLAGCX_UNIRUNNER,
           "hierarchical SlicedAR requires a cached DSL DAG, algo=%s commOp=%s "
@@ -2919,7 +2911,7 @@ flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
 
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
       uniRunnerDagAlgoRingRS, flagcxCommOpReduceScatter, count, datatype, op,
-      -1, 0, runnerState, comm, sendbuff, recvbuff, scratchbuff);
+      -1, comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateRingRS(runnerState, sendbuff, recvbuff,
                                      scratchbuff, count, datatype, op, comm);
@@ -2945,8 +2937,8 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
   bindings.scratchBytes = 2 * count * typeSize;
 
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
-      uniRunnerDagAlgoTreeRed, flagcxCommOpReduce, count, datatype, op, root, 0,
-      runnerState, comm, sendbuff, recvbuff, scratchbuff);
+      uniRunnerDagAlgoTreeRed, flagcxCommOpReduce, count, datatype, op, root,
+      comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateTreeRed(runnerState, sendbuff, recvbuff,
                                       scratchbuff, count, datatype, op, root,

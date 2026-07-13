@@ -41,7 +41,6 @@ struct uniRunnerDagRedOpDesc {
   uniRunnerDagBufferRef input2;
   uniRunnerDagBufferRef output;
   size_t count = 0;
-  size_t nthreads = 0;
   flagcxDataType_t datatype = flagcxInt8;
   flagcxRedOp_t redOp = flagcxRedNoOp;
 };
@@ -327,14 +326,6 @@ inline Json uniRunnerDagCacheKeyToJson(const uniRunnerDagCacheKey &key) {
       {"rank", key.rank},
       {"nranks", key.nranks},
       {"root", key.root},
-      {"group_size", key.groupSize},
-      {"num_slices", key.numSlices},
-      {"num_red_slices", key.numRedSlices},
-      {"red_slice_size", key.redSliceSize},
-      {"nthreads", key.nthreads},
-      {"input_output_aliased", key.inputOutputAliased},
-      {"input_scratch_aliased", key.inputScratchAliased},
-      {"output_scratch_aliased", key.outputScratchAliased},
   };
 }
 
@@ -353,14 +344,6 @@ inline bool uniRunnerDagCacheKeyFromJson(const Json &j,
   key->rank = j.at("rank").get<int>();
   key->nranks = j.at("nranks").get<int>();
   key->root = j.at("root").get<int>();
-  key->groupSize = j.at("group_size").get<int>();
-  key->numSlices = j.at("num_slices").get<uint64_t>();
-  key->numRedSlices = j.at("num_red_slices").get<uint64_t>();
-  key->redSliceSize = j.at("red_slice_size").get<uint64_t>();
-  key->nthreads = j.at("nthreads").get<uint64_t>();
-  key->inputOutputAliased = j.at("input_output_aliased").get<int>();
-  key->inputScratchAliased = j.at("input_scratch_aliased").get<int>();
-  key->outputScratchAliased = j.at("output_scratch_aliased").get<int>();
   return true;
 }
 
@@ -393,7 +376,6 @@ uniRunnerDagTemplateToJson(const uniRunnerDagTemplate &dagTemplate) {
           {"input2", uniRunnerDagBufferRefToJson(node.red.input2)},
           {"output", uniRunnerDagBufferRefToJson(node.red.output)},
           {"count", node.red.count},
-          {"nthreads", node.red.nthreads},
           {"datatype", static_cast<int>(node.red.datatype)},
           {"red_op", static_cast<int>(node.red.redOp)},
       };
@@ -467,7 +449,6 @@ inline bool uniRunnerDagTemplateFromJson(const Json &j,
         return false;
       }
       node.red.count = redJson.at("count").get<size_t>();
-      node.red.nthreads = redJson.at("nthreads").get<size_t>();
       node.red.datatype =
           static_cast<flagcxDataType_t>(redJson.at("datatype").get<int>());
       node.red.redOp =
