@@ -22,6 +22,12 @@
 #include "adaptor.h"
 #include "flagcx_kernel_core.h"
 
+struct flagcxDevMemInternal;
+#ifndef FLAGCX_DEV_MEM_T_DEFINED
+#define FLAGCX_DEV_MEM_T_DEFINED
+typedef struct flagcxDevMemInternal *flagcxDevMem_t;
+#endif
+
 struct flagcxFifo {
   // Unified fifo layout: [capacity][consumed][produced][terminate][data...]
   // flagcxDeviceTrigger fifo: terminate slot is reserved but unused
@@ -34,8 +40,10 @@ public:
   ~flagcxFifo() {}
   flagcxResult_t flagcxFifoInit();
   flagcxResult_t flagcxRedFifoInit();
+  flagcxResult_t flagcxIpcFifoInit();
   flagcxResult_t flagcxFifoDestroy();
   flagcxResult_t flagcxRedFifoDestroy();
+  flagcxResult_t flagcxIpcFifoDestroy();
 };
 typedef struct flagcxFifo *flagcxFifo_t;
 
@@ -48,15 +56,27 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr1,
                                              flagcxRedOp_t redop,
                                              uint64_t flagIn,
                                              uint64_t flagOut, int *idx);
+FLAGCX_HOST_DECORATOR flagcxResult_t enqueueIpc(
+    void *fifoBuffer, uint64_t srcOffsetBytes, uint64_t dstOffsetBytes,
+    uint64_t bytes, flagcxIpcBufferType srcBufferType, int peerLocalRank,
+    uint32_t readySlot, uint64_t epoch, uint32_t parentFlagsOffset,
+    uint32_t numParentFlags, uint64_t flagOut, int *idx);
 #ifdef COMPILE_KERNEL
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
                                                       int *idx);
 
-FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer);
+struct flagcxDevMem;
+FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(
+    void *redFifoBuffer, void *ipcFifoBuffer, flagcxDevMem inputMem,
+    flagcxDevMem outputMem, flagcxDevMem readyMem,
+    const uint64_t *ipcParentFlags, int nRedBlocks, int nIpcBlocks);
 #endif // COMPILE_KERNEL
 
-void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
-                                  size_t nblocks, flagcxStream_t stream);
+void flagcxLaunchCollectiveKernel(
+    void *redFifoBuffer, void *ipcFifoBuffer, flagcxDevMem_t inputMem,
+    flagcxDevMem_t outputMem, flagcxDevMem_t readyMem,
+    const uint64_t *ipcParentFlags, size_t nthreads, size_t nRedBlocks,
+    size_t nIpcBlocks, flagcxStream_t stream);
 
 // ==========================================================================
 // Device Communicator — Host-side lifecycle management

@@ -1190,8 +1190,12 @@ extern "C" flagcxResult_t flagcxDevMemCreate(flagcxComm_t comm, void *buff,
                            (handle->ipcIndex >= 0 && comm)
                                ? comm->ipcTable[handle->ipcIndex].devPeerPtrs
                                : nullptr);
+    handle->ipcDevPeerPtrs =
+        (handle->ipcIndex >= 0 && comm)
+            ? comm->ipcTable[handle->ipcIndex].devPeerPtrs
+            : nullptr;
     handle->window = kWin;
-    handle->hasWindow = kWin->hasAccess();
+    handle->hasWindow = kWin->hasAccess() || handle->ipcDevPeerPtrs != nullptr;
 
     // Detect incompatible configuration: symmetric default window on vendor
     // path. The vendor Device API Window only accepts vendor-native windows.

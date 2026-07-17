@@ -86,6 +86,8 @@ inline const char *uniRunnerDagAlgoTypeToString(uniRunnerDagAlgoType algoType) {
       return "ring_rs";
     case uniRunnerDagAlgoTreeRed:
       return "tree_red";
+    case uniRunnerDagAlgoIpcAR:
+      return "ipc_ar";
     default:
       return "unknown";
   }
@@ -109,6 +111,8 @@ inline bool uniRunnerDagAlgoTypeFromString(const std::string &text,
     *algoType = uniRunnerDagAlgoRingRS;
   } else if (text == "tree_red") {
     *algoType = uniRunnerDagAlgoTreeRed;
+  } else if (text == "ipc_ar") {
+    *algoType = uniRunnerDagAlgoIpcAR;
   } else {
     return false;
   }
@@ -186,6 +190,8 @@ inline const char *uniRunnerDagNodeTypeToString(uniRunnerDagNodeType nodeType) {
       return "red";
     case uniRunnerDagNodeTypeCpy:
       return "cpy";
+    case uniRunnerDagNodeTypeIpc:
+      return "ipc";
     default:
       return "unknown";
   }
@@ -199,6 +205,8 @@ inline bool uniRunnerDagNodeTypeFromString(const std::string &text,
     *nodeType = uniRunnerDagNodeTypeRed;
   } else if (text == "cpy") {
     *nodeType = uniRunnerDagNodeTypeCpy;
+  } else if (text == "ipc") {
+    *nodeType = uniRunnerDagNodeTypeIpc;
   } else {
     return false;
   }

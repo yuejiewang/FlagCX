@@ -58,6 +58,11 @@ typedef enum {
 } flagcxReduceTriggerState;
 
 typedef enum {
+  flagcxIpcBufferInput = 0,
+  flagcxIpcBufferOutput = 1
+} flagcxIpcBufferType;
+
+typedef enum {
   flagcxStreamFlagIdle = 0,
   flagcxStreamFlagPend = 1,
   flagcxStreamFlagDone = 2
@@ -227,6 +232,23 @@ struct alignas(16) flagcxReduceTrigger {
                                       uint64_t flagIn, uint64_t flagOut);
   FLAGCX_HOST_DECORATOR uint64_t pollState();
   FLAGCX_HOST_DECORATOR void setState(int state);
+};
+
+// Intra-node IPC/LSA push trigger. The source and destination memory handles
+// are bound once at collective-kernel launch; FIFO entries only carry buffer
+// selection, byte offsets, peer-local rank, and DAG synchronization metadata.
+struct alignas(16) flagcxIpcTrigger {
+  uint64_t srcOffsetBytes;
+  uint64_t dstOffsetBytes;
+  uint64_t bytes;
+  uint64_t flagOut;
+  uint64_t epoch;
+  uint32_t srcBufferType;
+  uint32_t peerLocalRank;
+  uint32_t readySlot;
+  uint32_t parentFlagsOffset;
+  uint32_t numParentFlags;
+  uint32_t state;
 };
 typedef flagcxReduceTrigger *flagcxReduceTrigger_t;
 

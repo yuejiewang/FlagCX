@@ -2,6 +2,7 @@
 #include "flagcx_kernel.h"
 
 FLAGCX_PARAM(ReduceFifoCapacity, "REDUCE_FIFO_CAPACITY", FLAGCX_FIFO_CAPACITY);
+FLAGCX_PARAM(IpcFifoCapacity, "IPC_FIFO_CAPACITY", FLAGCX_FIFO_CAPACITY);
 
 FLAGCX_HOST_DECORATOR void flagcxReduceTrigger::setValue(
     uint64_t fst, uint64_t snd, uint64_t out, size_t count, size_t nthreads,
@@ -97,8 +98,79 @@ flagcxResult_t flagcxFifo::flagcxRedFifoInit() {
   return flagcxSuccess;
 }
 
+FLAGCX_HOST_DECORATOR flagcxResult_t enqueueIpc(
+    void *fifoBuffer, uint64_t srcOffsetBytes, uint64_t dstOffsetBytes,
+    uint64_t bytes, flagcxIpcBufferType srcBufferType, int peerLocalRank,
+    uint32_t readySlot, uint64_t epoch, uint32_t parentFlagsOffset,
+    uint32_t numParentFlags, uint64_t flagOut, int *ret) {
+  uint64_t *buffer = static_cast<uint64_t *>(fifoBuffer);
+  int capacity = static_cast<int>(buffer[flagcxFifoIdxCapacity]);
+  uint64_t produced = __atomic_load_n(buffer + flagcxFifoIdxProduced,
+                                      __ATOMIC_ACQUIRE);
+  uint64_t consumed = __atomic_load_n(buffer + flagcxFifoIdxConsumed,
+                                      __ATOMIC_ACQUIRE);
+  if (produced - consumed >= static_cast<uint64_t>(capacity)) {
+    *ret = -1;
+    sched_yield();
+    return flagcxSuccess;
+  }
+
+  int idx = static_cast<int>(produced % capacity);
+  flagcxIpcTrigger *trigger =
+      reinterpret_cast<flagcxIpcTrigger *>(buffer + flagcxFifoIdxData) + idx;
+  if (__atomic_load_n(&trigger->state, __ATOMIC_ACQUIRE) !=
+      flagcxReduceTriggerAvailable) {
+    *ret = -1;
+    sched_yield();
+    return flagcxSuccess;
+  }
+
+  trigger->srcOffsetBytes = srcOffsetBytes;
+  trigger->dstOffsetBytes = dstOffsetBytes;
+  trigger->bytes = bytes;
+  trigger->flagOut = flagOut;
+  trigger->epoch = epoch;
+  trigger->srcBufferType = static_cast<uint32_t>(srcBufferType);
+  trigger->peerLocalRank = static_cast<uint32_t>(peerLocalRank);
+  trigger->readySlot = readySlot;
+  trigger->parentFlagsOffset = parentFlagsOffset;
+  trigger->numParentFlags = numParentFlags;
+  __atomic_store_n(&trigger->state, flagcxReduceTriggerEnqueued,
+                   __ATOMIC_RELEASE);
+  __atomic_fetch_add(buffer + flagcxFifoIdxProduced, 1ul, __ATOMIC_RELEASE);
+  *ret = idx;
+  TRACE(FLAGCX_KERNEL,
+        "enqueue ipc: bytes=%lu peerLocalRank=%d slot=%u epoch=%lu idx=%d",
+        bytes, peerLocalRank, readySlot, epoch, idx);
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxFifo::flagcxIpcFifoInit() {
+  uint64_t capacity = flagcxParamIpcFifoCapacity();
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+      reinterpret_cast<void **>(&buffer),
+      flagcxFifoIdxData * sizeof(uint64_t) +
+          capacity * sizeof(flagcxIpcTrigger),
+      flagcxMemHost, NULL));
+  buffer[flagcxFifoIdxCapacity] = capacity;
+  buffer[flagcxFifoIdxConsumed] = 0;
+  buffer[flagcxFifoIdxProduced] = 0;
+  buffer[flagcxFifoIdxTerminate] = 0;
+  memset(buffer + flagcxFifoIdxData, 0,
+         capacity * sizeof(flagcxIpcTrigger));
+  __sync_synchronize();
+  return flagcxSuccess;
+}
+
 flagcxResult_t flagcxFifo::flagcxRedFifoDestroy() {
   INFO(FLAGCX_KERNEL, "flagcxRedFifoDestroy called");
   FLAGCXCHECK(deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL));
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxFifo::flagcxIpcFifoDestroy() {
+  INFO(FLAGCX_KERNEL, "flagcxIpcFifoDestroy called");
+  FLAGCXCHECK(deviceAdaptor->deviceFree(static_cast<void *>(buffer),
+                                        flagcxMemHost, NULL));
   return flagcxSuccess;
 }

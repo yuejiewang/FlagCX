@@ -20,7 +20,8 @@
 typedef enum {
   uniRunnerDagNodeTypeP2p = 0,
   uniRunnerDagNodeTypeRed = 1,
-  uniRunnerDagNodeTypeCpy = 2
+  uniRunnerDagNodeTypeCpy = 2,
+  uniRunnerDagNodeTypeIpc = 3
 } uniRunnerDagNodeType;
 
 // Static DAG template algorithm identifiers used by the uniRunner cache.
@@ -32,7 +33,8 @@ typedef enum {
   uniRunnerDagAlgoRingAR = 4,
   uniRunnerDagAlgoSlicedAR = 5,
   uniRunnerDagAlgoRingRS = 6,
-  uniRunnerDagAlgoTreeRed = 7
+  uniRunnerDagAlgoTreeRed = 7,
+  uniRunnerDagAlgoIpcAR = 8
 } uniRunnerDagAlgoType;
 
 // Cache key describing a reusable uniRunner DAG template.
@@ -85,6 +87,17 @@ struct uniRunnerCpyNodeData {
   flagcxDataType_t datatype;
 };
 
+struct uniRunnerIpcNodeData {
+  size_t srcOffsetBytes;
+  size_t dstOffsetBytes;
+  size_t bytes;
+  flagcxIpcBufferType srcBufferType;
+  int peerLocalRank;
+  uint32_t readySlot;
+  uint32_t parentFlagsOffset;
+  int triggerIdx;
+};
+
 // Unified DAG node with common DAG structure fields
 struct uniRunnerDagNode {
   uniRunnerDagNodeType nodeType; // Discriminator for union
@@ -103,12 +116,15 @@ struct uniRunnerDagNode {
     struct uniRunnerP2pNodeData p2p;
     struct uniRunnerRedNodeData red;
     struct uniRunnerCpyNodeData cpy;
+    struct uniRunnerIpcNodeData ipc;
   } nodeData;
 };
 
 typedef struct {
   pthread_t thread;
   flagcxFifo_t fifo;
+  flagcxFifo_t ipcFifo;
+  void *ipcFifoDevicePtr;
   flagcxStream_t commStream;
   flagcxStream_t redStream;
   flagcxStream_t cpyStream;
@@ -121,10 +137,13 @@ typedef struct {
       p2pReadyQueue;
   flagcxIntruQueue<struct uniRunnerDagNode, &uniRunnerDagNode::next>
       redReadyQueue;
+  flagcxIntruQueue<struct uniRunnerDagNode, &uniRunnerDagNode::next>
+      ipcReadyQueue;
 
   uint64_t uniRunnerNSlices;
   uint64_t uniRunnerNThreads;
-  uint64_t uniRunnerNBlocks;
+  uint64_t uniRunnerNRedBlocks;
+  uint64_t uniRunnerNIpcBlocks;
   uint64_t uniRunnerNRedSlices;
   uint64_t uniRunnerRedSliceSize;
 
@@ -134,6 +153,23 @@ typedef struct {
   void **streamFlags;
   size_t streamFlagsSize;
   size_t streamFlagsCapacity;
+
+  // IPC/LSA AllReduce runtime resources. User-buffer DevMem views are reused
+  // while their base/size bindings remain unchanged; owned ready storage is
+  // communicator scoped and reused with monotonically increasing epochs.
+  flagcxComm_t ipcOwner;
+  flagcxDevMem_t ipcInputMem;
+  flagcxDevMem_t ipcOutputMem;
+  flagcxDevMem_t ipcReadyMem;
+  const void *ipcInputBase;
+  void *ipcOutputBase;
+  size_t ipcDataBytes;
+  void *ipcReadyBuffer;
+  size_t ipcReadyCapacity;
+  size_t ipcReadySlots;
+  uint64_t ipcEpoch;
+  uint64_t *ipcParentFlagsDevice;
+  size_t ipcParentFlagsCount;
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
@@ -159,6 +195,11 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
                                           size_t count,
                                           flagcxDataType_t datatype,
                                           flagcxRedOp_t op, flagcxComm_t comm);
+flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
+                                       const void *sendbuff, void *recvbuff,
+                                       size_t count,
+                                       flagcxDataType_t datatype,
+                                       flagcxRedOp_t op, flagcxComm_t comm);
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,

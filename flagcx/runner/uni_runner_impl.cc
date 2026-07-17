@@ -9,6 +9,7 @@
 #include "socket.h"
 #include "transport.h"
 #include "uni_runner_helper.h"
+#include "device_api/flagcx_device.h"
 #define ENABLE_TIMER 0
 #include "timer.h"
 
@@ -29,9 +30,17 @@
 
 FLAGCX_PARAM(UniRunnerNSlices, "UNIRUNNER_NSLICES", 1);
 FLAGCX_PARAM(UniRunnerNThreads, "UNIRUNNER_NTHREADS", 32);
-FLAGCX_PARAM(UniRunnerNBlocks, "UNIRUNNER_NBLOCKS", 1);
+FLAGCX_PARAM(UniRunnerNRedBlocks, "UNIRUNNER_NREDBLOCKS", 1);
+FLAGCX_PARAM(UniRunnerNIpcBlocks, "UNIRUNNER_NIPCBLOCKS", 1);
 FLAGCX_PARAM(UniRunnerNRedSlices, "UNIRUNNER_NREDSLICES", 0);
 FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
+
+static flagcxResult_t ensureUniRunnerIpcDataViews(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm,
+    const void *sendbuff, void *recvbuff, size_t bytes);
+static flagcxResult_t ensureUniRunnerIpcReadyStorage(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm,
+    size_t requiredSlots);
 
 namespace {
 
@@ -577,6 +586,8 @@ getDagNodeExecutionStream(flagcxUniRunnerState *runnerState,
       return runnerState->redStream;
     case uniRunnerDagNodeTypeCpy:
       return runnerState->cpyStream;
+    case uniRunnerDagNodeTypeIpc:
+      return runnerState->redStream;
     default:
       return NULL;
   }
@@ -1799,6 +1810,127 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   return validateDagNodes(runnerState);
 }
 
+static bool getIpcBufferOffset(const void *ptr, const void *base, size_t bytes,
+                               size_t *offset) {
+  if (ptr == NULL || base == NULL)
+    return false;
+  uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+  uintptr_t b = reinterpret_cast<uintptr_t>(base);
+  // One-past-end is valid for a zero-count slice; the trigger will carry
+  // bytes==0 and only exchange its ready epoch.
+  if (p < b || p - b > bytes)
+    return false;
+  *offset = static_cast<size_t>(p - b);
+  return true;
+}
+
+static int globalRankToLocalRank(flagcxComm_t comm, int globalRank) {
+  for (int localRank = 0; localRank < comm->localRanks; ++localRank) {
+    if (comm->localRankToRank[localRank] == globalRank)
+      return localRank;
+  }
+  return -1;
+}
+
+static flagcxResult_t buildUniRunnerStateIpcAR(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
+    flagcxComm_t comm) {
+  if (comm->localRanks != comm->nranks)
+    return flagcxNotSupported;
+  if (comm->nranks <= 1 || count == 0) {
+    return buildUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff, count,
+                                       datatype, op, comm);
+  }
+
+  FLAGCXCHECK(buildUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff,
+                                          count, datatype, op, comm));
+
+  const size_t totalBytes = count * getFlagcxDataTypeSize(datatype);
+  uint32_t readySlot = 0;
+  for (int nodeIdx = 0; nodeIdx < runnerState->numDagNodes; ++nodeIdx) {
+    uniRunnerDagNode *node = &runnerState->dagNodes[nodeIdx];
+    if (node->nodeType != uniRunnerDagNodeTypeP2p)
+      continue;
+
+    const uniRunnerP2pOpData *sendOp = NULL;
+    const uniRunnerP2pOpData *recvOp = NULL;
+    for (int opIdx = 0; opIdx < node->nodeData.p2p.numOps; ++opIdx) {
+      const uniRunnerP2pOpData *candidate = &node->nodeData.p2p.ops[opIdx];
+      if (candidate->type == flagcxDevicePrimSend)
+        sendOp = candidate;
+      else if (candidate->type == flagcxDevicePrimRecv)
+        recvOp = candidate;
+    }
+    if (sendOp == NULL || recvOp == NULL) {
+      return flagcxNotSupported;
+    }
+
+    size_t srcOffset = 0;
+    flagcxIpcBufferType srcBufferType = flagcxIpcBufferInput;
+    // Prefer output for aliased buffers: both handles describe the same local
+    // storage and output is the destination surface carried around the ring.
+    if (getIpcBufferOffset(sendOp->addr, recvbuff, totalBytes, &srcOffset)) {
+      srcBufferType = flagcxIpcBufferOutput;
+    } else if (getIpcBufferOffset(sendOp->addr, sendbuff, totalBytes,
+                                  &srcOffset)) {
+      srcBufferType = flagcxIpcBufferInput;
+    } else {
+      return flagcxInvalidArgument;
+    }
+
+    size_t localRecvOffset = 0;
+    if (!getIpcBufferOffset(recvOp->addr, recvbuff, totalBytes,
+                            &localRecvOffset)) {
+      return flagcxInvalidArgument;
+    }
+    (void)localRecvOffset;
+    int peerLocalRank = globalRankToLocalRank(comm, sendOp->peerRank);
+    if (peerLocalRank < 0)
+      return flagcxNotSupported;
+
+    uniRunnerP2pOpData *oldOps = node->nodeData.p2p.ops;
+    uniRunnerIpcNodeData ipc = {};
+    ipc.srcOffsetBytes = srcOffset;
+    // Ring chunks retain their global output-buffer offset at every rank. The
+    // local recv op refers to the chunk arriving from prevRank, while this
+    // send op writes its own source chunk to nextRank at srcOffset.
+    ipc.dstOffsetBytes = srcOffset;
+    ipc.bytes = sendOp->count * getFlagcxDataTypeSize(sendOp->datatype);
+    ipc.srcBufferType = srcBufferType;
+    ipc.peerLocalRank = peerLocalRank;
+    ipc.readySlot = readySlot++;
+    ipc.parentFlagsOffset = 0;
+    ipc.triggerIdx = -1;
+    free(oldOps);
+    node->nodeType = uniRunnerDagNodeTypeIpc;
+    node->nodeData.ipc = ipc;
+  }
+
+  flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->ipcReadyQueue);
+  runnerState->numPendingNodes = 0;
+  for (int nodeIdx = 0; nodeIdx < runnerState->numDagNodes; ++nodeIdx) {
+    uniRunnerDagNode *node = &runnerState->dagNodes[nodeIdx];
+    node->pendingParents = node->numParents;
+    if (node->numParents == 0) {
+      if (node->nodeType == uniRunnerDagNodeTypeRed) {
+        flagcxIntruQueueEnqueue(&runnerState->redReadyQueue, node);
+      } else if (node->nodeType == uniRunnerDagNodeTypeIpc) {
+        flagcxIntruQueueEnqueue(&runnerState->ipcReadyQueue, node);
+      } else {
+        flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, node);
+      }
+    } else {
+      runnerState->numPendingNodes++;
+    }
+  }
+
+  runnerState->ipcReadySlots = static_cast<size_t>(readySlot);
+  return validateDagNodes(runnerState);
+}
+
 static flagcxResult_t buildUniRunnerStateRingRS(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     void *scratchbuff, size_t count, flagcxDataType_t datatype,
@@ -2410,6 +2542,7 @@ static flagcxResult_t buildUniRunnerStateTreeRed(
 static void resetDagSchedulerRuntimeState(flagcxUniRunnerState *runnerState) {
   flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
   flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->ipcReadyQueue);
   runnerState->numPendingNodes = 0;
 }
 
@@ -2774,6 +2907,27 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   });
 }
 
+flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
+                                       const void *sendbuff, void *recvbuff,
+                                       size_t count,
+                                       flagcxDataType_t datatype,
+                                       flagcxRedOp_t op, flagcxComm_t comm) {
+  runnerState->uniRunnerNRedSlices =
+      resolveEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
+  // IPC nodes carry runtime Window/DevMem bindings and therefore intentionally
+  // bypass the static JSON DAG cache. The underlying SlicedAR topology remains
+  // unchanged and all existing cached algorithms are preserved.
+  FLAGCXCHECK(buildUniRunnerStateIpcAR(runnerState, sendbuff, recvbuff, count,
+                                       datatype, op, comm));
+  if (runnerState->ipcReadySlots == 0)
+    return flagcxSuccess;
+  size_t bytes = count * getFlagcxDataTypeSize(datatype);
+  FLAGCXCHECK(ensureUniRunnerIpcDataViews(runnerState, comm, sendbuff,
+                                          recvbuff, bytes));
+  return ensureUniRunnerIpcReadyStorage(runnerState, comm,
+                                        runnerState->ipcReadySlots);
+}
+
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,
@@ -2932,6 +3086,10 @@ static flagcxResult_t enqueueReadyQueue(flagcxUniRunnerState *runnerState,
              uniRunnerDagNodeTypeRed) {
     flagcxIntruQueueEnqueue(&runnerState->redReadyQueue,
                             &runnerState->dagNodes[nodeIdx]);
+  } else if (runnerState->dagNodes[nodeIdx].nodeType ==
+             uniRunnerDagNodeTypeIpc) {
+    flagcxIntruQueueEnqueue(&runnerState->ipcReadyQueue,
+                            &runnerState->dagNodes[nodeIdx]);
   } else {
     return flagcxNotSupported;
   }
@@ -2951,6 +3109,165 @@ static flagcxResult_t notifyChildrenScheduled(flagcxUniRunnerState *runnerState,
       FLAGCXCHECK(enqueueReadyQueue(runnerState, current->children[i]));
     }
   }
+  return flagcxSuccess;
+}
+
+static flagcxResult_t allocUniRunnerIpcReadyBuffer(void **ptr, size_t bytes) {
+  return deviceAdaptor->deviceMalloc(ptr, bytes, flagcxMemDevice, NULL);
+}
+
+static flagcxResult_t freeUniRunnerIpcReadyBuffer(void *ptr) {
+  if (ptr == NULL)
+    return flagcxSuccess;
+  return deviceAdaptor->deviceFree(ptr, flagcxMemDevice, NULL);
+}
+
+static flagcxResult_t destroyUniRunnerIpcDataViews(
+    flagcxUniRunnerState *runnerState) {
+  if (runnerState->ipcOwner == NULL)
+    return flagcxSuccess;
+  flagcxComm_t comm = runnerState->ipcOwner;
+  bool aliased = runnerState->ipcInputMem != NULL &&
+                 runnerState->ipcInputMem == runnerState->ipcOutputMem;
+  if (runnerState->ipcInputMem != NULL && !aliased) {
+    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->ipcInputMem));
+  }
+  if (runnerState->ipcOutputMem != NULL) {
+    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->ipcOutputMem));
+  }
+  runnerState->ipcInputMem = NULL;
+  runnerState->ipcOutputMem = NULL;
+  runnerState->ipcInputBase = NULL;
+  runnerState->ipcOutputBase = NULL;
+  runnerState->ipcDataBytes = 0;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t ensureUniRunnerIpcDataViews(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm,
+    const void *sendbuff, void *recvbuff, size_t bytes) {
+  if (runnerState->ipcInputMem != NULL && runnerState->ipcOutputMem != NULL &&
+      runnerState->ipcInputBase == sendbuff &&
+      runnerState->ipcOutputBase == recvbuff &&
+      runnerState->ipcDataBytes == bytes) {
+    return flagcxSuccess;
+  }
+
+  FLAGCXCHECK(destroyUniRunnerIpcDataViews(runnerState));
+  runnerState->ipcOwner = comm;
+  flagcxResult_t res = flagcxSuccess;
+
+  FLAGCXCHECKGOTO(flagcxDevMemCreate(comm, recvbuff, bytes, NULL,
+                                     &runnerState->ipcOutputMem),
+                  res, fail);
+  if (sendbuff == recvbuff) {
+    runnerState->ipcInputMem = runnerState->ipcOutputMem;
+  } else {
+    FLAGCXCHECKGOTO(flagcxDevMemCreate(
+                        comm, const_cast<void *>(sendbuff), bytes, NULL,
+                        &runnerState->ipcInputMem),
+                    res, fail);
+  }
+  if (!runnerState->ipcInputMem->hasWindow ||
+      !runnerState->ipcOutputMem->hasWindow) {
+    res = flagcxNotSupported;
+    goto fail;
+  }
+  runnerState->ipcInputBase = sendbuff;
+  runnerState->ipcOutputBase = recvbuff;
+  runnerState->ipcDataBytes = bytes;
+  return flagcxSuccess;
+
+fail:
+  (void)destroyUniRunnerIpcDataViews(runnerState);
+  return res;
+}
+
+static flagcxResult_t ensureUniRunnerIpcReadyStorage(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm,
+    size_t requiredSlots) {
+  if (requiredSlots == 0)
+    return flagcxSuccess;
+  if (runnerState->ipcReadyMem != NULL &&
+      runnerState->ipcReadyCapacity >= requiredSlots) {
+    return flagcxSuccess;
+  }
+
+  if (runnerState->ipcReadyMem != NULL) {
+    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->ipcReadyMem));
+    runnerState->ipcReadyMem = NULL;
+  }
+  if (runnerState->ipcReadyBuffer != NULL) {
+    FLAGCXCHECK(
+        freeUniRunnerIpcReadyBuffer(runnerState->ipcReadyBuffer));
+    runnerState->ipcReadyBuffer = NULL;
+  }
+  runnerState->ipcReadyCapacity = 0;
+
+  size_t bytes = requiredSlots * sizeof(uint64_t);
+  flagcxResult_t res = flagcxSuccess;
+  FLAGCXCHECKGOTO(allocUniRunnerIpcReadyBuffer(
+                      &runnerState->ipcReadyBuffer, bytes),
+                  res, fail);
+  FLAGCXCHECKGOTO(deviceAdaptor->deviceMemset(runnerState->ipcReadyBuffer, 0,
+                                               bytes, flagcxMemDevice, NULL),
+                  res, fail);
+  FLAGCXCHECKGOTO(flagcxDevMemCreate(
+                      comm, runnerState->ipcReadyBuffer, bytes, NULL,
+                      &runnerState->ipcReadyMem),
+                  res, fail);
+  if (!runnerState->ipcReadyMem->hasWindow) {
+    res = flagcxNotSupported;
+    goto fail;
+  }
+  runnerState->ipcReadyCapacity = requiredSlots;
+  return flagcxSuccess;
+
+fail:
+  if (runnerState->ipcReadyMem != NULL) {
+    (void)flagcxDevMemDestroy(comm, runnerState->ipcReadyMem);
+    runnerState->ipcReadyMem = NULL;
+  }
+  if (runnerState->ipcReadyBuffer != NULL) {
+    (void)freeUniRunnerIpcReadyBuffer(runnerState->ipcReadyBuffer);
+    runnerState->ipcReadyBuffer = NULL;
+  }
+  runnerState->ipcReadyCapacity = 0;
+  return res;
+}
+
+static flagcxResult_t prepareUniRunnerIpcParentFlags(
+    flagcxUniRunnerState *runnerState) {
+  if (runnerState->ipcParentFlagsDevice != NULL) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(
+        runnerState->ipcParentFlagsDevice, flagcxMemDevice, NULL));
+    runnerState->ipcParentFlagsDevice = NULL;
+    runnerState->ipcParentFlagsCount = 0;
+  }
+
+  std::vector<uint64_t> parentFlags;
+  for (int nodeIdx = 0; nodeIdx < runnerState->numDagNodes; ++nodeIdx) {
+    uniRunnerDagNode *node = &runnerState->dagNodes[nodeIdx];
+    if (node->nodeType != uniRunnerDagNodeTypeIpc)
+      continue;
+    node->nodeData.ipc.parentFlagsOffset =
+        static_cast<uint32_t>(parentFlags.size());
+    for (int parentIdx = 0; parentIdx < node->numParents; ++parentIdx) {
+      parentFlags.push_back(reinterpret_cast<uint64_t>(
+          getDagNodeFlag(runnerState, node->parents[parentIdx])));
+    }
+  }
+  if (parentFlags.empty())
+    return flagcxSuccess;
+
+  size_t bytes = parentFlags.size() * sizeof(uint64_t);
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+      reinterpret_cast<void **>(&runnerState->ipcParentFlagsDevice), bytes,
+      flagcxMemDevice, NULL));
+  FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+      runnerState->ipcParentFlagsDevice, parentFlags.data(), bytes,
+      flagcxMemcpyHostToDevice, NULL, NULL));
+  runnerState->ipcParentFlagsCount = parentFlags.size();
   return flagcxSuccess;
 }
 
@@ -3002,6 +3319,29 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
     FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
   }
 
+  while (!flagcxIntruQueueEmpty(&runnerState->ipcReadyQueue)) {
+    uniRunnerDagNode *current =
+        flagcxIntruQueueHead(&runnerState->ipcReadyQueue);
+    uint64_t flagOut =
+        reinterpret_cast<uint64_t>(getDagNodeFlag(runnerState,
+                                                  current->nodeIdx));
+    int idx = -1;
+    FLAGCXCHECK(enqueueIpc(
+        runnerState->ipcFifo->buffer, current->nodeData.ipc.srcOffsetBytes,
+        current->nodeData.ipc.dstOffsetBytes, current->nodeData.ipc.bytes,
+        current->nodeData.ipc.srcBufferType,
+        current->nodeData.ipc.peerLocalRank, current->nodeData.ipc.readySlot,
+        runnerState->ipcEpoch, current->nodeData.ipc.parentFlagsOffset,
+        static_cast<uint32_t>(current->numParents), flagOut, &idx));
+    if (idx == -1) {
+      sched_yield();
+      break;
+    }
+    flagcxIntruQueueDequeue(&runnerState->ipcReadyQueue);
+    current->nodeData.ipc.triggerIdx = idx;
+    FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
+  }
+
   return flagcxSuccess;
 }
 
@@ -3011,12 +3351,21 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->dagNodes = NULL;
   runnerState->numDagNodes = 0;
   runnerState->streamFlagsSize = 0;
+  runnerState->ipcReadySlots = 0;
 
   runnerState->uniRunnerNSlices = flagcxParamUniRunnerNSlices();
   runnerState->uniRunnerNThreads = flagcxParamUniRunnerNThreads();
-  runnerState->uniRunnerNBlocks = flagcxParamUniRunnerNBlocks();
+  runnerState->uniRunnerNRedBlocks = flagcxParamUniRunnerNRedBlocks();
+  runnerState->uniRunnerNIpcBlocks = flagcxParamUniRunnerNIpcBlocks();
   runnerState->uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
   runnerState->uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
+  if (runnerState->uniRunnerNThreads == 0 ||
+      runnerState->uniRunnerNRedBlocks == 0 ||
+      runnerState->uniRunnerNIpcBlocks == 0) {
+    WARN("UniRunner requires NTHREADS, NREDBLOCKS and NIPCBLOCKS to be "
+         "greater than zero");
+    return flagcxInvalidArgument;
+  }
 
   // Set device context
   FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
@@ -3029,9 +3378,16 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
       &hcomm->uniRunnerFifoBuffer, (void *)runnerState->fifo->buffer));
 
+  runnerState->ipcFifo = new flagcxFifo();
+  FLAGCXCHECK(runnerState->ipcFifo->flagcxIpcFifoInit());
+  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
+      &runnerState->ipcFifoDevicePtr,
+      static_cast<void *>(runnerState->ipcFifo->buffer)));
+
   // Initialize queues
   flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
   flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->ipcReadyQueue);
   runnerState->numPendingNodes = 0;
 
   // Create dedicated reduce and copy streams
@@ -3071,6 +3427,19 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
   FLAGCXCHECK(hcomm->proxyState->uniRunnerState.fifo->flagcxRedFifoDestroy());
   delete hcomm->proxyState->uniRunnerState.fifo;
   hcomm->uniRunnerFifoBuffer = NULL;
+  FLAGCXCHECK(
+      hcomm->proxyState->uniRunnerState.ipcFifo->flagcxIpcFifoDestroy());
+  delete hcomm->proxyState->uniRunnerState.ipcFifo;
+  hcomm->proxyState->uniRunnerState.ipcFifo = NULL;
+  hcomm->proxyState->uniRunnerState.ipcFifoDevicePtr = NULL;
+
+  if (hcomm->proxyState->uniRunnerState.ipcParentFlagsDevice != NULL) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(
+        hcomm->proxyState->uniRunnerState.ipcParentFlagsDevice,
+        flagcxMemDevice, NULL));
+    hcomm->proxyState->uniRunnerState.ipcParentFlagsDevice = NULL;
+    hcomm->proxyState->uniRunnerState.ipcParentFlagsCount = 0;
+  }
 
   return flagcxSuccess;
 }
@@ -3081,24 +3450,36 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
   FLAGCXCHECK(prepareDagStreamFlags(runnerState));
+  FLAGCXCHECK(prepareUniRunnerIpcParentFlags(runnerState));
+  if (runnerState->ipcReadySlots != 0) {
+    runnerState->ipcEpoch++;
+    if (runnerState->ipcEpoch == 0)
+      runnerState->ipcEpoch++;
+  }
 
 #ifdef COMPILE_KERNEL_HOST
   // Launch collective kernel
   flagcxLaunchCollectiveKernel(
-      hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
-      runnerState->uniRunnerNBlocks, runnerState->redStream);
+      hcomm->uniRunnerFifoBuffer, runnerState->ipcFifoDevicePtr,
+      runnerState->ipcInputMem, runnerState->ipcOutputMem,
+      runnerState->ipcReadyMem, runnerState->ipcParentFlagsDevice,
+      runnerState->uniRunnerNThreads, runnerState->uniRunnerNRedBlocks,
+      runnerState->uniRunnerNIpcBlocks, runnerState->redStream);
 #endif
 
   // Main scheduling loop using DAG-based queue scheduling
   while (true) {
     if (flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue) &&
         flagcxIntruQueueEmpty(&runnerState->redReadyQueue) &&
+        flagcxIntruQueueEmpty(&runnerState->ipcReadyQueue) &&
         runnerState->numPendingNodes == 0) {
       TRACE(
           FLAGCX_UNIRUNNER,
           "runUniRunner: all submitted work drained, terminating runner loop");
       __atomic_store_n(fifo->buffer + flagcxFifoIdxTerminate, 1,
                        __ATOMIC_RELEASE);
+      __atomic_store_n(runnerState->ipcFifo->buffer + flagcxFifoIdxTerminate,
+                       1, __ATOMIC_RELEASE);
       break;
     }
 
@@ -3114,5 +3495,29 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
 flagcxResult_t
 cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState) {
   FLAGCXCHECK(cleanupDagScheduler(runnerState));
-  return destroyStreamFlagQueue(runnerState);
+  FLAGCXCHECK(destroyStreamFlagQueue(runnerState));
+  if (runnerState == NULL)
+    return flagcxSuccess;
+
+  flagcxComm_t comm = runnerState->ipcOwner;
+  FLAGCXCHECK(destroyUniRunnerIpcDataViews(runnerState));
+  if (comm != NULL && runnerState->ipcReadyMem != NULL) {
+    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->ipcReadyMem));
+  }
+  runnerState->ipcReadyMem = NULL;
+  if (runnerState->ipcReadyBuffer != NULL) {
+    FLAGCXCHECK(
+        freeUniRunnerIpcReadyBuffer(runnerState->ipcReadyBuffer));
+  }
+  runnerState->ipcReadyBuffer = NULL;
+  runnerState->ipcReadyCapacity = 0;
+  runnerState->ipcReadySlots = 0;
+  runnerState->ipcOwner = NULL;
+  if (runnerState->ipcParentFlagsDevice != NULL) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->ipcParentFlagsDevice,
+                                          flagcxMemDevice, NULL));
+  }
+  runnerState->ipcParentFlagsDevice = NULL;
+  runnerState->ipcParentFlagsCount = 0;
+  return flagcxSuccess;
 }

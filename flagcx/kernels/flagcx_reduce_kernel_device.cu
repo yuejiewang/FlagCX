@@ -1,6 +1,6 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
-#include "device_api/comm_traits.h"
+#include "device_api/flagcx_device.h"
 
 #define SLOT_IDX 4
 #define FST_IDX 5
@@ -124,7 +124,7 @@ flagcxReduceKernel(uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
   }
 }
 
-FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
+FLAGCX_DEVICE_INLINE_DECORATOR void runReduceExecutor(void *fifoBuffer) {
   FLAGCX_SHARED uint64_t shm[16];
   uint64_t *vBuf = (uint64_t *)fifoBuffer;
   int emptyIter = 0; // backoff counter
@@ -247,8 +247,177 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
   }
 }
 
-void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
-                                  size_t nblocks, flagcxStream_t stream) {
+struct alignas(16) flagcxIpcVector128 {
+  uint64_t x;
+  uint64_t y;
+};
+
+FLAGCX_DEVICE_INLINE_DECORATOR void
+waitIpcParents(const flagcxIpcTrigger &trigger,
+               const uint64_t *parentFlags) {
+  if (FLAGCX_THREAD_IDX_X != 0)
+    return;
+  for (uint32_t i = 0; i < trigger.numParentFlags; ++i) {
+    uint64_t flagAddr = parentFlags[trigger.parentFlagsOffset + i];
+    int iter = 0;
+    while (!isStreamFlagStateDone(loadStreamFlagState(flagAddr))) {
+      DeviceAPI::Intrin::spinBackoff(iter++);
+    }
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void
+copyIpcBytes(void *dst, const void *src, size_t bytes) {
+  uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dst);
+  uintptr_t srcAddr = reinterpret_cast<uintptr_t>(src);
+  size_t vectorBytes = 0;
+  if (((dstAddr | srcAddr) & (alignof(flagcxIpcVector128) - 1)) == 0) {
+    vectorBytes = bytes & ~(sizeof(flagcxIpcVector128) - 1);
+    flagcxIpcVector128 *dstVec =
+        reinterpret_cast<flagcxIpcVector128 *>(dst);
+    const flagcxIpcVector128 *srcVec =
+        reinterpret_cast<const flagcxIpcVector128 *>(src);
+    size_t nvec = vectorBytes / sizeof(flagcxIpcVector128);
+    for (size_t i = FLAGCX_THREAD_IDX_X; i < nvec;
+         i += FLAGCX_BLOCK_DIM_X) {
+      dstVec[i] = srcVec[i];
+    }
+  }
+
+  char *dstBytes = static_cast<char *>(dst);
+  const char *srcBytes = static_cast<const char *>(src);
+  for (size_t i = vectorBytes + FLAGCX_THREAD_IDX_X; i < bytes;
+       i += FLAGCX_BLOCK_DIM_X) {
+    dstBytes[i] = srcBytes[i];
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void runIpcExecutor(
+    void *fifoBuffer, const flagcxDevMem &inputMem,
+    const flagcxDevMem &outputMem, const flagcxDevMem &readyMem,
+    const uint64_t *parentFlags) {
+  FLAGCX_SHARED int claimedIdx;
+  uint64_t *buffer = static_cast<uint64_t *>(fifoBuffer);
+  int capacity = static_cast<int>(buffer[flagcxFifoIdxCapacity]);
+  int emptyIter = 0;
+
+  while (true) {
+    if (FLAGCX_THREAD_IDX_X == 0) {
+      int absoluteIdx = -1;
+      dequeue(buffer, &absoluteIdx);
+      claimedIdx = absoluteIdx;
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+    int absoluteIdx = claimedIdx;
+    if (absoluteIdx < 0) {
+      if (DeviceAPI::Atomic::load(buffer + flagcxFifoIdxTerminate,
+                                  flagcxDeviceMemoryOrderAcquire) == 1) {
+        break;
+      }
+      DeviceAPI::Intrin::spinBackoff(emptyIter++);
+      continue;
+    }
+
+    emptyIter = 0;
+    int slot = absoluteIdx % capacity;
+    flagcxIpcTrigger *trigger =
+        reinterpret_cast<flagcxIpcTrigger *>(buffer + flagcxFifoIdxData) +
+        slot;
+
+    if (FLAGCX_THREAD_IDX_X == 0) {
+      DeviceAPI::Atomic::store(&trigger->state,
+                               static_cast<uint32_t>(
+                                   flagcxReduceTriggerInprogress),
+                               flagcxDeviceMemoryOrderRelease);
+      if (trigger->flagOut != 0) {
+        uint64_t *flagOut =
+            reinterpret_cast<uint64_t *>(trigger->flagOut);
+        if (loadStreamFlagState(trigger->flagOut) == flagcxStreamFlagIdle) {
+          DeviceAPI::Atomic::store(flagOut,
+                                   static_cast<uint64_t>(flagcxStreamFlagPend),
+                                   flagcxDeviceMemoryOrderRelease);
+        }
+      }
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+
+    waitIpcParents(*trigger, parentFlags);
+    FLAGCX_DEVICE_SYNC_THREADS();
+
+    const flagcxDevMem &srcMem =
+        trigger->srcBufferType == flagcxIpcBufferInput ? inputMem : outputMem;
+    const void *src = flagcxGetLocalPointer(srcMem, trigger->srcOffsetBytes);
+    void *remoteDst = flagcxGetIntraPointer(
+        outputMem, trigger->dstOffsetBytes,
+        static_cast<int>(trigger->peerLocalRank));
+    copyIpcBytes(remoteDst, src, static_cast<size_t>(trigger->bytes));
+    FLAGCX_DEVICE_SYNC_THREADS();
+
+    // Publish payload stores before the remote ready epoch. System scope is
+    // required because the destination belongs to a peer GPU/process.
+    if (FLAGCX_THREAD_IDX_X == 0) {
+      DeviceAPI::Intrin::threadfenceSystem();
+      uint64_t *remoteReady = static_cast<uint64_t *>(flagcxGetIntraPointer(
+          readyMem, trigger->readySlot * sizeof(uint64_t),
+          static_cast<int>(trigger->peerLocalRank)));
+      DeviceAPI::Atomic::store(remoteReady, trigger->epoch,
+                               flagcxDeviceMemoryOrderRelease);
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+
+    if (FLAGCX_THREAD_IDX_X == 0) {
+      uint64_t *localReady = static_cast<uint64_t *>(flagcxGetLocalPointer(
+          readyMem, trigger->readySlot * sizeof(uint64_t)));
+      int iter = 0;
+      while (DeviceAPI::Atomic::load(localReady,
+                                     flagcxDeviceMemoryOrderAcquire) <
+             trigger->epoch) {
+        DeviceAPI::Intrin::spinBackoff(iter++);
+      }
+      if (trigger->flagOut != 0) {
+        DeviceAPI::Atomic::store(
+            reinterpret_cast<uint64_t *>(trigger->flagOut),
+            static_cast<uint64_t>(flagcxStreamFlagDone),
+            flagcxDeviceMemoryOrderRelease);
+      }
+      DeviceAPI::Atomic::store(
+          &trigger->state,
+          static_cast<uint32_t>(flagcxReduceTriggerAvailable),
+          flagcxDeviceMemoryOrderRelease);
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+  }
+}
+
+FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(
+    void *redFifoBuffer, void *ipcFifoBuffer, flagcxDevMem inputMem,
+    flagcxDevMem outputMem, flagcxDevMem readyMem,
+    const uint64_t *ipcParentFlags, int nRedBlocks, int nIpcBlocks) {
+  if (FLAGCX_BLOCK_IDX_X < nRedBlocks) {
+    runReduceExecutor(redFifoBuffer);
+  } else if (FLAGCX_BLOCK_IDX_X < nRedBlocks + nIpcBlocks) {
+    runIpcExecutor(ipcFifoBuffer, inputMem, outputMem, readyMem,
+                   ipcParentFlags);
+  }
+}
+
+void flagcxLaunchCollectiveKernel(
+    void *redFifoBuffer, void *ipcFifoBuffer, flagcxDevMem_t inputMem,
+    flagcxDevMem_t outputMem, flagcxDevMem_t readyMem,
+    const uint64_t *ipcParentFlags, size_t nthreads, size_t nRedBlocks,
+    size_t nIpcBlocks, flagcxStream_t stream) {
+  flagcxDevMem input;
+  flagcxDevMem output;
+  flagcxDevMem ready;
+  if (inputMem != nullptr)
+    input = flagcxDevMem(*inputMem);
+  if (outputMem != nullptr)
+    output = flagcxDevMem(*outputMem);
+  if (readyMem != nullptr)
+    ready = flagcxDevMem(*readyMem);
+  size_t nblocks = nRedBlocks + nIpcBlocks;
   flagcxCollectiveKernel<<<nblocks, nthreads, 0,
-                           *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(fifoBuffer);
+                           *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(
+      redFifoBuffer, ipcFifoBuffer, input, output, ready, ipcParentFlags,
+      static_cast<int>(nRedBlocks), static_cast<int>(nIpcBlocks));
 }
