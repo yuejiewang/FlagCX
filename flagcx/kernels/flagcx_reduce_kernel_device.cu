@@ -296,20 +296,24 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runIpcExecutor(
     void *fifoBuffer, const flagcxDevMem &inputMem,
     const flagcxDevMem &outputMem, const flagcxDevMem &readyMem,
     const uint64_t *parentFlags) {
-  FLAGCX_SHARED int claimedIdx;
+  FLAGCX_SHARED uint64_t activeIdx;
+  FLAGCX_SHARED uint64_t claimedChunk;
+  FLAGCX_SHARED int finalChunk;
   uint64_t *buffer = static_cast<uint64_t *>(fifoBuffer);
   int capacity = static_cast<int>(buffer[flagcxFifoIdxCapacity]);
   int emptyIter = 0;
 
   while (true) {
     if (FLAGCX_THREAD_IDX_X == 0) {
-      int absoluteIdx = -1;
-      dequeue(buffer, &absoluteIdx);
-      claimedIdx = absoluteIdx;
+      uint64_t consumed = DeviceAPI::Atomic::load(
+          buffer + flagcxFifoIdxConsumed, flagcxDeviceMemoryOrderAcquire);
+      uint64_t produced = DeviceAPI::Atomic::load(
+          buffer + flagcxFifoIdxProduced, flagcxDeviceMemoryOrderAcquire);
+      activeIdx = consumed < produced ? consumed : ~uint64_t(0);
     }
     FLAGCX_DEVICE_SYNC_THREADS();
-    int absoluteIdx = claimedIdx;
-    if (absoluteIdx < 0) {
+    uint64_t absoluteIdx = activeIdx;
+    if (absoluteIdx == ~uint64_t(0)) {
       if (DeviceAPI::Atomic::load(buffer + flagcxFifoIdxTerminate,
                                   flagcxDeviceMemoryOrderAcquire) == 1) {
         break;
@@ -319,17 +323,18 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runIpcExecutor(
     }
 
     emptyIter = 0;
-    int slot = absoluteIdx % capacity;
+    int slot = static_cast<int>(absoluteIdx % capacity);
     flagcxIpcTrigger *trigger =
         reinterpret_cast<flagcxIpcTrigger *>(buffer + flagcxFifoIdxData) +
         slot;
 
     if (FLAGCX_THREAD_IDX_X == 0) {
-      DeviceAPI::Atomic::store(&trigger->state,
-                               static_cast<uint32_t>(
-                                   flagcxReduceTriggerInprogress),
-                               flagcxDeviceMemoryOrderRelease);
-      if (trigger->flagOut != 0) {
+      uint32_t expected = flagcxReduceTriggerEnqueued;
+      bool firstBlock = DeviceAPI::Atomic::compareExchange(
+          &trigger->state, expected,
+          static_cast<uint32_t>(flagcxReduceTriggerInprogress),
+          flagcxDeviceMemoryOrderAcqRel);
+      if (firstBlock && trigger->flagOut != 0) {
         uint64_t *flagOut =
             reinterpret_cast<uint64_t *>(trigger->flagOut);
         if (loadStreamFlagState(trigger->flagOut) == flagcxStreamFlagIdle) {
@@ -344,46 +349,94 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runIpcExecutor(
     waitIpcParents(*trigger, parentFlags);
     FLAGCX_DEVICE_SYNC_THREADS();
 
-    const flagcxDevMem &srcMem =
-        trigger->srcBufferType == flagcxIpcBufferInput ? inputMem : outputMem;
-    const void *src = flagcxGetLocalPointer(srcMem, trigger->srcOffsetBytes);
-    void *remoteDst = flagcxGetIntraPointer(
-        outputMem, trigger->dstOffsetBytes,
-        static_cast<int>(trigger->peerLocalRank));
-    copyIpcBytes(remoteDst, src, static_cast<size_t>(trigger->bytes));
-    FLAGCX_DEVICE_SYNC_THREADS();
+    while (true) {
+      if (FLAGCX_THREAD_IDX_X == 0) {
+        claimedChunk = DeviceAPI::Atomic::fetchAdd(
+            &trigger->nextChunk, uint64_t(1),
+            flagcxDeviceMemoryOrderAcqRel);
+        finalChunk = 0;
+      }
+      FLAGCX_DEVICE_SYNC_THREADS();
 
-    // Publish payload stores before the remote ready epoch. System scope is
-    // required because the destination belongs to a peer GPU/process.
-    if (FLAGCX_THREAD_IDX_X == 0) {
+      uint64_t chunk = claimedChunk;
+      if (chunk >= trigger->numChunks)
+        break;
+
+      uint64_t chunkOffset = chunk * trigger->chunkSize;
+      uint64_t chunkBytes = trigger->bytes - chunkOffset;
+      if (chunkBytes > trigger->chunkSize)
+        chunkBytes = trigger->chunkSize;
+
+      const flagcxDevMem &srcMem =
+          trigger->srcBufferType == flagcxIpcBufferInput ? inputMem : outputMem;
+      const void *src = flagcxGetLocalPointer(
+          srcMem, trigger->srcOffsetBytes + chunkOffset);
+      void *remoteDst = flagcxGetIntraPointer(
+          outputMem, trigger->dstOffsetBytes + chunkOffset,
+          static_cast<int>(trigger->peerLocalRank));
+      copyIpcBytes(remoteDst, src, static_cast<size_t>(chunkBytes));
+      FLAGCX_DEVICE_SYNC_THREADS();
+
+      // Every copy thread publishes its peer stores before this chunk becomes
+      // visible in completedChunks. The last completed chunk may then safely
+      // publish the logical IPC node's ready epoch.
       DeviceAPI::Intrin::threadfenceSystem();
-      uint64_t *remoteReady = static_cast<uint64_t *>(flagcxGetIntraPointer(
-          readyMem, trigger->readySlot * sizeof(uint64_t),
-          static_cast<int>(trigger->peerLocalRank)));
-      DeviceAPI::Atomic::store(remoteReady, trigger->epoch,
-                               flagcxDeviceMemoryOrderRelease);
-    }
-    FLAGCX_DEVICE_SYNC_THREADS();
+      FLAGCX_DEVICE_SYNC_THREADS();
 
+      if (FLAGCX_THREAD_IDX_X == 0) {
+        uint32_t completed = DeviceAPI::Atomic::fetchAdd(
+            &trigger->completedChunks, uint32_t(1),
+            flagcxDeviceMemoryOrderAcqRel);
+        finalChunk = completed + 1 == trigger->numChunks;
+      }
+      FLAGCX_DEVICE_SYNC_THREADS();
+
+      if (finalChunk) {
+        if (FLAGCX_THREAD_IDX_X == 0) {
+          uint64_t *remoteReady =
+              static_cast<uint64_t *>(flagcxGetIntraPointer(
+                  readyMem, trigger->readySlot * sizeof(uint64_t),
+                  static_cast<int>(trigger->peerLocalRank)));
+          DeviceAPI::Atomic::store(remoteReady, trigger->epoch,
+                                   flagcxDeviceMemoryOrderRelease);
+
+          uint64_t *localReady =
+              static_cast<uint64_t *>(flagcxGetLocalPointer(
+                  readyMem, trigger->readySlot * sizeof(uint64_t)));
+          int iter = 0;
+          while (DeviceAPI::Atomic::load(localReady,
+                                         flagcxDeviceMemoryOrderAcquire) <
+                 trigger->epoch) {
+            DeviceAPI::Intrin::spinBackoff(iter++);
+          }
+          if (trigger->flagOut != 0) {
+            DeviceAPI::Atomic::store(
+                reinterpret_cast<uint64_t *>(trigger->flagOut),
+                static_cast<uint64_t>(flagcxStreamFlagDone),
+                flagcxDeviceMemoryOrderRelease);
+          }
+          DeviceAPI::Atomic::store(
+              &trigger->state,
+              static_cast<uint32_t>(flagcxReduceTriggerAvailable),
+              flagcxDeviceMemoryOrderRelease);
+          DeviceAPI::Atomic::fetchAdd(buffer + flagcxFifoIdxConsumed,
+                                      uint64_t(1),
+                                      flagcxDeviceMemoryOrderRelease);
+        }
+        FLAGCX_DEVICE_SYNC_THREADS();
+        break;
+      }
+    }
+
+    // A block that found no remaining chunk waits for the unique finalizer to
+    // advance the logical FIFO entry before looking for more work.
     if (FLAGCX_THREAD_IDX_X == 0) {
-      uint64_t *localReady = static_cast<uint64_t *>(flagcxGetLocalPointer(
-          readyMem, trigger->readySlot * sizeof(uint64_t)));
       int iter = 0;
-      while (DeviceAPI::Atomic::load(localReady,
-                                     flagcxDeviceMemoryOrderAcquire) <
-             trigger->epoch) {
+      while (DeviceAPI::Atomic::load(buffer + flagcxFifoIdxConsumed,
+                                     flagcxDeviceMemoryOrderAcquire) <=
+             absoluteIdx) {
         DeviceAPI::Intrin::spinBackoff(iter++);
       }
-      if (trigger->flagOut != 0) {
-        DeviceAPI::Atomic::store(
-            reinterpret_cast<uint64_t *>(trigger->flagOut),
-            static_cast<uint64_t>(flagcxStreamFlagDone),
-            flagcxDeviceMemoryOrderRelease);
-      }
-      DeviceAPI::Atomic::store(
-          &trigger->state,
-          static_cast<uint32_t>(flagcxReduceTriggerAvailable),
-          flagcxDeviceMemoryOrderRelease);
     }
     FLAGCX_DEVICE_SYNC_THREADS();
   }

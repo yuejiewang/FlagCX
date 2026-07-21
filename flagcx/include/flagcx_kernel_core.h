@@ -241,6 +241,7 @@ struct alignas(16) flagcxIpcTrigger {
   uint64_t srcOffsetBytes;
   uint64_t dstOffsetBytes;
   uint64_t bytes;
+  uint64_t chunkSize;
   uint64_t flagOut;
   uint64_t epoch;
   uint32_t srcBufferType;
@@ -248,7 +249,10 @@ struct alignas(16) flagcxIpcTrigger {
   uint32_t readySlot;
   uint32_t parentFlagsOffset;
   uint32_t numParentFlags;
+  uint32_t numChunks;
+  uint32_t completedChunks; // atomically published after peer stores
   uint32_t state;
+  uint64_t nextChunk; // atomically claimed by IPC executor blocks
 };
 typedef flagcxReduceTrigger *flagcxReduceTrigger_t;
 

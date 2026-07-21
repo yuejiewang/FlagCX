@@ -32,6 +32,7 @@ FLAGCX_PARAM(UniRunnerNSlices, "UNIRUNNER_NSLICES", 1);
 FLAGCX_PARAM(UniRunnerNThreads, "UNIRUNNER_NTHREADS", 32);
 FLAGCX_PARAM(UniRunnerNRedBlocks, "UNIRUNNER_NREDBLOCKS", 1);
 FLAGCX_PARAM(UniRunnerNIpcBlocks, "UNIRUNNER_NIPCBLOCKS", 1);
+FLAGCX_PARAM(UniRunnerIpcChunkSize, "UNIRUNNER_IPCCHUNKSIZE", 262144);
 FLAGCX_PARAM(UniRunnerNRedSlices, "UNIRUNNER_NREDSLICES", 0);
 FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
 
@@ -2912,6 +2913,11 @@ flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
                                        size_t count,
                                        flagcxDataType_t datatype,
                                        flagcxRedOp_t op, flagcxComm_t comm) {
+  if (runnerState->uniRunnerIpcChunkSize < 16 ||
+      runnerState->uniRunnerIpcChunkSize % 16 != 0) {
+    WARN("UniRunner IPCCHUNKSIZE must be a positive multiple of 16 bytes");
+    return flagcxInvalidArgument;
+  }
   runnerState->uniRunnerNRedSlices =
       resolveEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
   // IPC nodes carry runtime Window/DevMem bindings and therefore intentionally
@@ -3329,6 +3335,7 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
     FLAGCXCHECK(enqueueIpc(
         runnerState->ipcFifo->buffer, current->nodeData.ipc.srcOffsetBytes,
         current->nodeData.ipc.dstOffsetBytes, current->nodeData.ipc.bytes,
+        runnerState->uniRunnerIpcChunkSize,
         current->nodeData.ipc.srcBufferType,
         current->nodeData.ipc.peerLocalRank, current->nodeData.ipc.readySlot,
         runnerState->ipcEpoch, current->nodeData.ipc.parentFlagsOffset,
@@ -3357,6 +3364,7 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->uniRunnerNThreads = flagcxParamUniRunnerNThreads();
   runnerState->uniRunnerNRedBlocks = flagcxParamUniRunnerNRedBlocks();
   runnerState->uniRunnerNIpcBlocks = flagcxParamUniRunnerNIpcBlocks();
+  runnerState->uniRunnerIpcChunkSize = flagcxParamUniRunnerIpcChunkSize();
   runnerState->uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
   runnerState->uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
   if (runnerState->uniRunnerNThreads == 0 ||

@@ -58,9 +58,10 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr1,
                                              uint64_t flagOut, int *idx);
 FLAGCX_HOST_DECORATOR flagcxResult_t enqueueIpc(
     void *fifoBuffer, uint64_t srcOffsetBytes, uint64_t dstOffsetBytes,
-    uint64_t bytes, flagcxIpcBufferType srcBufferType, int peerLocalRank,
-    uint32_t readySlot, uint64_t epoch, uint32_t parentFlagsOffset,
-    uint32_t numParentFlags, uint64_t flagOut, int *idx);
+    uint64_t bytes, uint64_t chunkSize, flagcxIpcBufferType srcBufferType,
+    int peerLocalRank, uint32_t readySlot, uint64_t epoch,
+    uint32_t parentFlagsOffset, uint32_t numParentFlags, uint64_t flagOut,
+    int *idx);
 #ifdef COMPILE_KERNEL
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
                                                       int *idx);

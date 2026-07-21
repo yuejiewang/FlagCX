@@ -129,10 +129,13 @@ This document provides a comprehensive reference for all environment variables u
 | `FLAGCX_P2P_EVENT_POOL_SIZE` | 1024 | Size of P2P event pool |
 | `FLAGCX_UNIRUNNER_NSLICES` | 1 | Number of slices for uniRunner |
 | `FLAGCX_UNIRUNNER_NTHREADS` | 32 | Number of threads per block for uniRunner |
-| `FLAGCX_UNIRUNNER_NBLOCKS` | 1 | Number of blocks for uniRunner |
+| `FLAGCX_UNIRUNNER_NREDBLOCKS` | 1 | Number of persistent blocks consuming reduction work |
+| `FLAGCX_UNIRUNNER_NIPCBLOCKS` | 1 | Number of persistent blocks cooperating on IPC transfers |
+| `FLAGCX_UNIRUNNER_IPCCHUNKSIZE` | 262144 | IPC transfer chunk size in bytes; large IPC nodes are shared dynamically across IPC blocks |
 | `FLAGCX_UNIRUNNER_USE_LOCRED` | 0 | When set to 1, uses local reduction in uniRunner |
 | `FLAGCX_UNIRUNNER_USE_RINGAG` | 0 | When set to 1, uses ring allgather in uniRunner |
 | `FLAGCX_UNIRUNNER_USE_SLICEDAR` | 0 | When set to 1, uses sliced allreduce in uniRunner |
+| `FLAGCX_UNIRUNNER_USE_IPCAR` | 0 | When set to 1, uses intra-node IPC push for uniRunner sliced allreduce |
 | `FLAGCX_UNIRUNNER_NREDSLICES` | 0 | Number of reduction slices for uniRunner (0 = auto) |
 | `FLAGCX_UNIRUNNER_REDSLICESIZE` | 65536 | Reduction slice size in bytes for uniRunner |
 

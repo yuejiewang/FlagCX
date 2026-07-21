@@ -100,9 +100,20 @@ flagcxResult_t flagcxFifo::flagcxRedFifoInit() {
 
 FLAGCX_HOST_DECORATOR flagcxResult_t enqueueIpc(
     void *fifoBuffer, uint64_t srcOffsetBytes, uint64_t dstOffsetBytes,
-    uint64_t bytes, flagcxIpcBufferType srcBufferType, int peerLocalRank,
-    uint32_t readySlot, uint64_t epoch, uint32_t parentFlagsOffset,
-    uint32_t numParentFlags, uint64_t flagOut, int *ret) {
+    uint64_t bytes, uint64_t chunkSize, flagcxIpcBufferType srcBufferType,
+    int peerLocalRank, uint32_t readySlot, uint64_t epoch,
+    uint32_t parentFlagsOffset, uint32_t numParentFlags, uint64_t flagOut,
+    int *ret) {
+  if (chunkSize == 0) {
+    return flagcxInvalidArgument;
+  }
+  uint64_t numChunks = bytes / chunkSize + (bytes % chunkSize != 0);
+  if (numChunks == 0)
+    numChunks = 1;
+  if (numChunks > ~uint32_t(0)) {
+    return flagcxInvalidArgument;
+  }
+
   uint64_t *buffer = static_cast<uint64_t *>(fifoBuffer);
   int capacity = static_cast<int>(buffer[flagcxFifoIdxCapacity]);
   uint64_t produced = __atomic_load_n(buffer + flagcxFifoIdxProduced,
@@ -128,6 +139,7 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueueIpc(
   trigger->srcOffsetBytes = srcOffsetBytes;
   trigger->dstOffsetBytes = dstOffsetBytes;
   trigger->bytes = bytes;
+  trigger->chunkSize = chunkSize;
   trigger->flagOut = flagOut;
   trigger->epoch = epoch;
   trigger->srcBufferType = static_cast<uint32_t>(srcBufferType);
@@ -135,13 +147,17 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueueIpc(
   trigger->readySlot = readySlot;
   trigger->parentFlagsOffset = parentFlagsOffset;
   trigger->numParentFlags = numParentFlags;
+  trigger->numChunks = static_cast<uint32_t>(numChunks);
+  trigger->nextChunk = 0;
+  trigger->completedChunks = 0;
   __atomic_store_n(&trigger->state, flagcxReduceTriggerEnqueued,
                    __ATOMIC_RELEASE);
   __atomic_fetch_add(buffer + flagcxFifoIdxProduced, 1ul, __ATOMIC_RELEASE);
   *ret = idx;
   TRACE(FLAGCX_KERNEL,
-        "enqueue ipc: bytes=%lu peerLocalRank=%d slot=%u epoch=%lu idx=%d",
-        bytes, peerLocalRank, readySlot, epoch, idx);
+        "enqueue ipc: bytes=%lu chunkSize=%lu chunks=%lu peerLocalRank=%d "
+        "slot=%u epoch=%lu idx=%d",
+        bytes, chunkSize, numChunks, peerLocalRank, readySlot, epoch, idx);
   return flagcxSuccess;
 }
 
