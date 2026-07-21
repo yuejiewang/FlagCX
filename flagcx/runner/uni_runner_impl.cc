@@ -3148,8 +3148,8 @@ static flagcxResult_t ensureUniRunnerIpcDataViews(
     const void *sendbuff, void *recvbuff, size_t bytes) {
   if (runnerState->ipcInputMem != NULL && runnerState->ipcOutputMem != NULL &&
       runnerState->ipcInputBase == sendbuff &&
-      runnerState->ipcOutputBase == recvbuff &&
-      runnerState->ipcDataBytes == bytes) {
+      runnerState->ipcOutputBase == recvbuff) {
+    runnerState->ipcDataBytes = std::max(runnerState->ipcDataBytes, bytes);
     return flagcxSuccess;
   }
 
