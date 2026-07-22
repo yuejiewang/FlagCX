@@ -147,6 +147,9 @@ typedef struct {
   uint64_t uniRunnerIpcChunkSize;
   uint64_t uniRunnerNRedSlices;
   uint64_t uniRunnerRedSliceSize;
+  // One launch-wide divisor used by terminal Avg RED nodes. Intermediate
+  // Avg nodes are materialized as Sum nodes, so no trigger needs to carry it.
+  uint64_t avgDivisor;
 
   // Stream completion flags backed by a reusable contiguous device pool. The
   // host-side queue stores per-node addresses within that pool.
@@ -214,6 +217,16 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
                                          flagcxComm_t comm);
 size_t getUniRunnerDagPatternHash(const uniRunnerDagCacheKey &key);
 flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream);
+
+// Validate public reduction arguments before allocating buffers or publishing
+// any RED node to the FIFO.
+flagcxResult_t validateUniRunnerReduceArgs(size_t count,
+                                           flagcxDataType_t datatype,
+                                           flagcxRedOp_t op);
+flagcxResult_t checkedUniRunnerTypeBytes(size_t count, size_t multiplier,
+                                         flagcxDataType_t datatype,
+                                         size_t *bytes);
+
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm);
 flagcxResult_t
 cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState);

@@ -163,6 +163,11 @@ constexpr unsigned int flagcxReduceTriggerOffState =
 constexpr unsigned int flagcxReduceTriggerBitsState = 2;
 constexpr unsigned int flagcxReduceTriggerBitsFifoReserved = 1;
 
+static_assert(flagcxNumTypes <= (1u << flagcxReduceTriggerBitsDatatype),
+              "Reduce trigger datatype field is too narrow");
+static_assert(flagcxRedNoOp < (1u << flagcxReduceTriggerBitsRedop),
+              "Reduce trigger redop field is too narrow");
+
 // Kernel launch configuration constants.
 // Also defined in device_api/flagcx_device.h (with same include guard).
 #ifndef FLAGCX_DEVICE_CTA_COUNT

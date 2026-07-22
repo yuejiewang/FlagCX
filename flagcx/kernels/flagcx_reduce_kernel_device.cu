@@ -2,6 +2,14 @@
 #include "flagcx_kernel.h"
 #include "device_api/flagcx_device.h"
 
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#endif
+
+#include <math.h>
+#include <type_traits>
+
 #define SLOT_IDX 4
 #define FST_IDX 5
 #define SND_IDX 6
@@ -111,20 +119,276 @@ FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(uint64_t *buffer,
   return flagcxSuccess;
 }
 
-FLAGCX_DEVICE_INLINE_DECORATOR void
-flagcxReduceKernel(uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
-                   uint64_t nthreads, uint64_t datatype, uint64_t redOp) {
-  // to be implemented by vendors
-  int tid = threadIdx.x;
-  float *fstPtr = (float *)fst;
-  float *sndPtr = (float *)snd;
-  float *outPtr = (float *)out;
-  for (int i = tid; i < count; i += nthreads) {
-    outPtr[i] = fstPtr[i] + sndPtr[i];
+template <typename T, typename Enable = void> struct uniRunnerReduceTraits {
+  FLAGCX_DEVICE_INLINE_DECORATOR static T sum(T a, T b) {
+    return a + b;
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static T prod(T a, T b) {
+    return a * b;
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static T max(T a, T b) {
+    return a > b ? a : b;
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static T min(T a, T b) {
+    return a < b ? a : b;
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static T avg(T a, T b,
+                                               uint64_t divisor) {
+    return static_cast<T>((a + b) / static_cast<T>(divisor));
+  }
+};
+
+template <typename T>
+struct uniRunnerReduceTraits<
+    T, typename std::enable_if<std::is_integral<T>::value>::type> {
+  using U = typename std::make_unsigned<T>::type;
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static T sum(T a, T b) {
+    return static_cast<T>(static_cast<U>(a) + static_cast<U>(b));
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static T prod(T a, T b) {
+    return static_cast<T>(static_cast<U>(a) * static_cast<U>(b));
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static T max(T a, T b) {
+    return a > b ? a : b;
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static T min(T a, T b) {
+    return a < b ? a : b;
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static T avg(T a, T b,
+                                               uint64_t divisor) {
+    T value = sum(a, b);
+    if constexpr (std::is_signed<T>::value) {
+      return static_cast<T>(static_cast<int64_t>(value) /
+                            static_cast<int64_t>(divisor));
+    } else {
+      return static_cast<T>(static_cast<uint64_t>(value) / divisor);
+    }
+  }
+};
+
+template <> struct uniRunnerReduceTraits<float> {
+  FLAGCX_DEVICE_INLINE_DECORATOR static float sum(float a, float b) {
+    return a + b;
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR static float prod(float a, float b) {
+    return a * b;
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR static float max(float a, float b) {
+    return fmaxf(a, b);
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR static float min(float a, float b) {
+    return fminf(a, b);
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR static float avg(float a, float b,
+                                                   uint64_t divisor) {
+    return (a + b) / static_cast<float>(divisor);
+  }
+};
+
+template <> struct uniRunnerReduceTraits<double> {
+  FLAGCX_DEVICE_INLINE_DECORATOR static double sum(double a, double b) {
+    return a + b;
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR static double prod(double a, double b) {
+    return a * b;
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR static double max(double a, double b) {
+    return fmax(a, b);
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR static double min(double a, double b) {
+    return fmin(a, b);
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR static double avg(double a, double b,
+                                                    uint64_t divisor) {
+    return (a + b) / static_cast<double>(divisor);
+  }
+};
+
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+template <> struct uniRunnerReduceTraits<__half> {
+  FLAGCX_DEVICE_INLINE_DECORATOR static __half sum(__half a, __half b) {
+    return __hadd(a, b);
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static __half prod(__half a, __half b) {
+    return __hmul(a, b);
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static __half max(__half a, __half b) {
+    return __half2float(a) > __half2float(b) ? a : b;
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static __half min(__half a, __half b) {
+    return __half2float(a) < __half2float(b) ? a : b;
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static __half avg(__half a, __half b,
+                                                    uint64_t divisor) {
+    return __float2half((__half2float(__hadd(a, b))) /
+                        static_cast<float>(divisor));
+  }
+};
+
+template <> struct uniRunnerReduceTraits<__nv_bfloat16> {
+  FLAGCX_DEVICE_INLINE_DECORATOR static __nv_bfloat16 sum(
+      __nv_bfloat16 a, __nv_bfloat16 b) {
+    return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b));
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static __nv_bfloat16 prod(
+      __nv_bfloat16 a, __nv_bfloat16 b) {
+    return __float2bfloat16(__bfloat162float(a) * __bfloat162float(b));
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static __nv_bfloat16 max(
+      __nv_bfloat16 a, __nv_bfloat16 b) {
+    return __bfloat162float(a) > __bfloat162float(b) ? a : b;
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static __nv_bfloat16 min(
+      __nv_bfloat16 a, __nv_bfloat16 b) {
+    return __bfloat162float(a) < __bfloat162float(b) ? a : b;
+  }
+
+  FLAGCX_DEVICE_INLINE_DECORATOR static __nv_bfloat16 avg(
+      __nv_bfloat16 a, __nv_bfloat16 b, uint64_t divisor) {
+    return __float2bfloat16((__bfloat162float(a) + __bfloat162float(b)) /
+                            static_cast<float>(divisor));
+  }
+};
+#endif
+
+template <typename T, flagcxRedOp_t Op>
+FLAGCX_DEVICE_INLINE_DECORATOR T uniRunnerApplyReduce(T a, T b,
+                                                       uint64_t divisor) {
+  if constexpr (Op == flagcxSum) {
+    return uniRunnerReduceTraits<T>::sum(a, b);
+  } else if constexpr (Op == flagcxProd) {
+    return uniRunnerReduceTraits<T>::prod(a, b);
+  } else if constexpr (Op == flagcxMax) {
+    return uniRunnerReduceTraits<T>::max(a, b);
+  } else if constexpr (Op == flagcxMin) {
+    return uniRunnerReduceTraits<T>::min(a, b);
+  } else {
+    return uniRunnerReduceTraits<T>::avg(a, b, divisor);
   }
 }
 
-FLAGCX_DEVICE_INLINE_DECORATOR void runReduceExecutor(void *fifoBuffer) {
+template <typename T, flagcxRedOp_t Op>
+FLAGCX_DEVICE_INLINE_DECORATOR void uniRunnerReduceTyped(
+    uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
+    uint64_t nthreads, uint64_t avgDivisor) {
+  const T *fstPtr = reinterpret_cast<const T *>(fst);
+  const T *sndPtr = reinterpret_cast<const T *>(snd);
+  T *outPtr = reinterpret_cast<T *>(out);
+  const uint64_t tid = static_cast<uint64_t>(FLAGCX_THREAD_IDX_X);
+  (void)nthreads;
+  const uint64_t stride = static_cast<uint64_t>(FLAGCX_BLOCK_DIM_X);
+  for (uint64_t i = tid; i < count; i += stride) {
+    T a = fstPtr[i];
+    T b = sndPtr[i];
+    outPtr[i] = uniRunnerApplyReduce<T, Op>(a, b, avgDivisor);
+  }
+}
+
+template <typename T>
+FLAGCX_DEVICE_INLINE_DECORATOR void uniRunnerDispatchReduceOp(
+    uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
+    uint64_t nthreads, uint64_t redOp, uint64_t avgDivisor) {
+  switch (static_cast<flagcxRedOp_t>(redOp)) {
+    case flagcxSum:
+      uniRunnerReduceTyped<T, flagcxSum>(fst, snd, out, count, nthreads,
+                                         avgDivisor);
+      break;
+    case flagcxProd:
+      uniRunnerReduceTyped<T, flagcxProd>(fst, snd, out, count, nthreads,
+                                          avgDivisor);
+      break;
+    case flagcxMax:
+      uniRunnerReduceTyped<T, flagcxMax>(fst, snd, out, count, nthreads,
+                                         avgDivisor);
+      break;
+    case flagcxMin:
+      uniRunnerReduceTyped<T, flagcxMin>(fst, snd, out, count, nthreads,
+                                         avgDivisor);
+      break;
+    case flagcxAvg:
+      uniRunnerReduceTyped<T, flagcxAvg>(fst, snd, out, count, nthreads,
+                                         avgDivisor);
+      break;
+    default:
+      break;
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void flagcxReduceKernel(
+    uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
+    uint64_t nthreads, uint64_t datatype, uint64_t redOp,
+    uint64_t avgDivisor) {
+  if (nthreads == 0 || avgDivisor == 0)
+    return;
+
+  switch (static_cast<flagcxDataType_t>(datatype)) {
+    case flagcxInt8:
+      uniRunnerDispatchReduceOp<int8_t>(fst, snd, out, count, nthreads, redOp,
+                                        avgDivisor);
+      break;
+    case flagcxUint8:
+      uniRunnerDispatchReduceOp<uint8_t>(fst, snd, out, count, nthreads,
+                                         redOp, avgDivisor);
+      break;
+    case flagcxInt32:
+      uniRunnerDispatchReduceOp<int32_t>(fst, snd, out, count, nthreads, redOp,
+                                         avgDivisor);
+      break;
+    case flagcxUint32:
+      uniRunnerDispatchReduceOp<uint32_t>(fst, snd, out, count, nthreads, redOp,
+                                          avgDivisor);
+      break;
+    case flagcxInt64:
+      uniRunnerDispatchReduceOp<int64_t>(fst, snd, out, count, nthreads, redOp,
+                                         avgDivisor);
+      break;
+    case flagcxUint64:
+      uniRunnerDispatchReduceOp<uint64_t>(fst, snd, out, count, nthreads, redOp,
+                                          avgDivisor);
+      break;
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+    case flagcxFloat16:
+      uniRunnerDispatchReduceOp<__half>(fst, snd, out, count, nthreads, redOp,
+                                        avgDivisor);
+      break;
+#endif
+    case flagcxFloat32:
+      uniRunnerDispatchReduceOp<float>(fst, snd, out, count, nthreads, redOp,
+                                       avgDivisor);
+      break;
+    case flagcxFloat64:
+      uniRunnerDispatchReduceOp<double>(fst, snd, out, count, nthreads, redOp,
+                                        avgDivisor);
+      break;
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+    case flagcxBfloat16:
+      uniRunnerDispatchReduceOp<__nv_bfloat16>(fst, snd, out, count, nthreads,
+                                               redOp, avgDivisor);
+      break;
+#endif
+    default:
+      break;
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void runReduceExecutor(void *fifoBuffer,
+                                                       uint64_t avgDivisor) {
   FLAGCX_SHARED uint64_t shm[16];
   uint64_t *vBuf = (uint64_t *)fifoBuffer;
   int emptyIter = 0; // backoff counter
@@ -234,7 +498,8 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runReduceExecutor(void *fifoBuffer) {
     uint64_t nthreads = shm[NTHREADS_IDX];
     uint64_t datatype = shm[DATATYPE_IDX];
     uint64_t redop = shm[REDOP_IDX];
-    flagcxReduceKernel(fst, snd, out, count, nthreads, datatype, redop);
+    flagcxReduceKernel(fst, snd, out, count, nthreads, datatype, redop,
+                       avgDivisor);
     FLAGCX_DEVICE_SYNC_THREADS();
     FLAGCX_DEVICE_THREAD_FENCE();
 
@@ -445,20 +710,21 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runIpcExecutor(
 FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(
     void *redFifoBuffer, void *ipcFifoBuffer, flagcxDevMem inputMem,
     flagcxDevMem outputMem, flagcxDevMem readyMem,
-    const uint64_t *ipcParentFlags, int nRedBlocks, int nIpcBlocks) {
+    const uint64_t *ipcParentFlags, int nRedBlocks, int nIpcBlocks,
+    uint64_t avgDivisor) {
   if (FLAGCX_BLOCK_IDX_X < nRedBlocks) {
-    runReduceExecutor(redFifoBuffer);
+    runReduceExecutor(redFifoBuffer, avgDivisor);
   } else if (FLAGCX_BLOCK_IDX_X < nRedBlocks + nIpcBlocks) {
     runIpcExecutor(ipcFifoBuffer, inputMem, outputMem, readyMem,
                    ipcParentFlags);
   }
 }
 
-void flagcxLaunchCollectiveKernel(
+flagcxResult_t flagcxLaunchCollectiveKernel(
     void *redFifoBuffer, void *ipcFifoBuffer, flagcxDevMem_t inputMem,
     flagcxDevMem_t outputMem, flagcxDevMem_t readyMem,
     const uint64_t *ipcParentFlags, size_t nthreads, size_t nRedBlocks,
-    size_t nIpcBlocks, flagcxStream_t stream) {
+    size_t nIpcBlocks, uint64_t avgDivisor, flagcxStream_t stream) {
   flagcxDevMem input;
   flagcxDevMem output;
   flagcxDevMem ready;
@@ -472,5 +738,6 @@ void flagcxLaunchCollectiveKernel(
   flagcxCollectiveKernel<<<nblocks, nthreads, 0,
                            *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(
       redFifoBuffer, ipcFifoBuffer, input, output, ready, ipcParentFlags,
-      static_cast<int>(nRedBlocks), static_cast<int>(nIpcBlocks));
+      static_cast<int>(nRedBlocks), static_cast<int>(nIpcBlocks), avgDivisor);
+  return flagcxSuccess;
 }

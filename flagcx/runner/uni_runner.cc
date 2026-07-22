@@ -42,9 +42,11 @@ flagcxResult_t uniRunnerReduce(const void *sendbuff, void *recvbuff,
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   void *scratchbuff = nullptr;
-  FLAGCXCHECK(deviceAdaptor->deviceMalloc(
-      &scratchbuff, 2 * count * getFlagcxDataTypeSize(datatype),
-      flagcxMemDevice, stream));
+  size_t scratchBytes = 0;
+  FLAGCXCHECK(validateUniRunnerReduceArgs(count, datatype, op));
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(count, 2, datatype, &scratchBytes));
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(&scratchbuff, scratchBytes,
+                                          flagcxMemDevice, stream));
   FLAGCXCHECKGOTO(initUniRunner(comm, stream), res, out);
   FLAGCXCHECKGOTO(initUniRunnerStateTreeRed(runnerState, sendbuff, recvbuff,
                                             scratchbuff, count, datatype, op,
@@ -123,6 +125,7 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
   flagcxResult_t res = flagcxSuccess;
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  FLAGCXCHECK(validateUniRunnerReduceArgs(count, datatype, op));
   FLAGCXCHECK(initUniRunner(comm, stream));
   if (flagcxParamUniRunnerUseIpcAR()) {
     /* Sliced AllReduce with intra-node IPC/LSA push transport. */
@@ -150,7 +153,7 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
                                              count, datatype, op, comm),
                     res, out);
   }
-  FLAGCXCHECK(runUniRunner(comm));
+  FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
 out:
   FLAGCXCHECK(cleanupUniRunner(comm));
   return res;
@@ -165,9 +168,12 @@ flagcxResult_t uniRunnerReduceScatter(const void *sendbuff, void *recvbuff,
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   void *scratchbuff = nullptr;
-  FLAGCXCHECK(deviceAdaptor->deviceMalloc(
-      &scratchbuff, recvcount * comm->nranks * getFlagcxDataTypeSize(datatype),
-      flagcxMemDevice, stream));
+  size_t scratchBytes = 0;
+  FLAGCXCHECK(validateUniRunnerReduceArgs(recvcount, datatype, op));
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(recvcount, comm->nranks, datatype,
+                                        &scratchBytes));
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(&scratchbuff, scratchBytes,
+                                          flagcxMemDevice, stream));
   FLAGCXCHECKGOTO(initUniRunner(comm, stream), res, out);
   FLAGCXCHECKGOTO(initUniRunnerStateRingRS(runnerState, sendbuff, recvbuff,
                                            scratchbuff, recvcount, datatype, op,

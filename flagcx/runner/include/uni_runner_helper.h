@@ -14,7 +14,17 @@
 
 using Json = nlohmann::json;
 
-inline constexpr int kUniRunnerDagCacheFormatVersion = 1;
+inline constexpr int kUniRunnerDagCacheFormatVersion = 2;
+
+inline bool uniRunnerDagDataTypeValueValid(int value) {
+  return value >= 0 && value < flagcxNumTypes;
+}
+
+inline bool uniRunnerDagRedOpValueValid(int value, bool allowNoOp) {
+  if (allowNoOp && value == flagcxRedNoOp)
+    return true;
+  return value >= flagcxSum && value < flagcxNumRedOps;
+}
 
 enum uniRunnerDagBufferType {
   uniRunnerDagBufferTypeNone = 0,
@@ -343,8 +353,14 @@ inline bool uniRunnerDagCacheKeyFromJson(const Json &j,
   }
   key->formatVersion = j.at("format_version").get<int>();
   key->count = j.at("count").get<size_t>();
-  key->datatype = static_cast<flagcxDataType_t>(j.at("datatype").get<int>());
-  key->redOp = static_cast<flagcxRedOp_t>(j.at("red_op").get<int>());
+  const int datatype = j.at("datatype").get<int>();
+  const int redOp = j.at("red_op").get<int>();
+  if (!uniRunnerDagDataTypeValueValid(datatype) ||
+      !uniRunnerDagRedOpValueValid(redOp, true)) {
+    return false;
+  }
+  key->datatype = static_cast<flagcxDataType_t>(datatype);
+  key->redOp = static_cast<flagcxRedOp_t>(redOp);
   key->rank = j.at("rank").get<int>();
   key->nranks = j.at("nranks").get<int>();
   key->root = j.at("root").get<int>();
@@ -406,6 +422,9 @@ inline bool uniRunnerDagTemplateFromJson(const Json &j,
   if (!uniRunnerDagCacheKeyFromJson(j.at("key"), &dagTemplate->key)) {
     return false;
   }
+  if (dagTemplate->key.formatVersion != kUniRunnerDagCacheFormatVersion) {
+    return false;
+  }
   size_t computedHash = getUniRunnerDagPatternHash(dagTemplate->key);
   if (j.contains("hash")) {
     size_t encodedHash =
@@ -438,8 +457,11 @@ inline bool uniRunnerDagTemplateFromJson(const Json &j,
         }
         op.peerRank = opJson.at("peer_rank").get<int>();
         op.count = opJson.at("count").get<size_t>();
-        op.datatype =
-            static_cast<flagcxDataType_t>(opJson.at("datatype").get<int>());
+        const int datatype = opJson.at("datatype").get<int>();
+        if (!uniRunnerDagDataTypeValueValid(datatype)) {
+          return false;
+        }
+        op.datatype = static_cast<flagcxDataType_t>(datatype);
         node.p2pOps.push_back(op);
       }
     } else if (node.nodeType == uniRunnerDagNodeTypeRed) {
@@ -453,10 +475,14 @@ inline bool uniRunnerDagTemplateFromJson(const Json &j,
         return false;
       }
       node.red.count = redJson.at("count").get<size_t>();
-      node.red.datatype =
-          static_cast<flagcxDataType_t>(redJson.at("datatype").get<int>());
-      node.red.redOp =
-          static_cast<flagcxRedOp_t>(redJson.at("red_op").get<int>());
+      const int datatype = redJson.at("datatype").get<int>();
+      const int redOp = redJson.at("red_op").get<int>();
+      if (!uniRunnerDagDataTypeValueValid(datatype) ||
+          !uniRunnerDagRedOpValueValid(redOp, false)) {
+        return false;
+      }
+      node.red.datatype = static_cast<flagcxDataType_t>(datatype);
+      node.red.redOp = static_cast<flagcxRedOp_t>(redOp);
     } else if (node.nodeType == uniRunnerDagNodeTypeCpy) {
       const Json &cpyJson = nodeJson.at("cpy");
       if (!uniRunnerDagBufferRefFromJson(cpyJson.at("src"), &node.cpy.src) ||
@@ -464,8 +490,11 @@ inline bool uniRunnerDagTemplateFromJson(const Json &j,
         return false;
       }
       node.cpy.count = cpyJson.at("count").get<size_t>();
-      node.cpy.datatype =
-          static_cast<flagcxDataType_t>(cpyJson.at("datatype").get<int>());
+      const int datatype = cpyJson.at("datatype").get<int>();
+      if (!uniRunnerDagDataTypeValueValid(datatype)) {
+        return false;
+      }
+      node.cpy.datatype = static_cast<flagcxDataType_t>(datatype);
     }
     dagTemplate->nodes.push_back(node);
   }

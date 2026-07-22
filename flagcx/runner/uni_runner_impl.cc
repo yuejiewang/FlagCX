@@ -18,6 +18,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <math.h>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
@@ -43,6 +44,51 @@ static flagcxResult_t ensureUniRunnerIpcReadyStorage(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm,
     size_t requiredSlots);
 
+static bool isValidUniRunnerDataType(flagcxDataType_t datatype) {
+  return static_cast<int>(datatype) >= 0 &&
+         static_cast<int>(datatype) < flagcxNumTypes &&
+         getFlagcxDataTypeSize(datatype) != 0;
+}
+
+static bool isValidUniRunnerRedOp(flagcxRedOp_t op) {
+  return static_cast<int>(op) >= static_cast<int>(flagcxSum) &&
+         static_cast<int>(op) < static_cast<int>(flagcxNumRedOps);
+}
+
+flagcxResult_t validateUniRunnerReduceArgs(size_t count,
+                                           flagcxDataType_t datatype,
+                                           flagcxRedOp_t op) {
+  if (!isValidUniRunnerDataType(datatype) || !isValidUniRunnerRedOp(op)) {
+    return flagcxInvalidArgument;
+  }
+  if (count > std::numeric_limits<size_t>::max() /
+                  getFlagcxDataTypeSize(datatype)) {
+    return flagcxInvalidArgument;
+  }
+  return flagcxSuccess;
+}
+
+flagcxResult_t checkedUniRunnerTypeBytes(size_t count, size_t multiplier,
+                                         flagcxDataType_t datatype,
+                                         size_t *bytes) {
+  if (bytes == NULL || validateUniRunnerReduceArgs(count, datatype,
+                                                    flagcxSum) !=
+                          flagcxSuccess) {
+    return flagcxInvalidArgument;
+  }
+  const size_t typeSize = getFlagcxDataTypeSize(datatype);
+  const size_t maxSize = std::numeric_limits<size_t>::max();
+  if (multiplier != 0 && count > maxSize / multiplier) {
+    return flagcxInvalidArgument;
+  }
+  const size_t elements = count * multiplier;
+  if (typeSize != 0 && elements > maxSize / typeSize) {
+    return flagcxInvalidArgument;
+  }
+  *bytes = elements * typeSize;
+  return flagcxSuccess;
+}
+
 namespace {
 
 constexpr char kUniRunnerDagCachePathEnv[] = "FLAGCX_UNIRUNNER_DAG_CACHE_PATH";
@@ -55,6 +101,19 @@ struct uniRunnerDagRuntimeBindings {
   size_t outputBytes = 0;
   size_t scratchBytes = 0;
 };
+
+static flagcxRedOp_t effectiveUniRunnerRedOp(flagcxRedOp_t requestedOp,
+                                             bool isFinalReduction) {
+  if (requestedOp == flagcxAvg && !isFinalReduction) {
+    return flagcxSum;
+  }
+  return requestedOp;
+}
+
+static void setUniRunnerAvgDivisor(flagcxUniRunnerState *runnerState,
+                                   flagcxRedOp_t op, uint64_t divisor) {
+  runnerState->avgDivisor = (op == flagcxAvg && divisor != 0) ? divisor : 1;
+}
 
 std::mutex gUniRunnerDagCacheMutex;
 std::unordered_map<size_t, std::vector<std::shared_ptr<uniRunnerDagTemplate>>>
@@ -427,6 +486,42 @@ static flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState) {
         (node->numChildren > 0 && node->children == NULL)) {
       return flagcxInternalError;
     }
+    switch (node->nodeType) {
+      case uniRunnerDagNodeTypeP2p:
+        if (node->nodeData.p2p.numOps < 0 ||
+            (node->nodeData.p2p.numOps > 0 &&
+             node->nodeData.p2p.ops == NULL)) {
+          return flagcxInternalError;
+        }
+        for (int opIdx = 0; opIdx < node->nodeData.p2p.numOps; ++opIdx) {
+          if (!isValidUniRunnerDataType(
+                  node->nodeData.p2p.ops[opIdx].datatype)) {
+            return flagcxInvalidArgument;
+          }
+        }
+        break;
+      case uniRunnerDagNodeTypeRed:
+        if (!isValidUniRunnerDataType(node->nodeData.red.datatype) ||
+            !isValidUniRunnerRedOp(node->nodeData.red.redOp) ||
+            node->nodeData.red.count >
+                flagcxTriggerMask(flagcxReduceTriggerBitsCount) ||
+            node->nodeData.red.nthreads == 0 ||
+            node->nodeData.red.nthreads >
+                flagcxTriggerMask(flagcxReduceTriggerBitsNThreads) ||
+            node->nodeData.red.nthreads != runnerState->uniRunnerNThreads) {
+          return flagcxInvalidArgument;
+        }
+        break;
+      case uniRunnerDagNodeTypeCpy:
+        if (!isValidUniRunnerDataType(node->nodeData.cpy.datatype)) {
+          return flagcxInvalidArgument;
+        }
+        break;
+      case uniRunnerDagNodeTypeIpc:
+        break;
+      default:
+        return flagcxInternalError;
+    }
     numEdges += static_cast<size_t>(node->numParents);
   }
 
@@ -665,7 +760,8 @@ buildUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
     runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
         runnerState->uniRunnerNThreads;
     runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
-    runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
+    runnerState->dagNodes[redNodeIdx].nodeData.red.redOp =
+        effectiveUniRunnerRedOp(op, true);
 
     // Setup dependencies linearly within the slice chain
     runnerState->dagNodes[redNodeIdx].numParents = 0;
@@ -1286,7 +1382,8 @@ buildUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
           runnerState->uniRunnerNThreads;
       runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
-      runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
+      runnerState->dagNodes[redNodeIdx].nodeData.red.redOp =
+          effectiveUniRunnerRedOp(op, i == nranks - 2);
 
       // Set up red node dependency
       runnerState->numPendingNodes++;
@@ -1663,7 +1760,8 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
         runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
             runnerState->uniRunnerNThreads;
         runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
-        runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.redOp =
+            effectiveUniRunnerRedOp(op, i == nranks - 2);
 
         // Set up red node dependency
         runnerState->numPendingNodes++;
@@ -2161,7 +2259,8 @@ static flagcxResult_t buildUniRunnerStateRingRS(
         runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
             runnerState->uniRunnerNThreads;
         runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
-        runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.redOp =
+            effectiveUniRunnerRedOp(op, i == nranks - 2);
 
         // Set up red node dependency
         runnerState->numPendingNodes++;
@@ -2420,7 +2519,9 @@ static flagcxResult_t buildUniRunnerStateTreeRed(
         runnerState->dagNodes[redNodeIdx].nodeData.red.nthreads =
             runnerState->uniRunnerNThreads;
         runnerState->dagNodes[redNodeIdx].nodeData.red.datatype = datatype;
-        runnerState->dagNodes[redNodeIdx].nodeData.red.redOp = op;
+        runnerState->dagNodes[redNodeIdx].nodeData.red.redOp =
+            effectiveUniRunnerRedOp(
+                op, algoRank == 0 && i == nTotalSteps - 1);
 
         // Set up red node dependency
         runnerState->numPendingNodes++;
@@ -2807,6 +2908,7 @@ flagcxResult_t initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         size_t count, flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm) {
+  setUniRunnerAvgDivisor(runnerState, op, 2);
   size_t typeSize = getFlagcxDataTypeSize(datatype);
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
@@ -2828,6 +2930,7 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
                                            size_t count,
                                            flagcxDataType_t datatype,
                                            flagcxComm_t comm, int groupSize) {
+  runnerState->avgDivisor = 1;
   size_t typeSize = getFlagcxDataTypeSize(datatype);
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
@@ -2848,6 +2951,7 @@ flagcxResult_t initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         size_t count, flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm) {
+  runnerState->avgDivisor = 1;
   size_t typeSize = getFlagcxDataTypeSize(datatype);
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
@@ -2868,6 +2972,7 @@ flagcxResult_t initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         size_t count, flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm) {
+  setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
   size_t typeSize = getFlagcxDataTypeSize(datatype);
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
@@ -2889,6 +2994,7 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
                                           size_t count,
                                           flagcxDataType_t datatype,
                                           flagcxRedOp_t op, flagcxComm_t comm) {
+  setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
   size_t typeSize = getFlagcxDataTypeSize(datatype);
   runnerState->uniRunnerNRedSlices =
       resolveEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
@@ -2913,6 +3019,7 @@ flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
                                        size_t count,
                                        flagcxDataType_t datatype,
                                        flagcxRedOp_t op, flagcxComm_t comm) {
+  setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
   if (runnerState->uniRunnerIpcChunkSize < 16 ||
       runnerState->uniRunnerIpcChunkSize % 16 != 0) {
     WARN("UniRunner IPCCHUNKSIZE must be a positive multiple of 16 bytes");
@@ -2939,6 +3046,7 @@ flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         void *scratchbuff, size_t count,
                                         flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm) {
+  setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
   size_t typeSize = getFlagcxDataTypeSize(datatype);
   runnerState->uniRunnerNRedSlices =
       resolveEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
@@ -2966,6 +3074,7 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
                                          flagcxDataType_t datatype,
                                          flagcxRedOp_t op, int root,
                                          flagcxComm_t comm) {
+  setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
   size_t typeSize = getFlagcxDataTypeSize(datatype);
   runnerState->uniRunnerNRedSlices =
       resolveEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
@@ -3367,6 +3476,7 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->uniRunnerIpcChunkSize = flagcxParamUniRunnerIpcChunkSize();
   runnerState->uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
   runnerState->uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
+  runnerState->avgDivisor = 1;
   if (runnerState->uniRunnerNThreads == 0 ||
       runnerState->uniRunnerNRedBlocks == 0 ||
       runnerState->uniRunnerNIpcBlocks == 0) {
@@ -3467,12 +3577,13 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
 
 #ifdef COMPILE_KERNEL_HOST
   // Launch collective kernel
-  flagcxLaunchCollectiveKernel(
+  FLAGCXCHECK(flagcxLaunchCollectiveKernel(
       hcomm->uniRunnerFifoBuffer, runnerState->ipcFifoDevicePtr,
       runnerState->ipcInputMem, runnerState->ipcOutputMem,
       runnerState->ipcReadyMem, runnerState->ipcParentFlagsDevice,
       runnerState->uniRunnerNThreads, runnerState->uniRunnerNRedBlocks,
-      runnerState->uniRunnerNIpcBlocks, runnerState->redStream);
+      runnerState->uniRunnerNIpcBlocks, runnerState->avgDivisor,
+      runnerState->redStream));
 #endif
 
   // Main scheduling loop using DAG-based queue scheduling

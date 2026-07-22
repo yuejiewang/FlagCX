@@ -49,6 +49,16 @@ FLAGCX_HOST_DECORATOR flagcxResult_t
 enqueue(void *fifoBuffer, uint64_t addr1, uint64_t addr2, uint64_t addr3,
         size_t count, size_t nthreads, flagcxDataType_t datatype,
         flagcxRedOp_t redop, uint64_t flagIn, uint64_t flagOut, int *ret) {
+  if (fifoBuffer == NULL || ret == NULL || static_cast<int>(datatype) < 0 ||
+      static_cast<int>(datatype) >= flagcxNumTypes ||
+      getFlagcxDataTypeSize(datatype) == 0 ||
+      static_cast<int>(redop) < static_cast<int>(flagcxSum) ||
+      static_cast<int>(redop) >= static_cast<int>(flagcxNumRedOps) ||
+      count > flagcxTriggerMask(flagcxReduceTriggerBitsCount) ||
+      nthreads == 0 ||
+      nthreads > flagcxTriggerMask(flagcxReduceTriggerBitsNThreads)) {
+    return flagcxInvalidArgument;
+  }
   int idx = -1;
   uint64_t *buffer = (uint64_t *)fifoBuffer;
   int capacity = buffer[flagcxFifoIdxCapacity];

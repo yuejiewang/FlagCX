@@ -70,14 +70,15 @@ struct flagcxDevMem;
 FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(
     void *redFifoBuffer, void *ipcFifoBuffer, flagcxDevMem inputMem,
     flagcxDevMem outputMem, flagcxDevMem readyMem,
-    const uint64_t *ipcParentFlags, int nRedBlocks, int nIpcBlocks);
+    const uint64_t *ipcParentFlags, int nRedBlocks, int nIpcBlocks,
+    uint64_t avgDivisor);
 #endif // COMPILE_KERNEL
 
-void flagcxLaunchCollectiveKernel(
+flagcxResult_t flagcxLaunchCollectiveKernel(
     void *redFifoBuffer, void *ipcFifoBuffer, flagcxDevMem_t inputMem,
     flagcxDevMem_t outputMem, flagcxDevMem_t readyMem,
     const uint64_t *ipcParentFlags, size_t nthreads, size_t nRedBlocks,
-    size_t nIpcBlocks, flagcxStream_t stream);
+    size_t nIpcBlocks, uint64_t avgDivisor, flagcxStream_t stream);
 
 // ==========================================================================
 // Device Communicator — Host-side lifecycle management

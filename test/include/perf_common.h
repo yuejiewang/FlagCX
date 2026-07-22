@@ -24,6 +24,11 @@ struct PerfContext {
   int root;
   uint64_t splitMask;
   int localRegister;
+  flagcxDataType_t datatype;
+  flagcxRedOp_t redOp;
+  size_t typeSize;
+  bool useTypedReduction;
+  bool accuracyFailed;
 
   // FlagCX handles
   flagcxDeviceHandle_t devHandle;
@@ -71,6 +76,10 @@ using PerfRootPostIterFn = void (*)(PerfContext &ctx, size_t size, size_t count,
 void perfSetup(PerfContext &ctx, int argc, char **argv,
                PerfBufSizeFn bufSizeFn = nullptr);
 
+// Enable the selected dtype for the reduction benchmark family. Other host
+// API perf tests intentionally retain their historical float32 payloads.
+void perfEnableTypedReduction(PerfContext &ctx);
+
 // Free all buffers, destroy comm/stream, free devHandle, MPI_Finalize.
 void perfTeardown(PerfContext &ctx);
 
@@ -90,3 +99,18 @@ void perfRootBenchmarkLoop(PerfContext &ctx, PerfRootCollFn collFn,
                            PerfBwFactorFn bwFactorFn = nullptr,
                            PerfRootDataInitFn dataInitFn = nullptr,
                            PerfRootPostIterFn postIterFn = nullptr);
+
+// Typed reduction-test helpers shared by the host API accuracy checks.
+const char *perfDataTypeName(flagcxDataType_t datatype);
+const char *perfRedOpName(flagcxRedOp_t op);
+void perfInitReductionBuffers(PerfContext &ctx, size_t size, size_t count,
+                              bool initializeRecvWithLocalInput);
+long double perfReduceAcrossRanks(flagcxRedOp_t op, int nranks);
+long double perfReduceBinary(flagcxRedOp_t op, long double value);
+bool perfCheckUniformReduction(PerfContext &ctx, size_t count,
+                               long double expected, const char *label);
+bool perfCheckLocalReduction(PerfContext &ctx, size_t count,
+                             const char *label);
+bool perfCheckRingGather(PerfContext &ctx, size_t count,
+                         const char *label);
+void perfPrintBuffer(const PerfContext &ctx, size_t count, const char *label);
