@@ -170,9 +170,8 @@ static void dataInitFn(PerfContext &ctx, size_t size, size_t count) {
   }
   ctx.devHandle->deviceMemcpy(ctx.sendbuff, ctx.hello, size,
                               flagcxMemcpyHostToDevice, NULL);
-  if ((ctx.proc == 0 || ctx.proc == ctx.totalProcs - 1) && ctx.color == 0 &&
-      ctx.printBuffer) {
-    printf("sendbuff = ");
+  if (ctx.color == 0 && ctx.printBuffer) {
+    printf("rank %d sendbuff = ", ctx.proc);
     for (int destination = 0; destination < ctx.totalProcs; destination++) {
       if (countPerPeer != 0) {
         printf("%f ", send[static_cast<size_t>(destination) * countPerPeer]);
@@ -190,6 +189,7 @@ static void postIterFn(PerfContext &ctx, size_t size, size_t count) {
   ctx.devHandle->streamSynchronize(ctx.stream);
 
   const float *recv = static_cast<const float *>(ctx.hello);
+  int correct = 1;
   bool mismatchReported = false;
   for (int source = 0; source < ctx.totalProcs; source++) {
     for (size_t offset = 0; offset < countPerPeer; offset++) {
@@ -203,20 +203,21 @@ static void postIterFn(PerfContext &ctx, size_t size, size_t count) {
                   ctx.proc, index, source, offset, expected, recv[index]);
           mismatchReported = true;
         }
+        correct = 0;
         ctx.accuracyFailed = true;
       }
     }
   }
 
-  if ((ctx.proc == 0 || ctx.proc == ctx.totalProcs - 1) && ctx.color == 0 &&
-      ctx.printBuffer) {
-    printf("recvbuff = ");
+  if (ctx.color == 0 && ctx.printBuffer) {
+    printf("rank %d recvbuff = ", ctx.proc);
     for (int source = 0; source < ctx.totalProcs; source++) {
       if (countPerPeer != 0) {
         printf("%f ", recv[static_cast<size_t>(source) * countPerPeer]);
       }
     }
     printf("\n");
+    printf("rank %d all-to-all correctness = %d\n", ctx.proc, correct);
   }
 }
 
