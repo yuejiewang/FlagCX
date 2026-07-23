@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <queue>
 #include <stdio.h>
+#include <string.h>
 #include <vector>
 
 __thread int flagcxGroupDepth = 0;
@@ -29,6 +30,9 @@ __thread struct flagcxGroupJob flagcxGroupJobMain;
 __thread int flagcxGroupBlocking = 1; /* default mode */
 __thread struct flagcxIntruQueue<struct flagcxAsyncJob, &flagcxAsyncJob::next>
     flagcxAsyncJobs;
+__thread struct flagcxGroupDeferredFree *flagcxGroupDeferredFreeHead = nullptr;
+__thread struct flagcxGroupDeferredFree *flagcxGroupDeferredFreeTail = nullptr;
+__thread int64_t flagcxGroupNextCustomOpId = INT_MIN;
 
 FLAGCX_PARAM(P2pScheduleDisable, "P2P_SCHEDULE_DISABLE", 0);
 
@@ -42,6 +46,126 @@ flagcxResult_t flagcxHeteroGroupEnd() {
   flagcxResult_t ret = flagcxSuccess;
   FLAGCXCHECKGOTO(flagcxGroupEndInternal(), ret, exit);
 exit:
+  return ret;
+}
+
+int flagcxGroupAllocCustomOpId() {
+  return static_cast<int>(flagcxGroupNextCustomOpId++);
+}
+
+flagcxResult_t flagcxGroupDeferFree(void *ptr, flagcxMemType_t type,
+                                   flagcxStream_t stream) {
+  if (flagcxGroupDepth <= 0 || ptr == nullptr) {
+    return flagcxInvalidUsage;
+  }
+  struct flagcxGroupDeferredFree *deferred;
+  FLAGCXCHECK(flagcxCalloc(&deferred, 1));
+  deferred->ptr = ptr;
+  deferred->type = type;
+  deferred->stream = stream;
+  flagcxResult_t deviceResult = deviceAdaptor->getDevice(&deferred->device);
+  if (deviceResult != flagcxSuccess) {
+    free(deferred);
+    return deviceResult;
+  }
+  if (flagcxGroupDeferredFreeTail == nullptr) {
+    flagcxGroupDeferredFreeHead = deferred;
+  } else {
+    flagcxGroupDeferredFreeTail->next = deferred;
+  }
+  flagcxGroupDeferredFreeTail = deferred;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t groupDrainDeferredFrees(struct flagcxGroupJob *gjob,
+                                              bool allowStreamOrderedFree) {
+  if (*gjob->deferredFreeHeadPtr == nullptr) {
+    return flagcxSuccess;
+  }
+  flagcxResult_t ret = flagcxSuccess;
+  const bool completionLaunched = gjob->deferredFreeCompletionLaunched;
+  const bool streamOrderedFree =
+      allowStreamOrderedFree && completionLaunched &&
+      gjob->deferredFreeCompletionEvent != nullptr &&
+      strcmp(deviceAdaptor->name, "CUDA") == 0;
+
+  // Adaptors without a stream-ordered free primitive must wait here. This is
+  // only the grouped in-place slow path; CUDA keeps GroupEnd asynchronous.
+  if (!streamOrderedFree && completionLaunched) {
+    flagcxResult_t syncResult = deviceAdaptor->streamSynchronize(
+        gjob->deferredFreeCompletionStream);
+    if (syncResult != flagcxSuccess) {
+      ret = syncResult;
+    }
+  }
+
+  int originalDevice = -1;
+  flagcxResult_t getDeviceResult = deviceAdaptor->getDevice(&originalDevice);
+  if (ret == flagcxSuccess && getDeviceResult != flagcxSuccess) {
+    ret = getDeviceResult;
+  }
+  struct flagcxGroupDeferredFree *deferred = *gjob->deferredFreeHeadPtr;
+  while (deferred != nullptr) {
+    struct flagcxGroupDeferredFree *next = deferred->next;
+    flagcxResult_t setDeviceResult = deviceAdaptor->setDevice(deferred->device);
+    if (ret == flagcxSuccess && setDeviceResult != flagcxSuccess) {
+      ret = setDeviceResult;
+    }
+
+    flagcxResult_t freeResult = flagcxSuccess;
+    if (streamOrderedFree && setDeviceResult == flagcxSuccess) {
+      flagcxStream_t freeStream = deferred->stream != nullptr
+                                      ? deferred->stream
+                                      : gjob->deferredFreeCompletionStream;
+      flagcxResult_t waitResult = flagcxSuccess;
+      if (freeStream != gjob->deferredFreeCompletionStream) {
+        waitResult = deviceAdaptor->streamWaitEvent(
+            freeStream, gjob->deferredFreeCompletionEvent);
+      }
+      if (waitResult == flagcxSuccess) {
+        freeResult = deviceAdaptor->deviceFree(deferred->ptr, deferred->type,
+                                               freeStream);
+      } else {
+        if (ret == flagcxSuccess) {
+          ret = waitResult;
+        }
+        // Retire safely even if cross-stream event ordering failed.
+        (void)deviceAdaptor->streamSynchronize(
+            gjob->deferredFreeCompletionStream);
+        freeResult = deviceAdaptor->deviceFree(deferred->ptr, deferred->type,
+                                               nullptr);
+      }
+    } else if (setDeviceResult == flagcxSuccess) {
+      freeResult = deviceAdaptor->deviceFree(deferred->ptr, deferred->type,
+                                             nullptr);
+    }
+    if (ret == flagcxSuccess && freeResult != flagcxSuccess) {
+      ret = freeResult;
+    }
+    free(deferred);
+    deferred = next;
+  }
+  *gjob->deferredFreeHeadPtr = nullptr;
+  *gjob->deferredFreeTailPtr = nullptr;
+  if (originalDevice >= 0) {
+    flagcxResult_t restoreResult = deviceAdaptor->setDevice(originalDevice);
+    if (ret == flagcxSuccess && restoreResult != flagcxSuccess) {
+      ret = restoreResult;
+    }
+  }
+  return ret;
+}
+
+static flagcxResult_t
+groupDestroyDeferredFreeEvent(struct flagcxGroupJob *gjob) {
+  if (gjob->deferredFreeCompletionEvent == nullptr) {
+    return flagcxSuccess;
+  }
+  flagcxResult_t ret =
+      deviceAdaptor->eventDestroy(gjob->deferredFreeCompletionEvent);
+  if (ret == flagcxSuccess) {
+    gjob->deferredFreeCompletionEvent = nullptr;
+  }
   return ret;
 }
 
@@ -179,7 +303,9 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
           bool matched = false;
           for (size_t j = 0; j < recvTasks.size(); j++) {
             if (sendTasks[i]->bytes == recvTasks[j]->bytes &&
-                sendTasks[i]->dtype == recvTasks[j]->dtype) {
+                sendTasks[i]->dtype == recvTasks[j]->dtype &&
+                sendTasks[i]->opId == recvTasks[j]->opId &&
+                sendTasks[i]->step == recvTasks[j]->step) {
               if (sendTasks[i]->buff != recvTasks[j]->buff) {
                 flagcxProxyOp *op;
                 FLAGCXCHECK(flagcxCalloc(&op, 1));
@@ -447,17 +573,44 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
     }
   }
 
+  if (*gjob->deferredFreeHeadPtr != nullptr && launchStream != nullptr) {
+    FLAGCXCHECKGOTO(deviceAdaptor->eventCreate(
+                        &gjob->deferredFreeCompletionEvent,
+                        flagcxEventDisableTiming),
+                    ret, fail);
+  }
+
   if (launchStream != nullptr && launchEvent != nullptr) {
     if (deviceAsyncKernel) {
       FLAGCXCHECK(deviceAdaptor->launchDeviceFunc(
           launchStream, deviceAsyncKernel, (void *)semaphore->getSignals()));
+      if (gjob->deferredFreeCompletionEvent != nullptr) {
+        gjob->deferredFreeCompletionStream = launchStream;
+        gjob->deferredFreeCompletionLaunched = true;
+      }
       // device semaphore need this event to signal completion
       FLAGCXCHECK(deviceAdaptor->eventRecord(launchEvent, launchStream));
     } else {
       FLAGCXCHECK(deviceAdaptor->launchHostFunc(launchStream, cpuAsyncKernel,
                                                 (void *)semaphore.get()));
+      if (gjob->deferredFreeCompletionEvent != nullptr) {
+        gjob->deferredFreeCompletionStream = launchStream;
+        gjob->deferredFreeCompletionLaunched = true;
+      }
     }
   }
+
+  if (gjob->deferredFreeCompletionEvent != nullptr) {
+    FLAGCXCHECKGOTO(deviceAdaptor->eventRecord(
+                        gjob->deferredFreeCompletionEvent, launchStream),
+                    ret, fail);
+  }
+
+  // Free group-owned temporary buffers only after the completion callback (or
+  // device semaphore kernel) above. CUDA queues a wait/free on each allocation
+  // stream; adaptors without stream-ordered free wait before releasing.
+  FLAGCXCHECKGOTO(groupDrainDeferredFrees(gjob, true), ret, fail);
+  FLAGCXCHECKGOTO(groupDestroyDeferredFreeEvent(gjob), ret, fail);
 
   while (!flagcxIntruQueueEmpty(asyncJobsMain)) {
     struct flagcxAsyncJob *job = flagcxIntruQueueDequeue(asyncJobsMain);
@@ -506,7 +659,9 @@ static flagcxResult_t groupCleanup(struct flagcxAsyncJob *job_) {
     groupCommHeadMain = next;
   }
 
-  return flagcxSuccess;
+  flagcxResult_t deferredFreeResult = groupDrainDeferredFrees(gjob, false);
+  flagcxResult_t eventResult = groupDestroyDeferredFreeEvent(gjob);
+  return deferredFreeResult != flagcxSuccess ? deferredFreeResult : eventResult;
 }
 
 static inline void groupResetJobState() {
@@ -514,6 +669,8 @@ static inline void groupResetJobState() {
   flagcxGroupJobMainPtr = NULL;
   flagcxGroupCommPreconnectHead = nullptr;
   flagcxGroupCommHead = nullptr;
+  flagcxGroupDeferredFreeHead = nullptr;
+  flagcxGroupDeferredFreeTail = nullptr;
   memset(&flagcxGroupJobMain, 0, sizeof(struct flagcxGroupJob));
 }
 
@@ -523,11 +680,14 @@ flagcxResult_t flagcxGroupEndInternal() {
   if (flagcxGroupDepth < 0)
     return flagcxSystemError;
   if (flagcxGroupDepth == 0) {
-    if (flagcxGroupCommPreconnectHead || flagcxGroupCommHead) {
+    if (flagcxGroupCommPreconnectHead || flagcxGroupCommHead ||
+        flagcxGroupDeferredFreeHead) {
       flagcxGroupJobMain.groupCommHeadPtr = &flagcxGroupCommHead;
       flagcxGroupJobMain.groupCommPreconnectHeadPtr =
           &flagcxGroupCommPreconnectHead;
       flagcxGroupJobMain.asyncJobsPtr = &flagcxAsyncJobs;
+      flagcxGroupJobMain.deferredFreeHeadPtr = &flagcxGroupDeferredFreeHead;
+      flagcxGroupJobMain.deferredFreeTailPtr = &flagcxGroupDeferredFreeTail;
       flagcxGroupJobMain.initialized = true;
       flagcxGroupJobMainPtr = &flagcxGroupJobMain;
       FLAGCXCHECKGOTO(groupLaunch(&flagcxGroupJobMainPtr->base), ret, fail);

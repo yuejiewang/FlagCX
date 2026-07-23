@@ -14,7 +14,7 @@
 
 using Json = nlohmann::json;
 
-inline constexpr int kUniRunnerDagCacheFormatVersion = 2;
+inline constexpr int kUniRunnerDagCacheFormatVersion = 3;
 
 inline bool uniRunnerDagDataTypeValueValid(int value) {
   return value >= 0 && value < flagcxNumTypes;
@@ -98,6 +98,8 @@ inline const char *uniRunnerDagAlgoTypeToString(uniRunnerDagAlgoType algoType) {
       return "tree_red";
     case uniRunnerDagAlgoIpcAR:
       return "ipc_ar";
+    case uniRunnerDagAlgoDirectA2A:
+      return "direct_a2a";
     default:
       return "unknown";
   }
@@ -123,6 +125,8 @@ inline bool uniRunnerDagAlgoTypeFromString(const std::string &text,
     *algoType = uniRunnerDagAlgoTreeRed;
   } else if (text == "ipc_ar") {
     *algoType = uniRunnerDagAlgoIpcAR;
+  } else if (text == "direct_a2a") {
+    *algoType = uniRunnerDagAlgoDirectA2A;
   } else {
     return false;
   }

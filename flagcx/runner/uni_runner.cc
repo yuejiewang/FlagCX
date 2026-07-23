@@ -220,21 +220,132 @@ out:
   return res;
 }
 
-flagcxResult_t uniRunnerAlltoAll(const void *sendbuff, void *recvbuff,
-                                 size_t count, flagcxDataType_t datatype,
-                                 flagcxComm_t comm, flagcxStream_t stream) {
-  size_t size = count * getFlagcxDataTypeSize(datatype);
+static flagcxResult_t enqueueGroupedUniRunnerAlltoAll(
+    const void *sendbuff, void *recvbuff, size_t count,
+    flagcxDataType_t datatype, size_t blockBytes, flagcxComm_t comm,
+    flagcxStream_t stream, int opId = INT_MAX, int step = -1,
+    bool includeSelf = true) {
   const char *bufferIn = static_cast<const char *>(sendbuff);
   char *bufferOut = static_cast<char *>(recvbuff);
   FLAGCXCHECK(flagcxHeteroGroupStart());
-  for (int r = 0; r < comm->nranks; r++) {
-    FLAGCXCHECK(flagcxHeteroSend(static_cast<const void *>(bufferIn + r * size),
-                                 count, datatype, r, comm->heteroComm, stream));
-    FLAGCXCHECK(flagcxHeteroRecv(static_cast<void *>(bufferOut + r * size),
-                                 count, datatype, r, comm->heteroComm, stream));
+  for (int peer = 0; peer < comm->nranks; ++peer) {
+    if (!includeSelf && peer == comm->rank) {
+      continue;
+    }
+    FLAGCXCHECK(flagcxHeteroSend(
+        static_cast<const void *>(bufferIn +
+                                  static_cast<size_t>(peer) * blockBytes),
+        count, datatype, peer, comm->heteroComm, stream, opId, step));
+    FLAGCXCHECK(flagcxHeteroRecv(
+        static_cast<void *>(bufferOut +
+                            static_cast<size_t>(peer) * blockBytes),
+        count, datatype, peer, comm->heteroComm, stream, opId, step));
   }
-  FLAGCXCHECK(flagcxHeteroGroupEnd());
-  return flagcxSuccess;
+  return flagcxHeteroGroupEnd();
+}
+
+flagcxResult_t uniRunnerAlltoAll(const void *sendbuff, void *recvbuff,
+                                 size_t count, flagcxDataType_t datatype,
+                                 flagcxComm_t comm, flagcxStream_t stream) {
+  if (comm == NULL || comm->nranks < 1) {
+    return flagcxInvalidArgument;
+  }
+
+  size_t totalBytes = 0;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(
+      count, static_cast<size_t>(comm->nranks), datatype, &totalBytes));
+  if (totalBytes == 0) {
+    return flagcxSuccess;
+  }
+  if (sendbuff == NULL || recvbuff == NULL) {
+    return flagcxInvalidArgument;
+  }
+  if (comm->nranks == 1 && sendbuff == recvbuff) {
+    return flagcxSuccess;
+  }
+
+  // An outer FlagCX group owns submission and buffer lifetime. Queue the
+  // operation directly so the outer GroupEnd launches it; runUniRunner cannot
+  // drain a nested group.
+  if (flagcxGroupDepth > 0) {
+    const size_t blockBytes =
+        totalBytes / static_cast<size_t>(comm->nranks);
+    if (sendbuff == recvbuff) {
+      // Preserve the group contract that no stream work starts before
+      // GroupEnd. The self P2P pair snapshots the whole input at step 0; all
+      // pairwise exchanges wait at step 1. GroupEnd defers freeing the scratch
+      // allocation until its completion callback/kernel has drained.
+      void *groupScratch = NULL;
+      FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+          &groupScratch, totalBytes, flagcxMemDevice, NULL));
+      flagcxResult_t deferResult =
+          flagcxGroupDeferFree(groupScratch, flagcxMemDevice, stream);
+      if (deferResult != flagcxSuccess) {
+        (void)deviceAdaptor->deviceFree(groupScratch, flagcxMemDevice, NULL);
+        return deferResult;
+      }
+
+      const int opId = flagcxGroupAllocCustomOpId();
+      const size_t typeSize = getFlagcxDataTypeSize(datatype);
+      const size_t totalCount = totalBytes / typeSize;
+      FLAGCXCHECK(flagcxHeteroSend(sendbuff, totalCount, datatype, comm->rank,
+                                   comm->heteroComm, stream, opId, 0));
+      FLAGCXCHECK(flagcxHeteroRecv(groupScratch, totalCount, datatype,
+                                   comm->rank, comm->heteroComm, stream, opId,
+                                   0));
+      return enqueueGroupedUniRunnerAlltoAll(
+          groupScratch, recvbuff, count, datatype, blockBytes, comm, stream,
+          opId, 1, false);
+    }
+    return enqueueGroupedUniRunnerAlltoAll(sendbuff, recvbuff, count, datatype,
+                                           blockBytes, comm, stream);
+  }
+
+  flagcxResult_t res = flagcxSuccess;
+  flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  const void *effectiveSendbuff = sendbuff;
+  void *scratchbuff = NULL;
+  bool runnerInitialized = false;
+
+  // AlltoAll permits sendbuff == recvbuff. Snapshot the complete input before
+  // launching direct pairwise receives so incoming blocks cannot overwrite
+  // blocks that have not yet been sent.
+  if (sendbuff == recvbuff) {
+    FLAGCXCHECKGOTO(deviceAdaptor->deviceMalloc(
+                        &scratchbuff, totalBytes, flagcxMemDevice, stream),
+                    res, out);
+    FLAGCXCHECKGOTO(deviceAdaptor->deviceMemcpy(
+                        scratchbuff, const_cast<void *>(sendbuff), totalBytes,
+                        flagcxMemcpyDeviceToDevice, stream, NULL),
+                    res, out);
+    FLAGCXCHECKGOTO(deviceAdaptor->streamSynchronize(stream), res, out);
+    effectiveSendbuff = scratchbuff;
+  }
+
+  FLAGCXCHECKGOTO(initUniRunner(comm, stream), res, out);
+  runnerInitialized = true;
+  FLAGCXCHECKGOTO(initUniRunnerStateAlltoAll(
+                      runnerState, effectiveSendbuff, recvbuff, count, datatype,
+                      comm),
+                  res, out);
+  FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
+
+out:
+  if (runnerInitialized) {
+    flagcxResult_t cleanupRes = cleanupUniRunner(comm);
+    if (res == flagcxSuccess) {
+      res = cleanupRes;
+    }
+  }
+  if (scratchbuff != NULL) {
+    flagcxResult_t freeRes =
+        deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream);
+    if (res == flagcxSuccess) {
+      res = freeRes;
+    }
+  }
+  return res;
 }
 
 flagcxResult_t uniRunnerAlltoAllv(const void *sendbuff, size_t *sendcounts,

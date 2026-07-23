@@ -9,6 +9,7 @@
 
 #include "assert.h"
 #include "comm.h"
+#include <climits>
 
 typedef flagcxResult_t (*flagcxInitFunc_t)(flagcxHeteroComm_t *newcomm,
                                            int ndev, flagcxUniqueId commId,
@@ -37,6 +38,14 @@ struct flagcxAsyncJob {
   flagcxHeteroComm_t comm;
 };
 
+struct flagcxGroupDeferredFree {
+  struct flagcxGroupDeferredFree *next;
+  void *ptr;
+  flagcxMemType_t type;
+  flagcxStream_t stream;
+  int device;
+};
+
 flagcxResult_t
 flagcxAsyncLaunch(struct flagcxAsyncJob *job,
                   flagcxResult_t (*func)(struct flagcxAsyncJob *),
@@ -52,6 +61,11 @@ struct flagcxGroupJob {
   int *groupBlockingPtr;
   struct flagcxIntruQueue<struct flagcxAsyncJob, &flagcxAsyncJob::next>
       *asyncJobsPtr;
+  struct flagcxGroupDeferredFree **deferredFreeHeadPtr;
+  struct flagcxGroupDeferredFree **deferredFreeTailPtr;
+  flagcxStream_t deferredFreeCompletionStream;
+  flagcxEvent_t deferredFreeCompletionEvent;
+  bool deferredFreeCompletionLaunched;
   bool initialized;
 };
 
@@ -71,11 +85,17 @@ extern __thread struct flagcxGroupJob flagcxGroupJobMain;
 extern __thread struct flagcxIntruQueue<struct flagcxAsyncJob,
                                         &flagcxAsyncJob::next>
     flagcxAsyncJobs;
+extern __thread struct flagcxGroupDeferredFree *flagcxGroupDeferredFreeHead;
+extern __thread struct flagcxGroupDeferredFree *flagcxGroupDeferredFreeTail;
+extern __thread int64_t flagcxGroupNextCustomOpId;
 
 flagcxResult_t flagcxGroupErrCheck(flagcxResult_t ret);
 void flagcxGroupCommJoin(struct flagcxHeteroComm *comm);
 void flagcxGroupCommPreconnect(struct flagcxHeteroComm *comm);
 flagcxResult_t flagcxGroupCommLeave(struct flagcxHeteroComm *comm);
+flagcxResult_t flagcxGroupDeferFree(void *ptr, flagcxMemType_t type,
+                                   flagcxStream_t stream);
+int flagcxGroupAllocCustomOpId();
 // Not implemented
 flagcxResult_t flagcxGroupJobAbort(struct flagcxGroupJob *groupJob);
 // Not implemented
@@ -115,6 +135,9 @@ inline flagcxResult_t flagcxGroupCommLeave(struct flagcxHeteroComm *comm) {
 }
 
 inline flagcxResult_t flagcxGroupStartInternal() {
+  if (flagcxGroupDepth == 0) {
+    flagcxGroupNextCustomOpId = INT_MIN;
+  }
   flagcxGroupDepth++;
   return flagcxSuccess;
 }

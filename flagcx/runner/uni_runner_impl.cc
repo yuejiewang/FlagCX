@@ -281,7 +281,10 @@ static bool matchBindingRange(const void *ptr, const void *base, size_t bytes,
     return false;
   }
   uintptr_t delta = ptrAddr - baseAddr;
-  if (delta > bytes) {
+  // Bindings are half-open ranges. Keep the sole zero-byte address usable for
+  // empty DAGs, but never classify the first byte of an adjacent allocation as
+  // belonging to this buffer.
+  if ((bytes == 0 && delta != 0) || (bytes != 0 && delta >= bytes)) {
     return false;
   }
   *offsetBytes = static_cast<int64_t>(delta);
@@ -345,7 +348,8 @@ resolveBufferRef(const uniRunnerDagBufferRef &ref,
   }
 
   if (base == NULL || ref.offsetBytes < 0 ||
-      static_cast<size_t>(ref.offsetBytes) > bytes) {
+      (bytes == 0 && ref.offsetBytes != 0) ||
+      (bytes != 0 && static_cast<size_t>(ref.offsetBytes) >= bytes)) {
     return flagcxInvalidArgument;
   }
 
@@ -979,6 +983,109 @@ static flagcxResult_t buildUniRunnerStateGroupedAG(
     }
   }
 
+  return validateDagNodes(runnerState);
+}
+
+static flagcxResult_t buildUniRunnerStateAlltoAll(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxComm_t comm) {
+  const int rank = comm->rank;
+  const int nranks = comm->nranks;
+
+  if (nranks < 1 || rank < 0 || rank >= nranks) {
+    return flagcxInvalidArgument;
+  }
+  if (count == 0) {
+    return flagcxSuccess;
+  }
+  if (nranks > std::numeric_limits<int>::max() / 2) {
+    return flagcxInvalidArgument;
+  }
+
+  const size_t typeSize = getFlagcxDataTypeSize(datatype);
+  const size_t blockBytes = count * typeSize;
+  const int numRemotePeers = nranks - 1;
+
+  runnerState->numDagNodes = numRemotePeers > 0 ? 2 : 1;
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                           runnerState->numDagNodes *
+                               sizeof(struct uniRunnerDagNode)));
+  if (runnerState->dagNodes == NULL) {
+    return flagcxSystemError;
+  }
+
+  // A direct pairwise exchange is bandwidth-optimal on a fully connected
+  // NVSwitch domain: every remote byte traverses the fabric exactly once.
+  // Rotating send/receive peers forms conflict-free permutations for any rank
+  // count. Self traffic is represented by a CPY DAG node rather than a
+  // HeteroSend/HeteroRecv pair.
+  if (numRemotePeers > 0) {
+    uniRunnerDagNode *p2pNode = &runnerState->dagNodes[0];
+    p2pNode->nodeIdx = 0;
+    p2pNode->nodeType = uniRunnerDagNodeTypeP2p;
+    p2pNode->nodeData.p2p.numOps = 2 * numRemotePeers;
+    FLAGCXCHECK(flagcxCalloc(
+        &p2pNode->nodeData.p2p.ops,
+        p2pNode->nodeData.p2p.numOps * sizeof(struct uniRunnerP2pOpData)));
+
+    for (int step = 1; step < nranks; ++step) {
+      const int sendPeer = static_cast<int>(
+          (static_cast<int64_t>(rank) + step) % nranks);
+      const int recvPeer = static_cast<int>(
+          (static_cast<int64_t>(rank) - step + nranks) % nranks);
+      const int opIdx = 2 * (step - 1);
+      uniRunnerP2pOpData *sendOp = &p2pNode->nodeData.p2p.ops[opIdx];
+      uniRunnerP2pOpData *recvOp = &p2pNode->nodeData.p2p.ops[opIdx + 1];
+
+      sendOp->addr = static_cast<void *>(
+          static_cast<char *>(const_cast<void *>(sendbuff)) +
+          static_cast<size_t>(sendPeer) * blockBytes);
+      sendOp->count = count;
+      sendOp->peerRank = sendPeer;
+      sendOp->datatype = datatype;
+      sendOp->type = flagcxDevicePrimSend;
+
+      recvOp->addr = static_cast<void *>(
+          static_cast<char *>(recvbuff) +
+          static_cast<size_t>(recvPeer) * blockBytes);
+      recvOp->count = count;
+      recvOp->peerRank = recvPeer;
+      recvOp->datatype = datatype;
+      recvOp->type = flagcxDevicePrimRecv;
+    }
+
+    p2pNode->numParents = 0;
+    p2pNode->numChildren = 1;
+    FLAGCXCHECK(allocDagNodeDeps(p2pNode));
+    p2pNode->children[0] = 1;
+    flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, p2pNode);
+  }
+
+  const int cpyNodeIdx = numRemotePeers > 0 ? 1 : 0;
+  uniRunnerDagNode *cpyNode = &runnerState->dagNodes[cpyNodeIdx];
+  cpyNode->nodeIdx = cpyNodeIdx;
+  cpyNode->nodeType = uniRunnerDagNodeTypeCpy;
+  cpyNode->nodeData.cpy.src = static_cast<void *>(
+      static_cast<char *>(const_cast<void *>(sendbuff)) +
+      static_cast<size_t>(rank) * blockBytes);
+  cpyNode->nodeData.cpy.dst = static_cast<void *>(
+      static_cast<char *>(recvbuff) + static_cast<size_t>(rank) * blockBytes);
+  cpyNode->nodeData.cpy.count = count;
+  cpyNode->nodeData.cpy.datatype = datatype;
+  cpyNode->numParents = numRemotePeers > 0 ? 1 : 0;
+  cpyNode->numChildren = 0;
+  FLAGCXCHECK(allocDagNodeDeps(cpyNode));
+  if (numRemotePeers > 0) {
+    FLAGCXCHECK(setDagNodeParent(cpyNode, 0, 0));
+  } else {
+    flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, cpyNode);
+  }
+
+  runnerState->numPendingNodes = numRemotePeers > 0 ? 1 : 0;
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initialized direct AlltoAll DAG for %d ranks with %d remote "
+        "peer exchanges",
+        rank, nranks, numRemotePeers);
   return validateDagNodes(runnerState);
 }
 
@@ -2944,6 +3051,39 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateGroupedAG(runnerState, sendbuff, recvbuff, count,
                                         datatype, comm, groupSize);
+  });
+}
+
+flagcxResult_t initUniRunnerStateAlltoAll(flagcxUniRunnerState *runnerState,
+                                          const void *sendbuff, void *recvbuff,
+                                          size_t count,
+                                          flagcxDataType_t datatype,
+                                          flagcxComm_t comm) {
+  runnerState->avgDivisor = 1;
+  if (comm == NULL || comm->nranks < 1 || comm->rank < 0 ||
+      comm->rank >= comm->nranks) {
+    return flagcxInvalidArgument;
+  }
+
+  size_t totalBytes = 0;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(
+      count, static_cast<size_t>(comm->nranks), datatype, &totalBytes));
+  if (totalBytes != 0 && (sendbuff == NULL || recvbuff == NULL)) {
+    return flagcxInvalidArgument;
+  }
+
+  uniRunnerDagRuntimeBindings bindings;
+  bindings.inputBase = sendbuff;
+  bindings.outputBase = recvbuff;
+  bindings.inputBytes = totalBytes;
+  bindings.outputBytes = totalBytes;
+
+  uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
+      uniRunnerDagAlgoDirectA2A, flagcxCommOpAlltoAll, count, datatype,
+      flagcxRedNoOp, -1, comm);
+  return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
+    return buildUniRunnerStateAlltoAll(runnerState, sendbuff, recvbuff, count,
+                                       datatype, comm);
   });
 }
 
