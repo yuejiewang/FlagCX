@@ -11,6 +11,7 @@ FLAGCX_PARAM(UniRunnerUseLocRed, "UNIRUNNER_USE_LOCRED", 0);
 FLAGCX_PARAM(UniRunnerUseRingAG, "UNIRUNNER_USE_RINGAG", 0);
 FLAGCX_PARAM(UniRunnerUseSlicedAR, "UNIRUNNER_USE_SLICEDAR", 0);
 FLAGCX_PARAM(UniRunnerUseIpcAR, "UNIRUNNER_USE_IPCAR", 0);
+FLAGCX_PARAM(UniRunnerUseIpcA2A, "UNIRUNNER_USE_IPCA2A", 0);
 FLAGCX_PARAM(UniRunnerUseGroupedAG, "UNIRUNNER_USE_GROUPEDAG", 1);
 FLAGCX_PARAM(UniRunnerGroupSize, "UNIRUNNER_GROUPSIZE", 0);
 
@@ -263,11 +264,18 @@ flagcxResult_t uniRunnerAlltoAll(const void *sendbuff, void *recvbuff,
   if (comm->nranks == 1 && sendbuff == recvbuff) {
     return flagcxSuccess;
   }
+  const bool useIpcA2A = flagcxParamUniRunnerUseIpcA2A() != 0;
 
   // An outer FlagCX group owns submission and buffer lifetime. Queue the
   // operation directly so the outer GroupEnd launches it; runUniRunner cannot
   // drain a nested group.
   if (flagcxGroupDepth > 0) {
+    if (useIpcA2A) {
+      TRACE(FLAGCX_UNIRUNNER,
+            "rank %d grouped AlltoAll keeps the grouped P2P path while "
+            "UNIRUNNER_USE_IPCA2A is enabled",
+            comm->rank);
+    }
     const size_t blockBytes =
         totalBytes / static_cast<size_t>(comm->nranks);
     if (sendbuff == recvbuff) {
@@ -307,6 +315,7 @@ flagcxResult_t uniRunnerAlltoAll(const void *sendbuff, void *recvbuff,
   const void *effectiveSendbuff = sendbuff;
   void *scratchbuff = NULL;
   bool runnerInitialized = false;
+  flagcxEvent_t ipcA2AEntryEvent = NULL;
 
   // AlltoAll permits sendbuff == recvbuff. Snapshot the complete input before
   // launching direct pairwise receives so incoming blocks cannot overwrite
@@ -325,10 +334,30 @@ flagcxResult_t uniRunnerAlltoAll(const void *sendbuff, void *recvbuff,
 
   FLAGCXCHECKGOTO(initUniRunner(comm, stream), res, out);
   runnerInitialized = true;
-  FLAGCXCHECKGOTO(initUniRunnerStateAlltoAll(
-                      runnerState, effectiveSendbuff, recvbuff, count, datatype,
-                      comm),
-                  res, out);
+  if (useIpcA2A) {
+    // Gate the dedicated IPC/copy streams on all work previously submitted to
+    // the user stream before peer-pointer loads begin.
+    FLAGCXCHECKGOTO(deviceAdaptor->eventCreate(
+                        &ipcA2AEntryEvent, flagcxEventDisableTiming),
+                    res, out);
+    FLAGCXCHECKGOTO(
+        deviceAdaptor->eventRecord(ipcA2AEntryEvent, stream), res, out);
+    FLAGCXCHECKGOTO(deviceAdaptor->streamWaitEvent(
+                        runnerState->redStream, ipcA2AEntryEvent),
+                    res, out);
+    FLAGCXCHECKGOTO(deviceAdaptor->streamWaitEvent(
+                        runnerState->cpyStream, ipcA2AEntryEvent),
+                    res, out);
+    FLAGCXCHECKGOTO(initUniRunnerStateIpcA2A(
+                        runnerState, effectiveSendbuff, recvbuff, count,
+                        datatype, comm),
+                    res, out);
+  } else {
+    FLAGCXCHECKGOTO(initUniRunnerStateAlltoAll(
+                        runnerState, effectiveSendbuff, recvbuff, count,
+                        datatype, comm),
+                    res, out);
+  }
   FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
 
 out:
@@ -336,6 +365,13 @@ out:
     flagcxResult_t cleanupRes = cleanupUniRunner(comm);
     if (res == flagcxSuccess) {
       res = cleanupRes;
+    }
+  }
+  if (ipcA2AEntryEvent != NULL) {
+    flagcxResult_t eventRes =
+        deviceAdaptor->eventDestroy(ipcA2AEntryEvent);
+    if (res == flagcxSuccess) {
+      res = eventRes;
     }
   }
   if (scratchbuff != NULL) {

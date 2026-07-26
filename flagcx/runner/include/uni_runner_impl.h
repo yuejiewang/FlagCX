@@ -35,7 +35,8 @@ typedef enum {
   uniRunnerDagAlgoRingRS = 6,
   uniRunnerDagAlgoTreeRed = 7,
   uniRunnerDagAlgoIpcAR = 8,
-  uniRunnerDagAlgoDirectA2A = 9
+  uniRunnerDagAlgoDirectA2A = 9,
+  uniRunnerDagAlgoIpcA2A = 10
 } uniRunnerDagAlgoType;
 
 // Cache key describing a reusable uniRunner DAG template.
@@ -159,7 +160,7 @@ typedef struct {
   size_t streamFlagsSize;
   size_t streamFlagsCapacity;
 
-  // IPC/LSA AllReduce runtime resources. User-buffer DevMem views are reused
+  // IPC/LSA collective runtime resources. User-buffer DevMem views are reused
   // while their base/size bindings remain unchanged; owned ready storage is
   // communicator scoped and reused with monotonically increasing epochs.
   flagcxComm_t ipcOwner;
@@ -192,6 +193,11 @@ flagcxResult_t initUniRunnerStateAlltoAll(flagcxUniRunnerState *runnerState,
                                           size_t count,
                                           flagcxDataType_t datatype,
                                           flagcxComm_t comm);
+flagcxResult_t initUniRunnerStateIpcA2A(flagcxUniRunnerState *runnerState,
+                                        const void *sendbuff, void *recvbuff,
+                                        size_t count,
+                                        flagcxDataType_t datatype,
+                                        flagcxComm_t comm);
 flagcxResult_t initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         size_t count, flagcxDataType_t datatype,

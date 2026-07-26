@@ -136,6 +136,7 @@ This document provides a comprehensive reference for all environment variables u
 | `FLAGCX_UNIRUNNER_USE_RINGAG` | 0 | When set to 1, uses ring allgather in uniRunner |
 | `FLAGCX_UNIRUNNER_USE_SLICEDAR` | 0 | When set to 1, uses sliced allreduce in uniRunner |
 | `FLAGCX_UNIRUNNER_USE_IPCAR` | 0 | When set to 1, uses intra-node IPC push for uniRunner sliced allreduce |
+| `FLAGCX_UNIRUNNER_USE_IPCA2A` | 0 | When set to 1, uses intra-node IPC peer-pointer pairwise exchange for uniRunner AlltoAll; grouped calls keep the grouped P2P path |
 | `FLAGCX_UNIRUNNER_NREDSLICES` | 0 | Number of reduction slices for uniRunner (0 = auto) |
 | `FLAGCX_UNIRUNNER_REDSLICESIZE` | 65536 | Reduction slice size in bytes for uniRunner |
 

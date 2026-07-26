@@ -100,6 +100,8 @@ inline const char *uniRunnerDagAlgoTypeToString(uniRunnerDagAlgoType algoType) {
       return "ipc_ar";
     case uniRunnerDagAlgoDirectA2A:
       return "direct_a2a";
+    case uniRunnerDagAlgoIpcA2A:
+      return "ipc_a2a";
     default:
       return "unknown";
   }
@@ -127,6 +129,8 @@ inline bool uniRunnerDagAlgoTypeFromString(const std::string &text,
     *algoType = uniRunnerDagAlgoIpcAR;
   } else if (text == "direct_a2a") {
     *algoType = uniRunnerDagAlgoDirectA2A;
+  } else if (text == "ipc_a2a") {
+    *algoType = uniRunnerDagAlgoIpcA2A;
   } else {
     return false;
   }

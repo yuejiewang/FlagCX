@@ -40,6 +40,9 @@ FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
 static flagcxResult_t ensureUniRunnerIpcDataViews(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm,
     const void *sendbuff, void *recvbuff, size_t bytes);
+static flagcxResult_t ensureUniRunnerIpcA2ADataViews(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm,
+    const void *sendbuff, void *recvbuff, size_t bytes);
 static flagcxResult_t ensureUniRunnerIpcReadyStorage(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm,
     size_t requiredSlots);
@@ -2038,6 +2041,146 @@ static int globalRankToLocalRank(flagcxComm_t comm, int globalRank) {
   return -1;
 }
 
+static flagcxResult_t buildUniRunnerStateIpcA2A(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxComm_t comm) {
+  if (comm == NULL || comm->nranks < 1 || comm->rank < 0 ||
+      comm->rank >= comm->nranks || comm->localRank < 0 ||
+      comm->localRank >= comm->localRanks) {
+    return flagcxInvalidArgument;
+  }
+  if (comm->localRanks != comm->nranks) {
+    return flagcxNotSupported;
+  }
+  if (count == 0 || comm->nranks == 1) {
+    return buildUniRunnerStateAlltoAll(runnerState, sendbuff, recvbuff, count,
+                                       datatype, comm);
+  }
+  if (comm->localRankToRank == NULL) {
+    return flagcxInternalError;
+  }
+  if (comm->localRankToRank[comm->localRank] != comm->rank) {
+    return flagcxInternalError;
+  }
+
+  const int rank = comm->rank;
+  const int nranks = comm->nranks;
+  const int numRemotePeers = nranks - 1;
+  const size_t blockBytes = count * getFlagcxDataTypeSize(datatype);
+  int numEntryRounds = 0;
+  for (uint64_t distance = 1; distance < static_cast<uint64_t>(nranks);
+       distance <<= 1) {
+    numEntryRounds++;
+  }
+  const size_t totalNodes = static_cast<size_t>(numEntryRounds) +
+                            static_cast<size_t>(numRemotePeers) + 1;
+  if (totalNodes > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return flagcxInvalidArgument;
+  }
+
+  // Each cyclic step is a conflict-free permutation: every local GPU pushes
+  // one destination block directly into that peer's receive buffer and gets
+  // one block from the inverse permutation. This is a single-hop pairwise
+  // exchange on NVLink/NVSwitch and does not depend on a fixed rank count.
+  runnerState->numDagNodes = static_cast<int>(totalNodes);
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                           static_cast<size_t>(runnerState->numDagNodes) *
+                               sizeof(struct uniRunnerDagNode)));
+  if (runnerState->dagNodes == NULL) {
+    return flagcxSystemError;
+  }
+
+  // A zero-byte dissemination barrier gates remote writes. Round r signals a
+  // peer at distance 2^r and waits for the inverse peer; the known-arrived set
+  // doubles every round, so ceil(log2(nranks)) rounds prove that every caller
+  // stream has reached the collective.
+  for (int round = 0; round < numEntryRounds; ++round) {
+    const int nodeIdx = round;
+    const uint64_t distance = uint64_t(1) << round;
+    const int peerLocalRank = static_cast<int>(
+        (static_cast<uint64_t>(comm->localRank) + distance) %
+        static_cast<uint64_t>(nranks));
+    uniRunnerDagNode *entryNode = &runnerState->dagNodes[nodeIdx];
+    entryNode->nodeIdx = nodeIdx;
+    entryNode->nodeType = uniRunnerDagNodeTypeIpc;
+    entryNode->nodeData.ipc.srcOffsetBytes = 0;
+    entryNode->nodeData.ipc.dstOffsetBytes = 0;
+    entryNode->nodeData.ipc.bytes = 0;
+    entryNode->nodeData.ipc.srcBufferType = flagcxIpcBufferInput;
+    entryNode->nodeData.ipc.peerLocalRank = peerLocalRank;
+    entryNode->nodeData.ipc.readySlot = static_cast<uint32_t>(nodeIdx);
+    entryNode->nodeData.ipc.parentFlagsOffset = 0;
+    entryNode->nodeData.ipc.triggerIdx = -1;
+    entryNode->numParents = nodeIdx == 0 ? 0 : 1;
+    entryNode->numChildren = 1;
+    FLAGCXCHECK(allocDagNodeDeps(entryNode));
+    if (nodeIdx == 0) {
+      flagcxIntruQueueEnqueue(&runnerState->ipcReadyQueue, entryNode);
+    } else {
+      runnerState->numPendingNodes++;
+      FLAGCXCHECK(setDagNodeParent(entryNode, 0, nodeIdx - 1));
+    }
+    entryNode->children[0] = nodeIdx + 1;
+  }
+
+  for (int step = 1; step < nranks; ++step) {
+    const int nodeIdx = numEntryRounds + step - 1;
+    const int peerLocalRank = static_cast<int>(
+        (static_cast<int64_t>(comm->localRank) + step) % nranks);
+    const int peerGlobalRank = comm->localRankToRank[peerLocalRank];
+    if (peerGlobalRank < 0 || peerGlobalRank >= nranks) {
+      return flagcxInternalError;
+    }
+
+    uniRunnerDagNode *ipcNode = &runnerState->dagNodes[nodeIdx];
+    ipcNode->nodeIdx = nodeIdx;
+    ipcNode->nodeType = uniRunnerDagNodeTypeIpc;
+    ipcNode->nodeData.ipc.srcOffsetBytes =
+        static_cast<size_t>(peerGlobalRank) * blockBytes;
+    // AlltoAll receive buffers are ordered by global source rank.
+    ipcNode->nodeData.ipc.dstOffsetBytes =
+        static_cast<size_t>(rank) * blockBytes;
+    ipcNode->nodeData.ipc.bytes = blockBytes;
+    ipcNode->nodeData.ipc.srcBufferType = flagcxIpcBufferInput;
+    ipcNode->nodeData.ipc.peerLocalRank = peerLocalRank;
+    ipcNode->nodeData.ipc.readySlot = static_cast<uint32_t>(nodeIdx);
+    ipcNode->nodeData.ipc.parentFlagsOffset = 0;
+    ipcNode->nodeData.ipc.triggerIdx = -1;
+
+    ipcNode->numParents = 1;
+    ipcNode->numChildren = 1;
+    FLAGCXCHECK(allocDagNodeDeps(ipcNode));
+    runnerState->numPendingNodes++;
+    FLAGCXCHECK(setDagNodeParent(ipcNode, 0, nodeIdx - 1));
+    ipcNode->children[0] = nodeIdx + 1;
+  }
+
+  const int cpyNodeIdx = numEntryRounds + numRemotePeers;
+  uniRunnerDagNode *cpyNode = &runnerState->dagNodes[cpyNodeIdx];
+  cpyNode->nodeIdx = cpyNodeIdx;
+  cpyNode->nodeType = uniRunnerDagNodeTypeCpy;
+  cpyNode->nodeData.cpy.src = static_cast<void *>(
+      static_cast<char *>(const_cast<void *>(sendbuff)) +
+      static_cast<size_t>(rank) * blockBytes);
+  cpyNode->nodeData.cpy.dst = static_cast<void *>(
+      static_cast<char *>(recvbuff) + static_cast<size_t>(rank) * blockBytes);
+  cpyNode->nodeData.cpy.count = count;
+  cpyNode->nodeData.cpy.datatype = datatype;
+  cpyNode->numParents = 1;
+  cpyNode->numChildren = 0;
+  FLAGCXCHECK(allocDagNodeDeps(cpyNode));
+  FLAGCXCHECK(setDagNodeParent(cpyNode, 0, cpyNodeIdx - 1));
+  runnerState->numPendingNodes++;
+
+  runnerState->ipcReadySlots =
+      static_cast<size_t>(numEntryRounds + numRemotePeers);
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initialized IPC peer-pointer AlltoAll DAG for %d ranks with "
+        "%d entry-barrier rounds and %d direct remote steps",
+        rank, nranks, numEntryRounds, numRemotePeers);
+  return validateDagNodes(runnerState);
+}
+
 static flagcxResult_t buildUniRunnerStateIpcAR(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
@@ -3087,6 +3230,42 @@ flagcxResult_t initUniRunnerStateAlltoAll(flagcxUniRunnerState *runnerState,
   });
 }
 
+flagcxResult_t initUniRunnerStateIpcA2A(flagcxUniRunnerState *runnerState,
+                                        const void *sendbuff, void *recvbuff,
+                                        size_t count,
+                                        flagcxDataType_t datatype,
+                                        flagcxComm_t comm) {
+  runnerState->avgDivisor = 1;
+  if (comm == NULL || comm->nranks < 1 || comm->rank < 0 ||
+      comm->rank >= comm->nranks) {
+    return flagcxInvalidArgument;
+  }
+  if (runnerState->uniRunnerIpcChunkSize < 16 ||
+      runnerState->uniRunnerIpcChunkSize % 16 != 0) {
+    WARN("UniRunner IPCCHUNKSIZE must be a positive multiple of 16 bytes");
+    return flagcxInvalidArgument;
+  }
+
+  size_t totalBytes = 0;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(
+      count, static_cast<size_t>(comm->nranks), datatype, &totalBytes));
+  if (totalBytes != 0 && (sendbuff == NULL || recvbuff == NULL)) {
+    return flagcxInvalidArgument;
+  }
+
+  // Runtime peer-pointer bindings are intentionally separate from the cached
+  // DirectA2A DAG, so selecting IPC never replaces the existing algorithm.
+  FLAGCXCHECK(buildUniRunnerStateIpcA2A(runnerState, sendbuff, recvbuff, count,
+                                        datatype, comm));
+  if (runnerState->ipcReadySlots == 0) {
+    return flagcxSuccess;
+  }
+  FLAGCXCHECK(ensureUniRunnerIpcA2ADataViews(
+      runnerState, comm, sendbuff, recvbuff, totalBytes));
+  return ensureUniRunnerIpcReadyStorage(runnerState, comm,
+                                        runnerState->ipcReadySlots);
+}
+
 flagcxResult_t initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         size_t count, flagcxDataType_t datatype,
@@ -3428,6 +3607,62 @@ static flagcxResult_t ensureUniRunnerIpcDataViews(
     res = flagcxNotSupported;
     goto fail;
   }
+  runnerState->ipcInputBase = sendbuff;
+  runnerState->ipcOutputBase = recvbuff;
+  runnerState->ipcDataBytes = bytes;
+  return flagcxSuccess;
+
+fail:
+  (void)destroyUniRunnerIpcDataViews(runnerState);
+  return res;
+}
+
+static flagcxResult_t ensureUniRunnerIpcA2ADataViews(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm,
+    const void *sendbuff, void *recvbuff, size_t bytes) {
+  if (runnerState->ipcOutputMem != NULL &&
+      runnerState->ipcOutputBase == recvbuff &&
+      runnerState->ipcOutputMem->hasWindow) {
+    if (runnerState->ipcInputMem == NULL ||
+        runnerState->ipcInputBase != sendbuff) {
+      // Preserve the remote output mapping when an in-place call receives a
+      // newly allocated snapshot. Rebuilding that stable mapping on every
+      // invocation would consume the communicator's deferred IPC table.
+      if (runnerState->ipcInputMem != NULL &&
+          runnerState->ipcInputMem != runnerState->ipcOutputMem) {
+        FLAGCXCHECK(
+            flagcxDevMemDestroy(comm, runnerState->ipcInputMem));
+      }
+      runnerState->ipcInputMem = NULL;
+      runnerState->ipcInputBase = NULL;
+      FLAGCXCHECK(flagcxDevMemCreate(
+          NULL, const_cast<void *>(sendbuff), bytes, NULL,
+          &runnerState->ipcInputMem));
+      runnerState->ipcInputBase = sendbuff;
+    }
+    runnerState->ipcDataBytes = std::max(runnerState->ipcDataBytes, bytes);
+    return flagcxSuccess;
+  }
+
+  FLAGCXCHECK(destroyUniRunnerIpcDataViews(runnerState));
+  runnerState->ipcOwner = comm;
+  flagcxResult_t res = flagcxSuccess;
+
+  // Only the output is remotely addressed. Keep input as a raw local view so
+  // an in-place AlltoAll snapshot can be released after runUniRunner without
+  // leaving a stale IPC mapping or consuming an ipcTable entry.
+  FLAGCXCHECKGOTO(flagcxDevMemCreate(comm, recvbuff, bytes, NULL,
+                                     &runnerState->ipcOutputMem),
+                  res, fail);
+  FLAGCXCHECKGOTO(flagcxDevMemCreate(
+                      NULL, const_cast<void *>(sendbuff), bytes, NULL,
+                      &runnerState->ipcInputMem),
+                  res, fail);
+  if (!runnerState->ipcOutputMem->hasWindow) {
+    res = flagcxNotSupported;
+    goto fail;
+  }
+
   runnerState->ipcInputBase = sendbuff;
   runnerState->ipcOutputBase = recvbuff;
   runnerState->ipcDataBytes = bytes;
