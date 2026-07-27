@@ -24,6 +24,7 @@ struct flagcxIpcTableEntry {
   int nPeers;          // number of local peers
   void *basePtr;       // own buffer ptr (skip in ipcMemHandleClose loop)
   bool inUse;          // true while a devMem references this entry
+  int refCount;        // number of live devMem wrappers sharing this entry
 };
 
 // Deferred device/host-pinned memory free — collected during cleanup,

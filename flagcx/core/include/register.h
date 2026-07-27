@@ -66,6 +66,8 @@ struct flagcxRegItem {
   std::vector<std::pair<flagcxRegNetHandle, flagcxRegP2pHandle>> handles;
   flagcxIpcHandleData localIpcHandleData =
       {}; // sender's IPC handle bytes (hetero path)
+  uintptr_t ipcExportBase =
+      0; // exact pointer represented by localIpcHandleData
   std::unordered_map<uintptr_t, void *>
       homoRegHandles; // commKey → backend CCL handle
 };

@@ -1132,7 +1132,7 @@ flagcxResult_t flagcxProxyInit(struct flagcxHeteroComm *comm) {
                  (void *)comm);
   pthread_create(&comm->proxyState->progressState.thread, NULL,
                  flagcxProxyProgress, comm->proxyState);
-#ifdef COMPILE_KERNEL_HOST
+#if defined(COMPILE_KERNEL_HOST) && !defined(USE_ASCEND_ADAPTOR)
   // Initialize synchronization primitives before creating threads
   pthread_mutex_init(&comm->proxyState->kernelState.initMutex, NULL);
   pthread_cond_init(&comm->proxyState->kernelState.initCond, NULL);
@@ -1365,7 +1365,7 @@ out:
   pthread_cond_signal(&comm->proxyState->cond);
   pthread_mutex_unlock(&comm->proxyState->mutex);
   pthread_join(comm->proxyState->progressState.thread, nullptr);
-#ifdef COMPILE_KERNEL_HOST
+#if defined(COMPILE_KERNEL_HOST) && !defined(USE_ASCEND_ADAPTOR)
   // Stop all kernel threads and cleanup
   for (int i = 0; i < comm->proxyState->kernelState.contextCount; i++) {
     pthread_join(comm->proxyState->kernelState.threads[i], nullptr);

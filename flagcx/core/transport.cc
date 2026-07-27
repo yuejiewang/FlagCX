@@ -12,10 +12,32 @@
 
 FLAGCX_PARAM(P2pDisable, "P2P_DISABLE", 0);
 
+static flagcxResult_t allocNetHostStagingBuffer(char **buffer, size_t size) {
+  if (buffer == NULL || size == 0)
+    return flagcxInvalidArgument;
+#ifdef USE_ASCEND_ADAPTOR
+  // Use runtime-owned page-locked memory for asynchronous Device<->Host
+  // copies. This keeps the NET staging path valid when Ascend routes ordinary
+  // non-self P2P (and IPCAR fallback) through SOCKET/host-only NET.
+  return deviceAdaptor->deviceMalloc(
+      reinterpret_cast<void **>(buffer), size, flagcxMemHost, NULL);
+#else
+  *buffer = static_cast<char *>(malloc(size));
+  return *buffer != NULL ? flagcxSuccess : flagcxSystemError;
+#endif
+}
+
 static inline bool isSameNode(struct flagcxHeteroComm *comm, int peer) {
   // Self is always same node (self-copy uses P2P memcpy, not NET)
   if (peer == comm->rank)
     return true;
+#ifdef USE_ASCEND_ADAPTOR
+  // The legacy P2P transport owns CUDA-style IPC FIFOs whose teardown does
+  // not provide CANN's required importer-before-exporter ordering. Ascend
+  // UniRunner IPCAR uses its dedicated ordered IPC path; all ordinary
+  // non-self P2P traffic stays on the existing NET transport.
+  return false;
+#endif
   // force use net transport for unirunner allreduce
   if (flagcxParamP2pDisable()) {
     return false;
@@ -78,10 +100,8 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
           }
           resources->buffSizes[0] = flagcxNetBufferSize;
           if (comm->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
-            resources->buffers[0] = (char *)malloc(resources->buffSizes[0]);
-            if (!resources->buffers[0]) {
-              return flagcxSystemError;
-            }
+            FLAGCXCHECK(allocNetHostStagingBuffer(
+                &resources->buffers[0], resources->buffSizes[0]));
           } else if (comm->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
             deviceAdaptor->gdrMemAlloc((void **)&resources->buffers[0],
                                        resources->buffSizes[0], NULL);
@@ -93,9 +113,8 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
               deviceAdaptor->gdrMemAlloc((void **)&resources->buffers[0],
                                          resources->buffSizes[0], NULL);
             } else {
-              resources->buffers[0] = (char *)malloc(resources->buffSizes[0]);
-              if (!resources->buffers[0])
-                return flagcxSystemError;
+              FLAGCXCHECK(allocNetHostStagingBuffer(
+                  &resources->buffers[0], resources->buffSizes[0]));
             }
           }
           struct flagcxIbHandle *handle = NULL;
@@ -162,10 +181,8 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
           }
           resources->buffSizes[0] = flagcxNetBufferSize;
           if (comm->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
-            resources->buffers[0] = (char *)malloc(resources->buffSizes[0]);
-            if (!resources->buffers[0]) {
-              return flagcxSystemError;
-            }
+            FLAGCXCHECK(allocNetHostStagingBuffer(
+                &resources->buffers[0], resources->buffSizes[0]));
           } else if (comm->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
             deviceAdaptor->gdrMemAlloc((void **)&resources->buffers[0],
                                        resources->buffSizes[0], NULL);
@@ -177,9 +194,8 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
               deviceAdaptor->gdrMemAlloc((void **)&resources->buffers[0],
                                          resources->buffSizes[0], NULL);
             } else {
-              resources->buffers[0] = (char *)malloc(resources->buffSizes[0]);
-              if (!resources->buffers[0])
-                return flagcxSystemError;
+              FLAGCXCHECK(allocNetHostStagingBuffer(
+                  &resources->buffers[0], resources->buffSizes[0]));
             }
           }
           struct flagcxIbHandle *handle = NULL;

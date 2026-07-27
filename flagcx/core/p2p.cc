@@ -714,6 +714,13 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm,
   *regBufFlag = 0;
   *offsetOut = 0;
   *peerRmtAddrsOut = NULL;
+#ifdef USE_ASCEND_ADAPTOR
+  // Registered-buffer zero-copy below uses the generic legacy IPC cache,
+  // whose CUDA-style lifetime has no collective importer/exporter teardown.
+  // Ascend ordinary P2P uses NET; IPCAR owns a separate per-invocation CANN
+  // IPC transaction, so this optional optimization must remain disabled.
+  return flagcxSuccess;
+#endif
   int legacyIpcCap = 0;
   uintptr_t baseAddr = 0;
   uintptr_t baseSize = 0;

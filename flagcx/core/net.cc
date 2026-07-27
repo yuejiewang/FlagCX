@@ -20,6 +20,15 @@ struct flagcxNetAdaptor *flagcxNetAdaptors[3] = {
 enum flagcxNetState flagcxNetStates[3] = {
     flagcxNetStateInit, flagcxNetStateInit, flagcxNetStateInit};
 
+static flagcxResult_t freeNetHostStagingBuffer(void *buffer) {
+#ifdef USE_ASCEND_ADAPTOR
+  return deviceAdaptor->deviceFree(buffer, flagcxMemHost, NULL);
+#else
+  free(buffer);
+  return flagcxSuccess;
+#endif
+}
+
 flagcxResult_t flagcxNetCheckDeviceVersion(struct flagcxHeteroComm *comm,
                                            struct flagcxNetAdaptor *net,
                                            int dev) {
@@ -80,6 +89,25 @@ flagcxResult_t flagcxNetInit(struct flagcxHeteroComm *comm) {
   bool forceSocket = (forceSocketEnv && atoi(forceSocketEnv) == 1);
 
   netName = comm->config.netName;
+#ifdef USE_ASCEND_ADAPTOR
+  const bool hasExplicitNetName = netName != nullptr && netName[0] != '\0';
+  const char *socketName = getUnifiedNetAdaptor(SOCKET)->name;
+#if !defined(USE_UCX) && !defined(USE_IBUC)
+  const char *ibrcName = getUnifiedNetAdaptor(IBRC)->name;
+  if (hasExplicitNetName && strcasecmp(netName, ibrcName) == 0) {
+    WARN("The built-in IBRC adaptor relies on CUDA peer-memory GDR and is not "
+         "supported for Ascend device pointers; use SOCKET or an explicitly "
+         "Ascend-capable network plugin");
+    return flagcxNotSupported;
+  }
+#endif
+  // Ordinary Ascend non-self P2P intentionally uses NET. Default to the
+  // correctness path whose pinned-host staging is adapted above; an
+  // explicitly named third-party plugin remains available through its normal
+  // capability contract.
+  if (!hasExplicitNetName || strcasecmp(netName, socketName) == 0)
+    forceSocket = true;
+#endif
 
   if (!forceSocket) {
     // Load net plugin if FLAGCX_NET_ADAPTOR_PLUGIN is set.
@@ -378,14 +406,14 @@ flagcxResult_t flagcxSendProxyFree(sendNetResources *resources) {
                                  resources->mhandles[0]);
   resources->netAdaptor->closeSend(resources->netSendComm);
   if (resources->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
-    free(resources->buffers[0]);
+    FLAGCXCHECK(freeNetHostStagingBuffer(resources->buffers[0]));
   } else if (resources->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
     FLAGCXCHECK(deviceAdaptor->gdrMemFree(resources->buffers[0], NULL));
   } else {
     if (resources->ptrSupport & FLAGCX_PTR_CUDA) {
       FLAGCXCHECK(deviceAdaptor->gdrMemFree(resources->buffers[0], NULL));
     } else {
-      free(resources->buffers[0]);
+      FLAGCXCHECK(freeNetHostStagingBuffer(resources->buffers[0]));
     }
   }
   return flagcxSuccess;
@@ -401,14 +429,14 @@ flagcxResult_t flagcxRecvProxyFree(recvNetResources *resources) {
   resources->netAdaptor->closeRecv(resources->netRecvComm);
   resources->netAdaptor->closeListen(resources->netListenComm);
   if (resources->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
-    free(resources->buffers[0]);
+    FLAGCXCHECK(freeNetHostStagingBuffer(resources->buffers[0]));
   } else if (resources->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
     FLAGCXCHECK(deviceAdaptor->gdrMemFree(resources->buffers[0], NULL));
   } else {
     if (resources->ptrSupport & FLAGCX_PTR_CUDA) {
       FLAGCXCHECK(deviceAdaptor->gdrMemFree(resources->buffers[0], NULL));
     } else {
-      free(resources->buffers[0]);
+      FLAGCXCHECK(freeNetHostStagingBuffer(resources->buffers[0]));
     }
   }
   return flagcxSuccess;
@@ -477,6 +505,16 @@ flagcxResult_t flagcxNetRegisterBuffer(flagcxHeteroComm *comm,
   INFO(FLAGCX_REG, "comm = %p, userbuff = %p, buffSize = %ld, nPeers = %d",
        comm, userbuff, buffSize, nPeers);
   *outRegBufFlag = 0;
+#ifdef USE_ASCEND_ADAPTOR
+  // The existing NET registered-buffer path advertises device memory through
+  // FLAGCX_PTR_CUDA and bypasses the transport's host staging copy. Neither
+  // SOCKET nor the built-in IBRC adaptor can register an Ascend device
+  // pointer through that contract. Keep the optional zero-copy shortcut off
+  // until an Ascend-aware NET capability and registration type are defined.
+  if (outHandle != NULL && nPeers > 0)
+    memset(outHandle, 0, nPeers * sizeof(void *));
+  return flagcxSuccess;
+#endif
   if (comm && userbuff && buffSize > 0 && nPeers > 0) {
     flagcxRegItem *reg = globalRegPool.getItem(reinterpret_cast<void *>(comm),
                                                const_cast<void *>(userbuff));

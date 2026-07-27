@@ -22,6 +22,8 @@ USE_IBUC ?= 0
 USE_ENFLAME ?= 0
 USE_SUNRISE ?= 0
 COMPILE_KERNEL ?= 0
+ASCEND_SOC_VERSION ?= $(SOC_VERSION)
+CMAKE ?= cmake
 
 # set to empty if not provided
 DEVICE_HOME ?=
@@ -34,7 +36,7 @@ ifeq ($(strip $(DEVICE_HOME)),)
 	ifeq ($(USE_NVIDIA), 1)
 		DEVICE_HOME = /usr/local/cuda
 	else ifeq ($(USE_ASCEND), 1)
-		DEVICE_HOME = /usr/local/Ascend/ascend-toolkit/latest
+		DEVICE_HOME = $(if $(strip $(ASCEND_HOME_PATH)),$(ASCEND_HOME_PATH),/usr/local/Ascend/cann)
 	else ifeq ($(USE_ILUVATAR_COREX), 1)
 		DEVICE_HOME = /usr/local/corex
 	else ifeq ($(USE_CAMBRICON), 1)
@@ -64,7 +66,7 @@ ifeq ($(strip $(CCL_HOME)),)
 	ifeq ($(USE_NVIDIA), 1)
 		CCL_HOME = /usr/local/nccl/build
 	else ifeq ($(USE_ASCEND), 1)
-		CCL_HOME = /usr/local/Ascend/ascend-toolkit/latest
+		CCL_HOME = $(DEVICE_HOME)
 	else ifeq ($(USE_ILUVATAR_COREX), 1)
 		CCL_HOME = /usr/local/corex
 	else ifeq ($(USE_CAMBRICON), 1)
@@ -120,6 +122,8 @@ DEVICE_COMPILER =
 DEVICE_COMPILE_FLAG =
 DEVICE_LINK_FLAG =
 DEVICE_FILE_EXTENSION =
+ASCEND_KERNEL_RPATH =
+ASCEND_KERNEL_CLEAN =
 CCL_LIB =
 CCL_INCLUDE =
 CCL_LINK =
@@ -155,11 +159,21 @@ endif
 else ifeq ($(USE_ASCEND), 1)
 	DEVICE_LIB = $(DEVICE_HOME)/lib64
 	DEVICE_INCLUDE = $(DEVICE_HOME)/include
-	DEVICE_LINK = -lascendcl
+	# CANN 9.x publishes the acl/acl_rt.h runtime ABI from libacl_rt.so.
+	DEVICE_LINK = -lacl_rt
 	CCL_LIB = $(CCL_HOME)/lib64
 	CCL_INCLUDE = $(CCL_HOME)/include
 	CCL_LINK = -lhccl
 	ADAPTOR_FLAG = -DUSE_ASCEND_ADAPTOR
+ifeq ($(COMPILE_KERNEL), 1)
+	# The CMake-built launcher library stays next to its target-specific
+	# build tree during development and is installed next to libflagcx.so.
+	ASCEND_KERNEL_RPATH = \
+		-Wl,-rpath,$(ASCEND_KERNEL_BUILD_DIR)/lib \
+		-Wl,-rpath,'$$ORIGIN'
+	ASCEND_KERNEL_CLEAN = \
+		$(DESTDIR)/libflagcx_ascend_unirunner.so
+endif
 else ifeq ($(USE_ILUVATAR_COREX), 1)
 	DEVICE_LIB = $(DEVICE_HOME)/lib
 	DEVICE_INCLUDE = $(DEVICE_HOME)/include
@@ -314,6 +328,14 @@ endif
 LIBDIR := $(BUILDDIR)/lib
 OBJDIR := $(BUILDDIR)/obj
 BUILD_INCDIR := $(BUILDDIR)/include
+ASCEND_KERNEL_SRC_DIR := $(abspath flagcx/kernels/ascend)
+ASCEND_KERNEL_BUILD_DIR := \
+	$(OBJDIR)/ascend-unirunner/$(ASCEND_SOC_VERSION)
+ASCEND_KERNEL_LIB := \
+	$(ASCEND_KERNEL_BUILD_DIR)/lib/libflagcx_ascend_unirunner.so
+ASCEND_KERNEL_SOURCES := \
+	$(ASCEND_KERNEL_SRC_DIR)/CMakeLists.txt \
+	$(ASCEND_KERNEL_SRC_DIR)/flagcx_ascend_unirunner_reduce.cpp
 PREFIX ?= /usr/local
 DESTDIR  ?= $(PREFIX)/lib
 INC_DESTDIR ?= $(PREFIX)/include
@@ -345,6 +367,10 @@ LIBSRCFILES:= \
 	$(wildcard flagcx/service/*.cc)
 
 ifeq ($(COMPILE_KERNEL), 1)
+ifeq ($(USE_ASCEND), 1)
+DEVSRCFILES :=
+DEVOBJ :=
+else
 DEVSRCFILES:= \
 	$(wildcard flagcx/kernels/*.$(DEVICE_FILE_EXTENSION))
 ifneq ($(USE_NVIDIA), 1)
@@ -354,6 +380,7 @@ EXCLUDE_SOURCES :=
 endif
 DEVSRCFILES := $(filter-out flagcx/kernels/$(EXCLUDE_SOURCES), $(DEVSRCFILES))
 DEVOBJ:= $(DEVSRCFILES:%.$(DEVICE_FILE_EXTENSION)=$(OBJDIR)/%.o)
+endif
 endif
 LIBOBJ:= $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
 
@@ -379,6 +406,7 @@ print_var:
 	@echo "USE_TSM: $(USE_TSM)"
 	@echo "USE_ENFLAME: $(USE_ENFLAME)"
 	@echo "COMPILE_KERNEL: $(COMPILE_KERNEL)"
+	@echo "ASCEND_SOC_VERSION: $(ASCEND_SOC_VERSION)"
 	@echo "DEVICE_LIB: $(DEVICE_LIB)"
 	@echo "DEVICE_INCLUDE: $(DEVICE_INCLUDE)"
 	@echo "CCL_LIB: $(CCL_LIB)"
@@ -396,7 +424,11 @@ print_var:
 	@echo "DEVSRCFILES: $(DEVSRCFILES)"
 
 ifeq ($(COMPILE_KERNEL), 1)
+ifeq ($(USE_ASCEND), 1)
+DEVOBJS = $(ASCEND_KERNEL_LIB)
+else
 DEVOBJS = $(DEVOBJ) $(OBJDIR)/kernel_dlink.o
+endif
 else
 DEVOBJS =
 endif
@@ -411,7 +443,7 @@ endif
 $(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJS)
 	@mkdir -p `dirname $@`
 	@echo "Linking   $@"
-	@$(LINKER) $^ -o $@ -L$(CCL_LIB) -L$(DEVICE_LIB) -L$(HOST_CCL_LIB) -L$(UCX_LIB) -shared -fvisibility=default -Wl,--no-as-needed -Wl,-rpath,$(LIBDIR) -Wl,-rpath,$(CCL_LIB) -Wl,-rpath,$(HOST_CCL_LIB) -Wl,-rpath,$(UCX_LIB) -lpthread -lrt -ldl $(CCL_LINK) $(DEVICE_LINK) $(HOST_CCL_LINK) $(UCX_LINK) -g
+	@$(LINKER) $^ -o $@ -L$(CCL_LIB) -L$(DEVICE_LIB) -L$(HOST_CCL_LIB) -L$(UCX_LIB) -shared -fvisibility=default -Wl,--no-as-needed -Wl,-rpath,$(LIBDIR) -Wl,-rpath,$(CCL_LIB) -Wl,-rpath,$(HOST_CCL_LIB) -Wl,-rpath,$(UCX_LIB) $(ASCEND_KERNEL_RPATH) -lpthread -lrt -ldl $(CCL_LINK) $(DEVICE_LINK) $(HOST_CCL_LINK) $(UCX_LINK) -g
 
 # Copy public headers from flagcx/include/ into the build output tree so they
 # sit next to the shared libraries (build/include + build/lib).
@@ -426,6 +458,18 @@ $(OBJDIR)/%.o: %.cc
 	@$(HOST_COMPILER) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) $(addprefix -I,$(DEVICE_INCLUDE)) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(COMPILE_KERNEL_HOST_FLAG) -c -fPIC -fvisibility=default -Wvla -Wno-unused-function -Wno-sign-compare -Wall -MMD -MP -g
 
 ifeq ($(COMPILE_KERNEL), 1)
+ifeq ($(USE_ASCEND), 1)
+$(ASCEND_KERNEL_LIB): $(ASCEND_KERNEL_SOURCES)
+	@echo "Compiling $@ (ASCEND)"
+	@$(CMAKE) -S "$(ASCEND_KERNEL_SRC_DIR)" \
+		-B "$(ASCEND_KERNEL_BUILD_DIR)" \
+		-DASCEND_CANN_PACKAGE_PATH="$(DEVICE_HOME)" \
+		-DSOC_VERSION="$(ASCEND_SOC_VERSION)" \
+		-DRUN_MODE=npu \
+		-DCMAKE_BUILD_TYPE=Release
+	@$(CMAKE) --build "$(ASCEND_KERNEL_BUILD_DIR)" \
+		--target flagcx_ascend_unirunner
+else
 $(OBJDIR)/kernel_dlink.o: $(DEVOBJ)
 	@$(DEVICE_LINKER) -dlink $^ -o $@ $(DEVICE_LINK) $(DEVICE_LINK_FLAG)
 
@@ -433,6 +477,7 @@ $(OBJDIR)/%.o: %.$(DEVICE_FILE_EXTENSION)
 	@mkdir -p `dirname $@`
 	@echo "Compiling $@ ($(DEVICE_PLATFORM))"
 	@$(DEVICE_COMPILER) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) $(addprefix -I,$(DEVICE_INCLUDE)) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(DEVICE_COMPILE_FLAG) $(COMPILE_KERNEL_FLAG) -g
+endif
 endif
 
 ifeq ($(COMPILE_KERNEL), 1)
@@ -445,8 +490,12 @@ INSTALLDIR := /usr/local/lib
 install:
 	@mkdir -p $(DESTDIR)
 	@cp $(LIBDIR)/$(TARGET) $(DESTDIR)/$(TARGET)
+ifeq ($(COMPILE_KERNEL)$(USE_ASCEND),11)
+	@cp $(ASCEND_KERNEL_LIB) $(DESTDIR)/
+endif
 	@mkdir -p $(INC_DESTDIR)
 	@cp $(PUBLIC_HEADERS) $(INC_DESTDIR)/
 
 clean:
-	@rm -rf $(LIBDIR)/$(TARGET) $(DESTDIR)/$(TARGET) $(BUILD_INCDIR) $(OBJDIR)
+	@rm -rf $(LIBDIR)/$(TARGET) $(DESTDIR)/$(TARGET) \
+		$(ASCEND_KERNEL_CLEAN) $(BUILD_INCDIR) $(OBJDIR)

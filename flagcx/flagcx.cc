@@ -1069,8 +1069,12 @@ flagcxResult_t flagcxCommRegister(const flagcxComm_t comm, void *buff,
     return flagcxSuccess;
   }
 
-  // Step 2b: Create IPC handle for the buffer (hetero path only)
-  // Write-once: if localIpcHandleData is already populated, skip
+  // Step 2b: Create IPC handle for the buffer (hetero path only).
+  // Ascend UniRunner deliberately acquires a per-invocation exporter
+  // reference in buildIpcPeerPointers and does not consume this cached key.
+  // Avoid creating an otherwise ownerless ACL exporter here.
+#ifndef USE_ASCEND_ADAPTOR
+  // Write-once: if localIpcHandleData is already populated, skip.
   {
     char zeros[sizeof(flagcxIpcHandleData)] = {};
     if (memcmp(&regItem->localIpcHandleData, zeros,
@@ -1091,9 +1095,11 @@ flagcxResult_t flagcxCommRegister(const flagcxComm_t comm, void *buff,
         goto fail;
       }
       memcpy(&regItem->localIpcHandleData, handlePtr, ipcSize);
+      regItem->ipcExportBase = reinterpret_cast<uintptr_t>(buff);
       deviceAdaptor->ipcMemHandleFree(handlePtr);
     }
   }
+#endif
 
   // Step 3: One-sided MR registration (hetero path only)
   {
@@ -2038,11 +2044,28 @@ flagcxResult_t flagcxCommFinalize(flagcxComm_t comm) {
 flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
   FLAGCXCHECK(flagcxEnsureCommReady(comm));
 
+#ifdef USE_ASCEND_ADAPTOR
+  // CommDestroy is specified as a local, non-blocking teardown. ACL IPC
+  // exporter close, however, requires every importer to have closed first.
+  // Ascend UniRunner performs that ordered collective cleanup per invocation.
+  // Refuse teardown before mutating the communicator if an exceptional or
+  // non-UniRunner Device-API path left mappings behind.
+  for (int index = 0; index < FLAGCX_MAX_IPC_ENTRIES; ++index) {
+    const flagcxIpcTableEntry *entry = &comm->ipcTable[index];
+    if (entry->hostPeerPtrs != nullptr ||
+        entry->devPeerPtrs != nullptr || entry->basePtr != nullptr) {
+      WARN("flagcxCommDestroy: Ascend IPC table entry %d is still live; "
+           "the owning collective must release it before local destroy",
+           index);
+      return flagcxInvalidUsage;
+    }
+  }
+#endif
+
   // Destroy cluster info
   free(comm->clusterIds);
   free(comm->clusterSizes);
   free(comm->globalRank2HomoRank);
-  free(comm->localRankToRank);
   free(comm->c2cSchedule);
   free(comm->clusterInterRanks);
 
@@ -2085,6 +2108,10 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
 
   // Clean up IPC peer pointer table — deferred to here.
   FLAGCXCHECK(flagcxCommCleanupIpcTable(comm));
+  // Ascend IPC teardown performs an intra-node barrier through this mapping.
+  // Keep it alive until every imported mapping and local export is closed.
+  free(comm->localRankToRank);
+  comm->localRankToRank = nullptr;
 
   // Drain deferred DevComm buffer queue.
   FLAGCXCHECK(flagcxCommDrainDeferredBuffers(comm));

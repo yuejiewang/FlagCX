@@ -43,19 +43,59 @@ flagcxResult_t uniRunnerReduce(const void *sendbuff, void *recvbuff,
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   void *scratchbuff = nullptr;
   size_t scratchBytes = 0;
+#ifdef USE_ASCEND_ADAPTOR
+  bool runnerInitialized = false;
+  bool scratchSafeToFree = false;
+#endif
   FLAGCXCHECK(validateUniRunnerReduceArgs(count, datatype, op));
+#ifdef USE_ASCEND_ADAPTOR
+  if (count == 0)
+    return flagcxSuccess;
+#endif
   FLAGCXCHECK(checkedUniRunnerTypeBytes(count, 2, datatype, &scratchBytes));
+#ifdef USE_ASCEND_ADAPTOR
+  res = initUniRunner(comm, stream);
+  if (res != flagcxSuccess)
+    return res;
+  runnerInitialized = true;
+  res = deviceAdaptor->deviceMalloc(&scratchbuff, scratchBytes,
+                                    flagcxMemDevice, stream);
+  if (res != flagcxSuccess)
+    goto out;
+#else
   FLAGCXCHECK(deviceAdaptor->deviceMalloc(&scratchbuff, scratchBytes,
                                           flagcxMemDevice, stream));
   FLAGCXCHECKGOTO(initUniRunner(comm, stream), res, out);
+#endif
   FLAGCXCHECKGOTO(initUniRunnerStateTreeRed(runnerState, sendbuff, recvbuff,
                                             scratchbuff, count, datatype, op,
                                             root, comm),
                   res, out);
   FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
 out:
+#ifdef USE_ASCEND_ADAPTOR
+  if (runnerInitialized) {
+    flagcxResult_t cleanupRes = cleanupUniRunner(comm);
+    if (cleanupRes != flagcxSuccess) {
+      res = cleanupRes;
+    } else {
+      scratchSafeToFree = true;
+    }
+  }
+  if (scratchbuff != nullptr && scratchSafeToFree) {
+    flagcxResult_t freeRes =
+        deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream);
+    if (freeRes != flagcxSuccess)
+      res = freeRes;
+  } else if (scratchbuff != nullptr) {
+    WARN("Ascend UniRunner: retaining Reduce scratch buffer %p after "
+         "stream/cleanup failure",
+         scratchbuff);
+  }
+#else
   FLAGCXCHECK(deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream));
   FLAGCXCHECK(cleanupUniRunner(comm));
+#endif
   return res;
 }
 
@@ -125,37 +165,110 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
   flagcxResult_t res = flagcxSuccess;
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  const void *runnerSendbuff = sendbuff;
+#ifdef USE_ASCEND_ADAPTOR
+  void *stagedSendbuff = nullptr;
+  size_t stagedBytes = 0;
+  bool runnerInitialized = false;
+  bool stagedSafeToFree = false;
+#endif
   FLAGCXCHECK(validateUniRunnerReduceArgs(count, datatype, op));
+#ifdef USE_ASCEND_ADAPTOR
+  if (count == 0)
+    return flagcxSuccess;
+  if (sendbuff == recvbuff && count != 0) {
+    FLAGCXCHECK(
+        checkedUniRunnerTypeBytes(count, 1, datatype, &stagedBytes));
+  }
+  res = initUniRunner(comm, stream);
+  if (res != flagcxSuccess)
+    goto out;
+  runnerInitialized = true;
+
+  // The existing SlicedAR topology receives peer chunks into recvbuff before
+  // their local reduction reads sendbuff. Preserve the public in-place
+  // contract by snapshotting the original input; this also makes IPCAR's
+  // capability fallback to SlicedAR safe without changing either DAG.
+  if (sendbuff == recvbuff && count != 0) {
+    res = deviceAdaptor->deviceMalloc(&stagedSendbuff, stagedBytes,
+                                      flagcxMemDevice, stream);
+    if (res != flagcxSuccess)
+      goto out;
+    res = deviceAdaptor->deviceMemcpy(
+        stagedSendbuff, const_cast<void *>(sendbuff), stagedBytes,
+        flagcxMemcpyDeviceToDevice, stream, NULL);
+    if (res != flagcxSuccess)
+      goto out;
+    runnerSendbuff = stagedSendbuff;
+  }
+#else
   FLAGCXCHECK(initUniRunner(comm, stream));
+#endif
   if (flagcxParamUniRunnerUseIpcAR()) {
     /* Sliced AllReduce with intra-node IPC/LSA push transport. */
-    FLAGCXCHECKGOTO(initUniRunnerStateIpcAR(runnerState, sendbuff, recvbuff,
-                                            count, datatype, op, comm),
+    FLAGCXCHECKGOTO(initUniRunnerStateIpcAR(runnerState, runnerSendbuff,
+                                            recvbuff, count, datatype, op,
+                                            comm),
                     res, out);
   } else if (flagcxParamUniRunnerUseLocRed()) {
     /* initialize uniRunnerState for reduce test */
-    FLAGCXCHECKGOTO(initUniRunnerStateLocRed(runnerState, sendbuff, recvbuff,
-                                             count, datatype, op, comm),
+    FLAGCXCHECKGOTO(initUniRunnerStateLocRed(runnerState, runnerSendbuff,
+                                             recvbuff, count, datatype, op,
+                                             comm),
                     res, out);
   } else if (flagcxParamUniRunnerUseRingAG()) {
     /* initialize uniRunnerState for p2p test */
-    FLAGCXCHECKGOTO(initUniRunnerStateRingAG(runnerState, sendbuff, recvbuff,
-                                             count, datatype, op, comm),
+    FLAGCXCHECKGOTO(initUniRunnerStateRingAG(runnerState, runnerSendbuff,
+                                             recvbuff, count, datatype, op,
+                                             comm),
                     res, out);
   } else if (flagcxParamUniRunnerUseSlicedAR()) {
     /* initialize uniRunnerState for sliced AllReduce */
-    FLAGCXCHECKGOTO(initUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff,
-                                               count, datatype, op, comm),
+    FLAGCXCHECKGOTO(initUniRunnerStateSlicedAR(
+                        runnerState, runnerSendbuff, recvbuff, count, datatype,
+                        op, comm),
                     res, out);
   } else {
     /* initialize uniRunnerState for ring AllReduce */
-    FLAGCXCHECKGOTO(initUniRunnerStateRingAR(runnerState, sendbuff, recvbuff,
-                                             count, datatype, op, comm),
+    FLAGCXCHECKGOTO(initUniRunnerStateRingAR(runnerState, runnerSendbuff,
+                                             recvbuff, count, datatype, op,
+                                             comm),
                     res, out);
   }
   FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
 out:
+#ifdef USE_ASCEND_ADAPTOR
+  if (runnerInitialized) {
+    flagcxResult_t cleanupRes = cleanupUniRunner(comm);
+    if (cleanupRes != flagcxSuccess) {
+      res = cleanupRes;
+    } else {
+      stagedSafeToFree = true;
+    }
+  } else if (stagedSendbuff != nullptr) {
+    // The staging copy is asynchronous on the user stream. If runner
+    // initialization failed before normal cleanup could synchronize it, wait
+    // before releasing the temporary allocation.
+    flagcxResult_t syncRes = deviceAdaptor->streamSynchronize(stream);
+    if (syncRes != flagcxSuccess) {
+      res = syncRes;
+    } else {
+      stagedSafeToFree = true;
+    }
+  }
+  if (stagedSendbuff != nullptr && stagedSafeToFree) {
+    flagcxResult_t freeRes =
+        deviceAdaptor->deviceFree(stagedSendbuff, flagcxMemDevice, stream);
+    if (freeRes != flagcxSuccess)
+      res = freeRes;
+  } else if (stagedSendbuff != nullptr) {
+    WARN("Ascend UniRunner: retaining in-place staging buffer %p after "
+         "stream/cleanup failure",
+         stagedSendbuff);
+  }
+#else
   FLAGCXCHECK(cleanupUniRunner(comm));
+#endif
   return res;
 }
 
@@ -169,20 +282,60 @@ flagcxResult_t uniRunnerReduceScatter(const void *sendbuff, void *recvbuff,
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   void *scratchbuff = nullptr;
   size_t scratchBytes = 0;
+#ifdef USE_ASCEND_ADAPTOR
+  bool runnerInitialized = false;
+  bool scratchSafeToFree = false;
+#endif
   FLAGCXCHECK(validateUniRunnerReduceArgs(recvcount, datatype, op));
+#ifdef USE_ASCEND_ADAPTOR
+  if (recvcount == 0)
+    return flagcxSuccess;
+#endif
   FLAGCXCHECK(checkedUniRunnerTypeBytes(recvcount, comm->nranks, datatype,
                                         &scratchBytes));
+#ifdef USE_ASCEND_ADAPTOR
+  res = initUniRunner(comm, stream);
+  if (res != flagcxSuccess)
+    return res;
+  runnerInitialized = true;
+  res = deviceAdaptor->deviceMalloc(&scratchbuff, scratchBytes,
+                                    flagcxMemDevice, stream);
+  if (res != flagcxSuccess)
+    goto out;
+#else
   FLAGCXCHECK(deviceAdaptor->deviceMalloc(&scratchbuff, scratchBytes,
                                           flagcxMemDevice, stream));
   FLAGCXCHECKGOTO(initUniRunner(comm, stream), res, out);
+#endif
   FLAGCXCHECKGOTO(initUniRunnerStateRingRS(runnerState, sendbuff, recvbuff,
                                            scratchbuff, recvcount, datatype, op,
                                            comm),
                   res, out);
   FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
 out:
+#ifdef USE_ASCEND_ADAPTOR
+  if (runnerInitialized) {
+    flagcxResult_t cleanupRes = cleanupUniRunner(comm);
+    if (cleanupRes != flagcxSuccess) {
+      res = cleanupRes;
+    } else {
+      scratchSafeToFree = true;
+    }
+  }
+  if (scratchbuff != nullptr && scratchSafeToFree) {
+    flagcxResult_t freeRes =
+        deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream);
+    if (freeRes != flagcxSuccess)
+      res = freeRes;
+  } else if (scratchbuff != nullptr) {
+    WARN("Ascend UniRunner: retaining ReduceScatter scratch buffer %p after "
+         "stream/cleanup failure",
+         scratchbuff);
+  }
+#else
   FLAGCXCHECK(deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream));
   FLAGCXCHECK(cleanupUniRunner(comm));
+#endif
   return res;
 }
 
