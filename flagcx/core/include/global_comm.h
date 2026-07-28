@@ -124,6 +124,13 @@ struct flagcxComm {
 
   // Custom op state (NULL = not enabled)
   struct flagcxDevCommState *devCommState;
+
+#ifdef USE_ASCEND_ADAPTOR
+  // Opaque, lazily initialized HCOMM/HCCS resources used by the Ascend
+  // UniRunner AlltoAll path. HCCL owns the acquired thread/channel handles;
+  // FlagCX owns the ACL stream stored in this state.
+  void *ascendHccsState;
+#endif
 };
 
 // Function helps init single homo cluster.

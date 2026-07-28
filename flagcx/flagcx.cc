@@ -21,6 +21,7 @@
 #include "sym_heap.h"
 #include "timer.h"
 #include "transport.h"
+#include "uni_runner_ascend.h"
 #include "utils.h"
 #include <cassert>
 #include <stdio.h>
@@ -1646,6 +1647,9 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
   (*comm)->homoInterComm = NULL;
   (*comm)->c2cSchedule = NULL;
   (*comm)->devCommState = NULL;
+#ifdef USE_ASCEND_ADAPTOR
+  (*comm)->ascendHccsState = NULL;
+#endif
   flagcxIntruQueueConstruct(&(*comm)->deferredBufferQueue);
   (*comm)->deferredBufferCount = 0;
 
@@ -2073,18 +2077,52 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
   // needs the NCCL comm to still be alive.
   FLAGCXCHECK(flagcxDevCommStateDestroy(comm));
 
+#ifdef USE_ASCEND_ADAPTOR
+  // HCOMM ThreadHandle and ChannelHandle objects belong to HCCL and remain
+  // associated with their ACL stream until HcclCommDestroy. Drain work now,
+  // then destroy the FlagCX-owned stream after the HCCL communicator.
+  flagcxResult_t ascendHccsDestroyResult =
+      flagcxAscendUniRunnerHccsPrepareDestroy(comm);
+#endif
+
   // Destroy homo comms
   if (comm->tuner) {
     for (const auto &item : comm->homoCommMap) {
       if (item.second != nullptr) {
+#ifdef USE_ASCEND_ADAPTOR
+        flagcxResult_t destroyResult =
+            cclAdaptors[flagcxCCLAdaptorDevice]->commDestroy(item.second);
+        if (ascendHccsDestroyResult == flagcxSuccess)
+          ascendHccsDestroyResult = destroyResult;
+#else
         FLAGCXCHECK(
             cclAdaptors[flagcxCCLAdaptorDevice]->commDestroy(item.second));
+#endif
       }
     }
   } else {
+#ifdef USE_ASCEND_ADAPTOR
+    flagcxResult_t destroyResult =
+        cclAdaptors[flagcxCCLAdaptorDevice]->commDestroy(comm->homoComm);
+    if (ascendHccsDestroyResult == flagcxSuccess)
+      ascendHccsDestroyResult = destroyResult;
+#else
     FLAGCXCHECK(
         cclAdaptors[flagcxCCLAdaptorDevice]->commDestroy(comm->homoComm));
+#endif
   }
+
+#ifdef USE_ASCEND_ADAPTOR
+  // Finish is best-effort even when stream drain or HCCL teardown failed.
+  // Preserve the first error, but defer reporting it until the remaining
+  // communicator-owned resources have been released.
+  {
+    flagcxResult_t finishResult =
+        flagcxAscendUniRunnerHccsFinishDestroy(comm);
+    if (ascendHccsDestroyResult == flagcxSuccess)
+      ascendHccsDestroyResult = finishResult;
+  }
+#endif
 
   if (!useHomoComm(comm)) {
     // Tear down inter-node signal relay first: drains FIFOs and closes RDMA
@@ -2139,7 +2177,11 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
   flagcxDeviceAdaptorPluginFinalize();
 
   free(comm);
+#ifdef USE_ASCEND_ADAPTOR
+  return ascendHccsDestroyResult;
+#else
   return flagcxSuccess;
+#endif
 }
 
 flagcxResult_t flagcxCommAbort(flagcxComm_t comm) {

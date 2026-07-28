@@ -40,6 +40,17 @@ where `<backend>` is one of:
 
 Note that Option A also supports `<backend>=1`, allowing users to explicitly specify the backend. Otherwise, it will be selected automatically.
 
+Ascend builds that enable the UniRunner HCCS Alltoall path require the
+matching CANN 9.0.0-beta.1 `hccl`, `hcomm`, and `c_sec` libraries plus the
+driver `ascend_hal` library. `ASCEND_HOME_PATH` selects the CANN installation
+and `ASCEND_DRIVER_HOME` selects the driver installation (default:
+`/usr/local/Ascend/driver`). The direct CPU_TS HCOMM submission path fails
+instead of running on an unverified CANN version; newer releases may have a
+different submission or batching contract and need separate validation.
+The current correctness-first implementation uses two complete HCOMM batches
+per chunk to establish a visible staging boundary, so it sends one priming
+transfer in addition to the payload transfer.
+
 ## Tests
 
 ### Performance Test

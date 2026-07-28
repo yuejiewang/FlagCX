@@ -5,6 +5,7 @@
 #include "flagcx_hetero.h"
 #include "proxy.h"
 #include "runner.h"
+#include "uni_runner_ascend.h"
 #include "uni_runner_impl.h"
 
 FLAGCX_PARAM(UniRunnerUseLocRed, "UNIRUNNER_USE_LOCRED", 0);
@@ -13,6 +14,9 @@ FLAGCX_PARAM(UniRunnerUseSlicedAR, "UNIRUNNER_USE_SLICEDAR", 0);
 FLAGCX_PARAM(UniRunnerUseIpcAR, "UNIRUNNER_USE_IPCAR", 0);
 FLAGCX_PARAM(UniRunnerUseGroupedAG, "UNIRUNNER_USE_GROUPEDAG", 1);
 FLAGCX_PARAM(UniRunnerGroupSize, "UNIRUNNER_GROUPSIZE", 0);
+#ifdef USE_ASCEND_ADAPTOR
+FLAGCX_PARAM(UniRunnerUseHccsA2A, "UNIRUNNER_USE_HCCSA2A", 0);
+#endif
 
 static int resolveUniRunnerGroupedAGGroupSize(flagcxComm_t comm) {
   if (comm->nranks <= 0) {
@@ -376,6 +380,17 @@ out:
 flagcxResult_t uniRunnerAlltoAll(const void *sendbuff, void *recvbuff,
                                  size_t count, flagcxDataType_t datatype,
                                  flagcxComm_t comm, flagcxStream_t stream) {
+#ifdef USE_ASCEND_ADAPTOR
+  if (flagcxParamUniRunnerUseHccsA2A()) {
+    if (flagcxGroupDepth != 0) {
+      WARN("Ascend UniRunner HCCS AlltoAll does not support FlagCX group "
+           "capture; refusing to fall back to another transport");
+      return flagcxNotSupported;
+    }
+    return flagcxAscendUniRunnerHccsAlltoAll(sendbuff, recvbuff, count,
+                                             datatype, comm, stream);
+  }
+#endif
   size_t size = count * getFlagcxDataTypeSize(datatype);
   const char *bufferIn = static_cast<const char *>(sendbuff);
   char *bufferOut = static_cast<char *>(recvbuff);

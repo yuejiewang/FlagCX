@@ -4,8 +4,10 @@
 
 #include "adaptor.h"
 #include "alloc.h"
+#include "driver/ascend_hal.h"
 
 #include <array>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -230,6 +232,76 @@ flagcxResult_t cannAdaptorGetDeviceCount(int *count) {
 flagcxResult_t cannAdaptorGetVendor(char *vendor) {
   strcpy(vendor, "ASCEND");
   return flagcxSuccess;
+}
+
+static flagcxResult_t cannAdaptorGetPciBdf(int dev, uint64_t *bdf) {
+  if (dev < 0 || bdf == nullptr)
+    return flagcxInvalidArgument;
+
+  int64_t value = 0;
+  const drvError_t result =
+      halGetDeviceInfo(static_cast<uint32_t>(dev), MODULE_TYPE_PCIE,
+                       INFO_TYPE_ID, &value);
+  if (result != 0 || value < 0) {
+    WARN("CANN halGetDeviceInfo PCI BDF failed for logical device %d: "
+         "result=%d value=%ld",
+         dev, static_cast<int>(result), static_cast<long>(value));
+    return flagcxUnhandledDeviceError;
+  }
+  *bdf = static_cast<uint64_t>(value);
+  return flagcxSuccess;
+}
+
+flagcxResult_t cannAdaptorGetDevicePciBusId(char *pciBusId, int len, int dev) {
+  if (pciBusId == nullptr || len <= 0)
+    return flagcxInvalidArgument;
+
+  uint64_t bdf = 0;
+  FLAGCXCHECK(cannAdaptorGetPciBdf(dev, &bdf));
+  const unsigned int domain = static_cast<unsigned int>((bdf >> 16) & 0xffff);
+  const unsigned int bus = static_cast<unsigned int>((bdf >> 8) & 0xff);
+  const unsigned int device = static_cast<unsigned int>((bdf >> 3) & 0x1f);
+  const unsigned int function = static_cast<unsigned int>(bdf & 0x7);
+  const int written = snprintf(pciBusId, static_cast<size_t>(len),
+                               "%04x:%02x:%02x.%01x", domain, bus, device,
+                               function);
+  return written >= 0 && written < len ? flagcxSuccess
+                                      : flagcxInvalidArgument;
+}
+
+flagcxResult_t cannAdaptorGetDeviceByPciBusId(int *dev,
+                                              const char *pciBusId) {
+  if (dev == nullptr || pciBusId == nullptr)
+    return flagcxInvalidArgument;
+
+  unsigned int domain = 0;
+  unsigned int bus = 0;
+  unsigned int device = 0;
+  unsigned int function = 0;
+  int consumed = 0;
+  if (sscanf(pciBusId, "%x:%x:%x.%x%n", &domain, &bus, &device, &function,
+             &consumed) != 4 ||
+      pciBusId[consumed] != '\0' ||
+      domain > 0xffff || bus > 0xff || device > 0x1f || function > 0x7)
+    return flagcxInvalidArgument;
+  const uint64_t expected = (static_cast<uint64_t>(domain) << 16) |
+                            (static_cast<uint64_t>(bus) << 8) |
+                            (static_cast<uint64_t>(device) << 3) | function;
+
+  int count = 0;
+  FLAGCXCHECK(cannAdaptorGetDeviceCount(&count));
+  for (int candidate = 0; candidate < count; ++candidate) {
+    uint64_t candidateBdf = 0;
+    flagcxResult_t result =
+        cannAdaptorGetPciBdf(candidate, &candidateBdf);
+    if (result != flagcxSuccess)
+      return result;
+    if (candidateBdf == expected) {
+      *dev = candidate;
+      return flagcxSuccess;
+    }
+  }
+  return flagcxInvalidArgument;
 }
 
 flagcxResult_t cannAdaptorHostGetDevicePointer(void **pDevice, void *pHost) {
@@ -672,11 +744,8 @@ struct flagcxDeviceAdaptor cannAdaptor {
       // Others
       NULL, // flagcxResult_t (*getDeviceProperties)(struct flagcxDevProps
             // *props, int dev);
-      NULL, // flagcxResult_t (*getDevicePciBusId)(char
-            // *pciBusId, int len, int dev);
-      NULL, // flagcxResult_t
-            // (*getDeviceByPciBusId)(int
-            // *dev, const char *pciBusId);
+      cannAdaptorGetDevicePciBusId,
+      cannAdaptorGetDeviceByPciBusId,
       cannAdaptorLaunchHostFunc,
       // DMA buffer
       NULL, // flagcxResult_t (*dmaSupport)(bool *dmaBufferSupport);

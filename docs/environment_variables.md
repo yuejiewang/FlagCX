@@ -136,6 +136,9 @@ This document provides a comprehensive reference for all environment variables u
 | `FLAGCX_UNIRUNNER_USE_RINGAG` | 0 | When set to 1, uses ring allgather in uniRunner |
 | `FLAGCX_UNIRUNNER_USE_SLICEDAR` | 0 | When set to 1, uses sliced allreduce in uniRunner |
 | `FLAGCX_UNIRUNNER_USE_IPCAR` | 0 | When set to 1, uses intra-node IPC push for uniRunner sliced allreduce |
+| `FLAGCX_UNIRUNNER_USE_HCCSA2A` | 0 | Ascend CANN 9.0.0-beta.1 only: force UniRunner AlltoAll for two or more homogeneous, intra-node ranks through HCOMM channels explicitly constrained to HCCS. Requires `FLAGCX_USE_HETERO_COMM=1` plus matching `libhcomm`/`libc_sec`; fails instead of falling back when HCCS or the validated CANN submission contract is unavailable |
+| `FLAGCX_UNIRUNNER_HCCS_CHUNK_BYTES` | 16777216 | Ascend HCCS AlltoAll staging chunk size. The effective size is bounded by the per-rank HCCL buffer slot |
+| `FLAGCX_UNIRUNNER_HCCS_TIMEOUT_MS` | 30000 | Finite timeout in milliseconds for each HCOMM channel notification wait |
 | `FLAGCX_UNIRUNNER_NREDSLICES` | 0 | Number of reduction slices for uniRunner (0 = auto) |
 | `FLAGCX_UNIRUNNER_REDSLICESIZE` | 65536 | Reduction slice size in bytes for uniRunner |
 

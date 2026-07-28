@@ -23,6 +23,7 @@ USE_ENFLAME ?= 0
 USE_SUNRISE ?= 0
 COMPILE_KERNEL ?= 0
 ASCEND_SOC_VERSION ?= $(SOC_VERSION)
+ASCEND_DRIVER_HOME ?= /usr/local/Ascend/driver
 CMAKE ?= cmake
 
 # set to empty if not provided
@@ -160,10 +161,15 @@ else ifeq ($(USE_ASCEND), 1)
 	DEVICE_LIB = $(DEVICE_HOME)/lib64
 	DEVICE_INCLUDE = $(DEVICE_HOME)/include
 	# CANN 9.x publishes the acl/acl_rt.h runtime ABI from libacl_rt.so.
-	DEVICE_LINK = -lacl_rt
+	DEVICE_LINK = -lacl_rt \
+		-L$(ASCEND_DRIVER_HOME)/lib64/driver \
+		-Wl,-rpath,$(ASCEND_DRIVER_HOME)/lib64/driver \
+		-lascend_hal
 	CCL_LIB = $(CCL_HOME)/lib64
 	CCL_INCLUDE = $(CCL_HOME)/include
-	CCL_LINK = -lhccl
+	# UniRunner's HCCS AlltoAll path uses the communication-operator
+	# primitives exported by libhcomm in addition to the HCCL control plane.
+	CCL_LINK = -lhccl -lhcomm -lc_sec
 	ADAPTOR_FLAG = -DUSE_ASCEND_ADAPTOR
 ifeq ($(COMPILE_KERNEL), 1)
 	# The CMake-built launcher library stays next to its target-specific
