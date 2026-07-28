@@ -41,6 +41,8 @@ static int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size,
   struct IpcBuildExchange {
     struct flagcxP2pIpcDesc desc;
     int result;
+    int32_t processId;
+    int device;
   };
 
   if (buildResult != nullptr)
@@ -69,6 +71,12 @@ static int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size,
   bool localExportAcquired = false;
   bool collectiveFailureDecision = false;
   bool peerImportsAttempted = false;
+  const bool hasIpcProcessIdHook =
+      deviceAdaptor->ipcMemGetProcessId != nullptr;
+  const bool hasIpcPidAuthorizationHook =
+      deviceAdaptor->ipcMemHandleSetImportPid != nullptr;
+  const bool needsExplicitPeerAccess =
+      deviceAdaptor->ipcMemEnablePeerAccess != nullptr;
 
   // Step 1: Get IPC handle for existing user buffer.
   // First check if globalRegPool has a pre-registered handle (from
@@ -136,6 +144,20 @@ static int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size,
     res = flagcxNotSupported;
   }
 
+  int32_t processId = -1;
+  int device = -1;
+  if (res == flagcxSuccess &&
+      hasIpcProcessIdHook != hasIpcPidAuthorizationHook) {
+    WARN("buildIpcPeerPointers: incomplete IPC process authorization hooks");
+    res = flagcxInternalError;
+  }
+  if (res == flagcxSuccess && hasIpcProcessIdHook) {
+    res = deviceAdaptor->ipcMemGetProcessId(&processId);
+  }
+  if (res == flagcxSuccess && needsExplicitPeerAccess) {
+    res = deviceAdaptor->getDevice(&device);
+  }
+
   // Step 2: Exchange IPC handles with all ranks. A local export failure must
   // still participate in this collective; returning before the all-gather
   // would strand peers that successfully exported their buffers.
@@ -148,11 +170,70 @@ static int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size,
   memcpy(&allExchanges[myRank].desc, &myIpcDesc,
          sizeof(struct flagcxP2pIpcDesc));
   allExchanges[myRank].result = static_cast<int>(res);
+  allExchanges[myRank].processId = processId;
+  allExchanges[myRank].device = device;
   FLAGCXCHECKGOTO(bootstrapCollAllGather(
                       comm->bootstrap, allExchanges,
                       sizeof(struct IpcBuildExchange)),
                   res, fail);
   for (int r = 0; r < nRanks; r++) {
+    flagcxResult_t peerResult =
+        static_cast<flagcxResult_t>(allExchanges[r].result);
+    if (peerResult != flagcxSuccess) {
+      collectiveFailureDecision = true;
+      res = peerResult;
+      goto fail;
+    }
+  }
+
+  // Some runtimes, notably Ascend ACL with the default IPC security policy,
+  // require two explicit setup phases before an importer may open a key:
+  // the exporter authorizes every local importing process, and each importer
+  // enables access to the exporting device. Complete both phases
+  // collectively so no rank enters ipcMemHandleOpen while a peer is still
+  // missing authorization.
+  if (hasIpcPidAuthorizationHook) {
+    std::vector<int32_t> peerProcessIds;
+    peerProcessIds.reserve(static_cast<size_t>(std::max(0, localRanks - 1)));
+    for (int lr = 0; lr < localRanks; ++lr) {
+      int gr = localRankToRank[lr];
+      if (gr == myRank)
+        continue;
+      if (allExchanges[gr].processId < 0) {
+        res = flagcxInternalError;
+        break;
+      }
+      peerProcessIds.push_back(allExchanges[gr].processId);
+    }
+    if (res == flagcxSuccess && !peerProcessIds.empty()) {
+      flagcxIpcMemHandle_t handlePtr =
+          (flagcxIpcMemHandle_t)&myIpcDesc.handleData;
+      res = deviceAdaptor->ipcMemHandleSetImportPid(
+          handlePtr, peerProcessIds.data(), peerProcessIds.size());
+    }
+  }
+  if (res == flagcxSuccess && needsExplicitPeerAccess) {
+    for (int lr = 0; lr < localRanks; ++lr) {
+      int gr = localRankToRank[lr];
+      if (gr == myRank)
+        continue;
+      if (allExchanges[gr].device < 0) {
+        res = flagcxInternalError;
+        break;
+      }
+      res = deviceAdaptor->ipcMemEnablePeerAccess(
+          allExchanges[gr].device);
+      if (res != flagcxSuccess)
+        break;
+    }
+  }
+
+  allExchanges[myRank].result = static_cast<int>(res);
+  FLAGCXCHECKGOTO(bootstrapCollAllGather(
+                      comm->bootstrap, allExchanges,
+                      sizeof(struct IpcBuildExchange)),
+                  res, fail);
+  for (int r = 0; r < nRanks; ++r) {
     flagcxResult_t peerResult =
         static_cast<flagcxResult_t>(allExchanges[r].result);
     if (peerResult != flagcxSuccess) {
@@ -247,7 +328,7 @@ fail:
   // closes are nulled so an exceptional retry never closes them twice.
   if (hostPeerPtrs) {
     for (int i = 0; i < localRanks; i++) {
-      if (hostPeerPtrs[i] && hostPeerPtrs[i] != buff) {
+      if (hostPeerPtrs[i] && i != comm->localRank) {
         flagcxResult_t closeRes =
             deviceAdaptor->ipcMemHandleClose(hostPeerPtrs[i]);
         if (closeRes == flagcxSuccess)
@@ -258,7 +339,7 @@ fail:
     }
     bool allImportsClosed = true;
     for (int i = 0; i < localRanks; i++) {
-      if (hostPeerPtrs[i] && hostPeerPtrs[i] != buff) {
+      if (hostPeerPtrs[i] && i != comm->localRank) {
         allImportsClosed = false;
         break;
       }
@@ -1182,7 +1263,7 @@ extern "C" flagcxResult_t flagcxDevCommDestroy(flagcxComm_t comm,
     struct flagcxIpcTableEntry *e = &comm->ipcTable[devComm->barrierIpcIndex];
     if (e->hostPeerPtrs) {
       for (int i = 0; i < e->nPeers; i++) {
-        if (e->hostPeerPtrs[i] && e->hostPeerPtrs[i] != e->basePtr)
+        if (e->hostPeerPtrs[i] && i != comm->localRank)
           deviceAdaptor->ipcMemHandleClose(e->hostPeerPtrs[i]);
       }
       free(e->hostPeerPtrs);
@@ -1690,7 +1771,7 @@ flagcxResult_t flagcxCommCleanupIpcTable(flagcxComm_t comm) {
     // Close IPC handles
     if (e->hostPeerPtrs) {
       for (int i = 0; i < e->nPeers; i++) {
-        if (e->hostPeerPtrs[i] && e->hostPeerPtrs[i] != e->basePtr) {
+        if (e->hostPeerPtrs[i] && i != comm->localRank) {
           flagcxResult_t closeRes =
               deviceAdaptor->ipcMemHandleClose(e->hostPeerPtrs[i]);
           if (closeRes == flagcxSuccess)
@@ -1701,7 +1782,7 @@ flagcxResult_t flagcxCommCleanupIpcTable(flagcxComm_t comm) {
       }
       bool allImportsClosed = true;
       for (int i = 0; i < e->nPeers; i++) {
-        if (e->hostPeerPtrs[i] && e->hostPeerPtrs[i] != e->basePtr) {
+        if (e->hostPeerPtrs[i] && i != comm->localRank) {
           allImportsClosed = false;
           break;
         }
@@ -1807,7 +1888,7 @@ flagcxResult_t flagcxCommCleanupIpcTable(flagcxComm_t comm) {
 
     if (e->hostPeerPtrs) {
       for (int i = 0; i < e->nPeers; i++) {
-        if (e->hostPeerPtrs[i] && e->hostPeerPtrs[i] != e->basePtr) {
+        if (e->hostPeerPtrs[i] && i != comm->localRank) {
           deviceAdaptor->ipcMemHandleClose(e->hostPeerPtrs[i]);
         }
       }

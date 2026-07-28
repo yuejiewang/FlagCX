@@ -243,12 +243,24 @@ struct flagcxDeviceAdaptor_latest {
   // Release the multicast object handle returned by symMulticastCreate.
   // Must be called after all ranks have torn down their mappings.
   flagcxResult_t (*symMulticastFree)(void *mcHandle);
+
+  // ---- Optional IPC peer-authorization functions ----
+  //
+  // Some runtimes require the exporter to authorize importer process IDs and
+  // the importer to enable access to the exporting device before opening an
+  // IPC handle. These hooks are NULL on runtimes whose IPC open operation
+  // performs those steps implicitly.
+  flagcxResult_t (*ipcMemGetProcessId)(int32_t *processId);
+  flagcxResult_t (*ipcMemHandleSetImportPid)(flagcxIpcMemHandle_t handle,
+                                             int32_t *processIds,
+                                             size_t count);
+  flagcxResult_t (*ipcMemEnablePeerAccess)(int peerDevice);
 };
 
 #define flagcxDeviceAdaptor flagcxDeviceAdaptor_latest
 
 // Upgrade a v1 plugin struct to latest in-place into dst.
-// Fields added beyond v1 (hostRegister, hostUnregister) are zeroed (NULL).
+// All fields added beyond v1 are zeroed (NULL).
 static inline void
 flagcxDeviceAdaptorUpgradeV1(const struct flagcxDeviceAdaptor_v1 *src,
                              struct flagcxDeviceAdaptor_latest *dst) {

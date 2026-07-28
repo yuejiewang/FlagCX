@@ -34,7 +34,8 @@ typedef enum {
   uniRunnerDagAlgoSlicedAR = 5,
   uniRunnerDagAlgoRingRS = 6,
   uniRunnerDagAlgoTreeRed = 7,
-  uniRunnerDagAlgoIpcAR = 8
+  uniRunnerDagAlgoIpcAR = 8,
+  uniRunnerDagAlgoIpcA2A = 9
 } uniRunnerDagAlgoType;
 
 // Cache key describing a reusable uniRunner DAG template.
@@ -158,7 +159,7 @@ typedef struct {
   size_t streamFlagsSize;
   size_t streamFlagsCapacity;
 
-  // IPC/LSA AllReduce runtime resources. User-buffer DevMem views are reused
+  // IPC/LSA collective runtime resources. User-buffer DevMem views are reused
   // while their base/size bindings remain unchanged; owned ready storage is
   // communicator scoped and reused with monotonically increasing epochs.
   flagcxComm_t ipcOwner;
@@ -168,6 +169,13 @@ typedef struct {
   const void *ipcInputBase;
   void *ipcOutputBase;
   size_t ipcDataBytes;
+  // True only when the corresponding allocation was offered to the
+  // communicator IPC builder. A raw local AlltoAll snapshot must never make
+  // cleanup claim an unrelated ipcTable entry that happens to use the same
+  // address.
+  bool ipcInputExportAttempted;
+  bool ipcOutputExportAttempted;
+  bool ipcReadyExportAttempted;
   void *ipcReadyBuffer;
   size_t ipcReadyCapacity;
   size_t ipcReadySlots;
@@ -204,6 +212,11 @@ flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
                                        size_t count,
                                        flagcxDataType_t datatype,
                                        flagcxRedOp_t op, flagcxComm_t comm);
+flagcxResult_t initUniRunnerStateIpcA2A(flagcxUniRunnerState *runnerState,
+                                       const void *sendbuff, void *recvbuff,
+                                       size_t count,
+                                       flagcxDataType_t datatype,
+                                       flagcxComm_t comm);
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,
@@ -226,6 +239,13 @@ flagcxResult_t validateUniRunnerReduceArgs(size_t count,
 flagcxResult_t checkedUniRunnerTypeBytes(size_t count, size_t multiplier,
                                          flagcxDataType_t datatype,
                                          size_t *bytes);
+#ifdef USE_ASCEND_ADAPTOR
+// Turn a rank-local IPC setup result into one collective decision before any
+// rank enters (or skips) the next IPC phase.
+flagcxResult_t agreeAscendUniRunnerIpcResult(
+    flagcxComm_t comm, flagcxResult_t localResult,
+    flagcxResult_t *collectiveResult);
+#endif
 
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm);
 flagcxResult_t

@@ -43,6 +43,11 @@ FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
 static flagcxResult_t ensureUniRunnerIpcDataViews(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm,
     const void *sendbuff, void *recvbuff, size_t bytes);
+#ifdef USE_ASCEND_ADAPTOR
+static flagcxResult_t ensureUniRunnerIpcA2ADataViews(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm,
+    const void *sendbuff, void *recvbuff, size_t bytes);
+#endif
 static flagcxResult_t ensureUniRunnerIpcReadyStorage(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm,
     size_t requiredSlots);
@@ -88,10 +93,10 @@ flagcxResult_t checkedUniRunnerTypeBytes(size_t count, size_t multiplier,
   if (bytes == NULL) {
     return flagcxInvalidArgument;
   }
-  flagcxResult_t validateRes =
-      validateUniRunnerReduceArgs(count, datatype, flagcxSum);
-  if (validateRes != flagcxSuccess) {
-    return validateRes;
+  // Byte-count validation is also used by copy-only collectives. Do not apply
+  // Ascend reduction arithmetic restrictions (notably FP64) here.
+  if (!isValidUniRunnerDataType(datatype)) {
+    return flagcxInvalidArgument;
   }
   const size_t typeSize = getFlagcxDataTypeSize(datatype);
   const size_t maxSize = std::numeric_limits<size_t>::max();
@@ -1948,6 +1953,115 @@ static int globalRankToLocalRank(flagcxComm_t comm, int globalRank) {
   return -1;
 }
 
+static flagcxResult_t buildUniRunnerStateIpcA2A(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxComm_t comm) {
+  if (runnerState == NULL || comm == NULL || comm->nranks < 2 ||
+      comm->rank < 0 || comm->rank >= comm->nranks || comm->localRank < 0 ||
+      comm->localRank >= comm->localRanks || comm->localRankToRank == NULL) {
+    return flagcxInvalidArgument;
+  }
+  if (comm->localRanks != comm->nranks) {
+    return flagcxNotSupported;
+  }
+
+  std::vector<bool> seenGlobalRanks(static_cast<size_t>(comm->nranks), false);
+  for (int localRank = 0; localRank < comm->localRanks; ++localRank) {
+    const int globalRank = comm->localRankToRank[localRank];
+    if (globalRank < 0 || globalRank >= comm->nranks ||
+        seenGlobalRanks[static_cast<size_t>(globalRank)]) {
+      return flagcxInternalError;
+    }
+    seenGlobalRanks[static_cast<size_t>(globalRank)] = true;
+  }
+  if (comm->localRankToRank[comm->localRank] != comm->rank) {
+    return flagcxInternalError;
+  }
+
+  size_t totalBytes = 0;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(
+      count, static_cast<size_t>(comm->nranks), datatype, &totalBytes));
+  if (totalBytes == 0 || sendbuff == NULL || recvbuff == NULL) {
+    return flagcxInvalidArgument;
+  }
+  const size_t blockBytes =
+      totalBytes / static_cast<size_t>(comm->nranks);
+  const int rank = comm->rank;
+  const int nranks = comm->nranks;
+  const int numRemotePeers = nranks - 1;
+  const size_t totalNodes = static_cast<size_t>(numRemotePeers) + 1;
+  if (totalNodes > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return flagcxInvalidArgument;
+  }
+
+  runnerState->numDagNodes = static_cast<int>(totalNodes);
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                           totalNodes * sizeof(struct uniRunnerDagNode)));
+  if (runnerState->dagNodes == NULL) {
+    return flagcxSystemError;
+  }
+
+  // In cyclic step s every rank pushes its block for destination rank+s into
+  // that peer's imported receive-buffer pointer. The peer stores it at the
+  // offset for this source rank. The inverse peer writes our matching block in
+  // the same step, so a per-step epoch exchange also proves completion. The
+  // runUniRunner caller-stream all-gather is the entry barrier for all steps.
+  for (int step = 1; step < nranks; ++step) {
+    const int nodeIdx = step - 1;
+    const int peerLocalRank =
+        (comm->localRank + step) % comm->localRanks;
+    const int peerGlobalRank = comm->localRankToRank[peerLocalRank];
+
+    uniRunnerDagNode *ipcNode = &runnerState->dagNodes[nodeIdx];
+    ipcNode->nodeIdx = nodeIdx;
+    ipcNode->nodeType = uniRunnerDagNodeTypeIpc;
+    ipcNode->nodeData.ipc.srcOffsetBytes =
+        static_cast<size_t>(peerGlobalRank) * blockBytes;
+    ipcNode->nodeData.ipc.dstOffsetBytes =
+        static_cast<size_t>(rank) * blockBytes;
+    ipcNode->nodeData.ipc.bytes = blockBytes;
+    ipcNode->nodeData.ipc.srcBufferType = flagcxIpcBufferInput;
+    ipcNode->nodeData.ipc.peerLocalRank = peerLocalRank;
+    ipcNode->nodeData.ipc.readySlot = static_cast<uint32_t>(nodeIdx);
+    ipcNode->nodeData.ipc.parentFlagsOffset = 0;
+    ipcNode->nodeData.ipc.triggerIdx = -1;
+    ipcNode->numParents = nodeIdx == 0 ? 0 : 1;
+    ipcNode->numChildren = 1;
+    FLAGCXCHECK(allocDagNodeDeps(ipcNode));
+    if (nodeIdx == 0) {
+      flagcxIntruQueueEnqueue(&runnerState->ipcReadyQueue, ipcNode);
+    } else {
+      runnerState->numPendingNodes++;
+      FLAGCXCHECK(setDagNodeParent(ipcNode, 0, nodeIdx - 1));
+    }
+    ipcNode->children[0] = nodeIdx + 1;
+  }
+
+  const int cpyNodeIdx = numRemotePeers;
+  uniRunnerDagNode *cpyNode = &runnerState->dagNodes[cpyNodeIdx];
+  cpyNode->nodeIdx = cpyNodeIdx;
+  cpyNode->nodeType = uniRunnerDagNodeTypeCpy;
+  cpyNode->nodeData.cpy.src =
+      static_cast<char *>(const_cast<void *>(sendbuff)) +
+      static_cast<size_t>(rank) * blockBytes;
+  cpyNode->nodeData.cpy.dst =
+      static_cast<char *>(recvbuff) + static_cast<size_t>(rank) * blockBytes;
+  cpyNode->nodeData.cpy.count = count;
+  cpyNode->nodeData.cpy.datatype = datatype;
+  cpyNode->numParents = 1;
+  cpyNode->numChildren = 0;
+  FLAGCXCHECK(allocDagNodeDeps(cpyNode));
+  FLAGCXCHECK(setDagNodeParent(cpyNode, 0, cpyNodeIdx - 1));
+  runnerState->numPendingNodes++;
+
+  runnerState->ipcReadySlots = static_cast<size_t>(numRemotePeers);
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initialized ACL IPC peer-pointer AlltoAll DAG: ranks=%d "
+        "remote_steps=%d",
+        rank, nranks, numRemotePeers);
+  return validateDagNodes(runnerState);
+}
+
 static flagcxResult_t buildUniRunnerStateIpcAR(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
@@ -3031,6 +3145,57 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   });
 }
 
+flagcxResult_t initUniRunnerStateIpcA2A(flagcxUniRunnerState *runnerState,
+                                       const void *sendbuff, void *recvbuff,
+                                       size_t count,
+                                       flagcxDataType_t datatype,
+                                       flagcxComm_t comm) {
+  if (runnerState == NULL || comm == NULL || comm->nranks < 2 ||
+      comm->rank < 0 || comm->rank >= comm->nranks) {
+    return flagcxInvalidArgument;
+  }
+  runnerState->avgDivisor = 1;
+  if (runnerState->uniRunnerIpcChunkSize < 16 ||
+      runnerState->uniRunnerIpcChunkSize % 16 != 0) {
+    WARN("UniRunner IPCCHUNKSIZE must be a positive multiple of 16 bytes");
+    return flagcxInvalidArgument;
+  }
+
+  size_t totalBytes = 0;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(
+      count, static_cast<size_t>(comm->nranks), datatype, &totalBytes));
+  if (totalBytes == 0 || sendbuff == NULL || recvbuff == NULL) {
+    return flagcxInvalidArgument;
+  }
+
+  // IPC nodes carry live ACL-imported peer pointers, so this topology
+  // intentionally bypasses the static JSON DAG cache.
+  flagcxResult_t buildRes = buildUniRunnerStateIpcA2A(
+      runnerState, sendbuff, recvbuff, count, datatype, comm);
+#ifdef USE_ASCEND_ADAPTOR
+  flagcxResult_t collectiveBuildRes = flagcxSuccess;
+  FLAGCXCHECK(agreeAscendUniRunnerIpcResult(
+      comm, buildRes, &collectiveBuildRes));
+  if (collectiveBuildRes != flagcxSuccess) {
+    return collectiveBuildRes;
+  }
+#else
+  FLAGCXCHECK(buildRes);
+#endif
+
+#ifdef USE_ASCEND_ADAPTOR
+  // Export only the receive surface. Remote ranks write through its
+  // ACL-imported peer pointer; the send buffer is a raw local source.
+  FLAGCXCHECK(ensureUniRunnerIpcA2ADataViews(
+      runnerState, comm, sendbuff, recvbuff, totalBytes));
+#else
+  FLAGCXCHECK(ensureUniRunnerIpcDataViews(
+      runnerState, comm, sendbuff, recvbuff, totalBytes));
+#endif
+  return ensureUniRunnerIpcReadyStorage(runnerState, comm,
+                                        runnerState->ipcReadySlots);
+}
+
 flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
                                        const void *sendbuff, void *recvbuff,
                                        size_t count,
@@ -3305,6 +3470,8 @@ static flagcxResult_t destroyUniRunnerIpcDataViews(
   runnerState->ipcInputBase = NULL;
   runnerState->ipcOutputBase = NULL;
   runnerState->ipcDataBytes = 0;
+  runnerState->ipcInputExportAttempted = false;
+  runnerState->ipcOutputExportAttempted = false;
   return flagcxSuccess;
 }
 
@@ -3316,25 +3483,43 @@ static flagcxResult_t cleanupAscendUniRunnerIpcResources(
 
   flagcxComm_t comm = runnerState->ipcOwner;
   void *readyBuffer = runnerState->ipcReadyBuffer;
-  int ipcIndices[3] = {-1, -1, -1};
-  int ipcIndexCount = 0;
+  enum {
+    ipcInputRole = 0,
+    ipcOutputRole = 1,
+    ipcReadyRole = 2,
+    ipcRoleCount = 3
+  };
+  int roleIpcIndices[ipcRoleCount] = {-1, -1, -1};
   auto findIpcIndexByBase = [&](const void *base) {
     if (base == NULL)
       return -1;
-    int referencedMatch = -1;
     for (int index = 0; index < FLAGCX_MAX_IPC_ENTRIES; ++index) {
       if (comm->ipcTable[index].basePtr != base)
         continue;
       if (comm->ipcTable[index].refCount == 0)
         return index;
-      if (referencedMatch < 0)
-        referencedMatch = index;
     }
-    return referencedMatch;
+    return -1;
   };
-  int readyIpcIndex = runnerState->ipcReadyMem != NULL
-                          ? runnerState->ipcReadyMem->ipcIndex
-                          : findIpcIndexByBase(readyBuffer);
+  roleIpcIndices[ipcInputRole] =
+      runnerState->ipcInputMem != NULL
+          ? runnerState->ipcInputMem->ipcIndex
+          : (runnerState->ipcInputExportAttempted
+                 ? findIpcIndexByBase(runnerState->ipcInputBase)
+                 : -1);
+  roleIpcIndices[ipcOutputRole] =
+      runnerState->ipcOutputMem != NULL
+          ? runnerState->ipcOutputMem->ipcIndex
+          : (runnerState->ipcOutputExportAttempted
+                 ? findIpcIndexByBase(runnerState->ipcOutputBase)
+                 : -1);
+  roleIpcIndices[ipcReadyRole] =
+      runnerState->ipcReadyMem != NULL
+          ? runnerState->ipcReadyMem->ipcIndex
+          : (runnerState->ipcReadyExportAttempted
+                 ? findIpcIndexByBase(readyBuffer)
+                 : -1);
+  const int readyIpcIndex = roleIpcIndices[ipcReadyRole];
   auto retireRunnerState = [&](bool deferReadyBuffer) {
     if (deferReadyBuffer && readyBuffer != NULL) {
       // flagcxCommDeferFree frees immediately when its fixed-size list is
@@ -3355,6 +3540,9 @@ static flagcxResult_t cleanupAscendUniRunnerIpcResources(
     runnerState->ipcInputBase = NULL;
     runnerState->ipcOutputBase = NULL;
     runnerState->ipcDataBytes = 0;
+    runnerState->ipcInputExportAttempted = false;
+    runnerState->ipcOutputExportAttempted = false;
+    runnerState->ipcReadyExportAttempted = false;
     // Make this cleanup one-shot. Any table entries retained after a runtime
     // failure remain visible on the communicator, preventing a later local
     // destroy from freeing an allocation whose peer import may still exist.
@@ -3377,31 +3565,6 @@ static flagcxResult_t cleanupAscendUniRunnerIpcResources(
     }
     return flagcxSuccess;
   };
-  auto addIpcIndexValue = [&](int ipcIndex) {
-    if (ipcIndex < 0 || ipcIndex >= FLAGCX_MAX_IPC_ENTRIES) {
-      return;
-    }
-    for (int i = 0; i < ipcIndexCount; ++i) {
-      if (ipcIndices[i] == ipcIndex)
-        return;
-    }
-    if (ipcIndexCount < 3)
-      ipcIndices[ipcIndexCount++] = ipcIndex;
-  };
-  auto addIpcIndex = [&](flagcxDevMem_t mem) {
-    if (mem != NULL)
-      addIpcIndexValue(mem->ipcIndex);
-  };
-  addIpcIndex(runnerState->ipcInputMem);
-  addIpcIndex(runnerState->ipcOutputMem);
-  addIpcIndex(runnerState->ipcReadyMem);
-  // A failed build can leave an orphan entry without returning a DevMem
-  // wrapper. Recover it by the exact allocation base so this invocation can
-  // still perform ordered importer/exporter cleanup.
-  addIpcIndexValue(findIpcIndexByBase(runnerState->ipcInputBase));
-  addIpcIndexValue(findIpcIndexByBase(runnerState->ipcOutputBase));
-  addIpcIndexValue(readyIpcIndex);
-
   flagcxResult_t localRes = flagcxSuccess;
   bool aliased = runnerState->ipcInputMem != NULL &&
                  runnerState->ipcInputMem == runnerState->ipcOutputMem;
@@ -3427,10 +3590,16 @@ static flagcxResult_t cleanupAscendUniRunnerIpcResources(
   runnerState->ipcOutputMem = NULL;
   runnerState->ipcReadyMem = NULL;
 
+  // Role bits have a fixed meaning on every rank. Do not encode the locally
+  // compressed ipcTable order in a collective mask: partial construction can
+  // assign different slot numbers or omit a role on one rank.
   int localCloseMask = 0;
-  for (int i = 0; i < ipcIndexCount; ++i) {
-    if (comm->ipcTable[ipcIndices[i]].refCount == 0)
-      localCloseMask |= 1 << i;
+  for (int role = 0; role < ipcRoleCount; ++role) {
+    int ipcIndex = roleIpcIndices[role];
+    if (ipcIndex >= 0 && ipcIndex < FLAGCX_MAX_IPC_ENTRIES &&
+        comm->ipcTable[ipcIndex].refCount == 0) {
+      localCloseMask |= 1 << role;
+    }
   }
   std::vector<int> closeMasks(static_cast<size_t>(comm->nranks), 0);
   closeMasks[comm->rank] = localCloseMask;
@@ -3440,22 +3609,37 @@ static flagcxResult_t cleanupAscendUniRunnerIpcResources(
     retireRunnerState(true);
     return maskGatherRes;
   }
-  int collectiveCloseMask =
-      ipcIndexCount == 0 ? 0 : (1 << ipcIndexCount) - 1;
-  for (int mask : closeMasks)
+  int collectiveCloseMask = (1 << ipcRoleCount) - 1;
+  int unionCloseMask = 0;
+  for (int mask : closeMasks) {
     collectiveCloseMask &= mask;
+    unionCloseMask |= mask;
+  }
+  const bool roleMaskMismatch = unionCloseMask != collectiveCloseMask;
+
+  int ipcIndices[ipcRoleCount] = {-1, -1, -1};
+  int ipcIndexCount = 0;
+  for (int role = 0; role < ipcRoleCount; ++role) {
+    if ((collectiveCloseMask & (1 << role)) == 0)
+      continue;
+    int ipcIndex = roleIpcIndices[role];
+    bool duplicate = false;
+    for (int i = 0; i < ipcIndexCount; ++i) {
+      duplicate = duplicate || ipcIndices[i] == ipcIndex;
+    }
+    if (!duplicate)
+      ipcIndices[ipcIndexCount++] = ipcIndex;
+  }
 
   // First close every imported mapping and its device-side pointer table.
   // Keep each local export alive until every rank reports that this phase
   // completed successfully.
   for (int i = 0; i < ipcIndexCount; ++i) {
-    if ((collectiveCloseMask & (1 << i)) == 0)
-      continue;
     flagcxIpcTableEntry *entry = &comm->ipcTable[ipcIndices[i]];
     if (entry->hostPeerPtrs != NULL) {
       for (int peer = 0; peer < entry->nPeers; ++peer) {
         void *peerPtr = entry->hostPeerPtrs[peer];
-        if (peerPtr != NULL && peerPtr != entry->basePtr) {
+        if (peerPtr != NULL && peer != comm->localRank) {
           flagcxResult_t res =
               deviceAdaptor->ipcMemHandleClose(peerPtr);
           if (res == flagcxSuccess)
@@ -3467,7 +3651,7 @@ static flagcxResult_t cleanupAscendUniRunnerIpcResources(
       bool allImportsClosed = true;
       for (int peer = 0; peer < entry->nPeers; ++peer) {
         void *peerPtr = entry->hostPeerPtrs[peer];
-        if (peerPtr != NULL && peerPtr != entry->basePtr) {
+        if (peerPtr != NULL && peer != comm->localRank) {
           allImportsClosed = false;
           break;
         }
@@ -3488,6 +3672,8 @@ static flagcxResult_t cleanupAscendUniRunnerIpcResources(
     if (entry->hostPeerPtrs == NULL && entry->devPeerPtrs == NULL)
       entry->inUse = false;
   }
+  if (roleMaskMismatch && localRes == flagcxSuccess)
+    localRes = flagcxInternalError;
 
   flagcxResult_t collectiveImportRes = flagcxSuccess;
   flagcxResult_t importGatherRes =
@@ -3523,8 +3709,6 @@ static flagcxResult_t cleanupAscendUniRunnerIpcResources(
   // reference for each table entry, then the FlagCX-owned ready allocation.
   flagcxResult_t localExportRes = flagcxSuccess;
   for (int i = 0; i < ipcIndexCount; ++i) {
-    if ((collectiveCloseMask & (1 << i)) == 0)
-      continue;
     flagcxIpcTableEntry *entry = &comm->ipcTable[ipcIndices[i]];
     if (entry->basePtr != NULL) {
       flagcxResult_t res =
@@ -3552,22 +3736,16 @@ static flagcxResult_t cleanupAscendUniRunnerIpcResources(
   }
 
   for (int i = 0; i < ipcIndexCount; ++i) {
-    if ((collectiveCloseMask & (1 << i)) == 0)
-      continue;
     flagcxIpcTableEntry *entry = &comm->ipcTable[ipcIndices[i]];
     entry->basePtr = NULL;
     entry->nPeers = 0;
     entry->refCount = 0;
   }
 
-  bool readyEntryClosed = readyIpcIndex < 0;
-  for (int i = 0; i < ipcIndexCount; ++i) {
-    if (ipcIndices[i] == readyIpcIndex &&
-        (collectiveCloseMask & (1 << i)) != 0) {
-      readyEntryClosed = true;
-      break;
-    }
-  }
+  const bool readyEntryClosed =
+      !runnerState->ipcReadyExportAttempted ||
+      ((collectiveCloseMask & (1 << ipcReadyRole)) != 0 &&
+       readyIpcIndex >= 0);
 
   flagcxResult_t localReadyFreeRes = flagcxSuccess;
   bool runnerStateRetired = false;
@@ -3613,7 +3791,7 @@ static flagcxResult_t gatherAscendUniRunnerIpcState(
                                 sizeof(int));
 }
 
-static flagcxResult_t agreeAscendUniRunnerIpcResult(
+flagcxResult_t agreeAscendUniRunnerIpcResult(
     flagcxComm_t comm, flagcxResult_t localResult,
     flagcxResult_t *collectiveResult) {
   if (collectiveResult == NULL)
@@ -3630,6 +3808,78 @@ static flagcxResult_t agreeAscendUniRunnerIpcResult(
   }
   return flagcxSuccess;
 }
+
+static flagcxResult_t ensureUniRunnerIpcA2ADataViews(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm,
+    const void *sendbuff, void *recvbuff, size_t bytes) {
+  if (runnerState == NULL || comm == NULL || sendbuff == NULL ||
+      recvbuff == NULL || sendbuff == recvbuff || bytes == 0) {
+    return flagcxInvalidArgument;
+  }
+
+  // Ascend UniRunner tears IPC mappings down after every invocation. Refuse to
+  // merge this forced transport with stale or concurrently owned state.
+  const bool localEmpty =
+      runnerState->ipcOwner == NULL && runnerState->ipcInputMem == NULL &&
+      runnerState->ipcOutputMem == NULL &&
+      runnerState->ipcReadyMem == NULL &&
+      runnerState->ipcInputBase == NULL &&
+      runnerState->ipcOutputBase == NULL &&
+      runnerState->ipcReadyBuffer == NULL &&
+      runnerState->ipcReadyCapacity == 0 &&
+      !runnerState->ipcInputExportAttempted &&
+      !runnerState->ipcOutputExportAttempted &&
+      !runnerState->ipcReadyExportAttempted;
+  std::vector<int> states;
+  FLAGCXCHECK(gatherAscendUniRunnerIpcState(
+      comm, localEmpty ? 0 : 1, &states));
+  for (int state : states) {
+    if (state != 0) {
+      return flagcxNotSupported;
+    }
+  }
+
+  // Record exact bases before the collective exporter/importer build so the
+  // ordered cleanup path can recover a partially constructed output entry.
+  runnerState->ipcOwner = comm;
+  runnerState->ipcInputBase = sendbuff;
+  runnerState->ipcOutputBase = recvbuff;
+  runnerState->ipcDataBytes = bytes;
+  runnerState->ipcInputExportAttempted = false;
+  runnerState->ipcOutputExportAttempted = true;
+
+  flagcxResult_t localRes =
+      flagcxDevMemCreate(comm, recvbuff, bytes, NULL,
+                         &runnerState->ipcOutputMem);
+  flagcxResult_t collectiveRes = flagcxSuccess;
+  FLAGCXCHECK(agreeAscendUniRunnerIpcResult(
+      comm, localRes, &collectiveRes));
+  if (collectiveRes != flagcxSuccess) {
+    return collectiveRes;
+  }
+
+  // The local source (including an in-place snapshot) is never remotely
+  // addressed. Wrap it without a communicator so no unnecessary ACL key or
+  // ipcTable slot is consumed.
+  localRes = flagcxDevMemCreate(
+      NULL, const_cast<void *>(sendbuff), bytes, NULL,
+      &runnerState->ipcInputMem);
+  FLAGCXCHECK(agreeAscendUniRunnerIpcResult(
+      comm, localRes, &collectiveRes));
+  if (collectiveRes != flagcxSuccess) {
+    return collectiveRes;
+  }
+
+  localRes = runnerState->ipcInputMem != NULL &&
+                     runnerState->ipcOutputMem != NULL &&
+                     runnerState->ipcOutputMem->hasWindow &&
+                     runnerState->ipcOutputMem->ipcIndex >= 0
+                 ? flagcxSuccess
+                 : flagcxNotSupported;
+  FLAGCXCHECK(agreeAscendUniRunnerIpcResult(
+      comm, localRes, &collectiveRes));
+  return collectiveRes;
+}
 #endif
 
 static flagcxResult_t ensureUniRunnerIpcDataViews(
@@ -3644,7 +3894,9 @@ static flagcxResult_t ensureUniRunnerIpcDataViews(
   bool localStateExists = runnerState->ipcInputMem != NULL ||
                           runnerState->ipcOutputMem != NULL ||
                           runnerState->ipcInputBase != NULL ||
-                          runnerState->ipcOutputBase != NULL;
+                          runnerState->ipcOutputBase != NULL ||
+                          runnerState->ipcInputExportAttempted ||
+                          runnerState->ipcOutputExportAttempted;
   std::vector<int> cacheStates;
   FLAGCXCHECK(gatherAscendUniRunnerIpcState(
       comm, localCacheHit ? 1 : (localStateExists ? 2 : 0), &cacheStates));
@@ -3669,6 +3921,8 @@ static flagcxResult_t ensureUniRunnerIpcDataViews(
   runnerState->ipcInputBase = sendbuff;
   runnerState->ipcOutputBase = recvbuff;
   runnerState->ipcDataBytes = bytes;
+  runnerState->ipcInputExportAttempted = false;
+  runnerState->ipcOutputExportAttempted = true;
   flagcxResult_t localRes =
       flagcxDevMemCreate(comm, recvbuff, bytes, NULL,
                          &runnerState->ipcOutputMem);
@@ -3693,6 +3947,7 @@ static flagcxResult_t ensureUniRunnerIpcDataViews(
   if (allAliased) {
     runnerState->ipcInputMem = runnerState->ipcOutputMem;
   } else {
+    runnerState->ipcInputExportAttempted = true;
     localRes = flagcxDevMemCreate(
         comm, const_cast<void *>(sendbuff), bytes, NULL,
         &runnerState->ipcInputMem);
@@ -3727,14 +3982,18 @@ static flagcxResult_t ensureUniRunnerIpcDataViews(
 
   FLAGCXCHECK(destroyUniRunnerIpcDataViews(runnerState));
   runnerState->ipcOwner = comm;
+  runnerState->ipcInputExportAttempted = false;
+  runnerState->ipcOutputExportAttempted = false;
   flagcxResult_t res = flagcxSuccess;
 
+  runnerState->ipcOutputExportAttempted = true;
   FLAGCXCHECKGOTO(flagcxDevMemCreate(comm, recvbuff, bytes, NULL,
                                      &runnerState->ipcOutputMem),
                   res, fail);
   if (sendbuff == recvbuff) {
     runnerState->ipcInputMem = runnerState->ipcOutputMem;
   } else {
+    runnerState->ipcInputExportAttempted = true;
     FLAGCXCHECKGOTO(flagcxDevMemCreate(
                         comm, const_cast<void *>(sendbuff), bytes, NULL,
                         &runnerState->ipcInputMem),
@@ -3767,7 +4026,8 @@ static flagcxResult_t ensureUniRunnerIpcReadyStorage(
                        runnerState->ipcReadyCapacity >= requiredSlots;
   bool localStateExists = runnerState->ipcReadyMem != NULL ||
                           runnerState->ipcReadyBuffer != NULL ||
-                          runnerState->ipcReadyCapacity != 0;
+                          runnerState->ipcReadyCapacity != 0 ||
+                          runnerState->ipcReadyExportAttempted;
   std::vector<int> cacheStates;
   FLAGCXCHECK(gatherAscendUniRunnerIpcState(
       comm, localCacheHit ? 1 : (localStateExists ? 2 : 0), &cacheStates));
@@ -3781,13 +4041,17 @@ static flagcxResult_t ensureUniRunnerIpcReadyStorage(
     return flagcxSuccess;
   if (!allEmpty)
     return flagcxNotSupported;
+  // Ascend uses one imported receive slot and one local send slot per IPC
+  // step. aclrtValueWrite cannot target an imported peer pointer on Atlas A2,
+  // so the local send slot is written first and copied to the peer's receive
+  // slot with an 8-byte device-to-device transfer.
   if (requiredSlots > std::numeric_limits<size_t>::max() /
-                          sizeof(uint64_t)) {
+                          (2 * sizeof(uint64_t))) {
     return flagcxInvalidArgument;
   }
 
   runnerState->ipcOwner = comm;
-  size_t bytes = requiredSlots * sizeof(uint64_t);
+  size_t bytes = requiredSlots * 2 * sizeof(uint64_t);
   flagcxResult_t localRes = allocUniRunnerIpcReadyBuffer(
       &runnerState->ipcReadyBuffer, bytes);
   if (localRes == flagcxSuccess) {
@@ -3805,6 +4069,7 @@ static flagcxResult_t ensureUniRunnerIpcReadyStorage(
     return collectiveRes;
   }
 
+  runnerState->ipcReadyExportAttempted = true;
   localRes = flagcxDevMemCreate(
       comm, runnerState->ipcReadyBuffer, bytes, NULL,
       &runnerState->ipcReadyMem);
@@ -4021,8 +4286,16 @@ launchAscendIpcNode(flagcxUniRunnerState *runnerState,
   char *localReady =
       static_cast<char *>(runnerState->ipcReadyBuffer) +
       static_cast<size_t>(ipc.readySlot) * sizeof(uint64_t);
+  char *localSignal =
+      static_cast<char *>(runnerState->ipcReadyBuffer) +
+      (runnerState->ipcReadyCapacity +
+       static_cast<size_t>(ipc.readySlot)) *
+          sizeof(uint64_t);
   FLAGCXCHECK(deviceAdaptor->streamWriteValue64(
-      stream, remoteReady, runnerState->ipcEpoch, 0));
+      stream, localSignal, runnerState->ipcEpoch, 0));
+  FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+      remoteReady, localSignal, sizeof(uint64_t),
+      flagcxMemcpyDeviceToDevice, stream, NULL));
   FLAGCXCHECK(deviceAdaptor->streamWaitValue64(
       stream, localReady, runnerState->ipcEpoch, 0));
   FLAGCXCHECK(deviceAdaptor->streamWriteValue64(
@@ -4298,7 +4571,23 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
     FLAGCXCHECK(localReadyRes);
   }
 #endif
-  FLAGCXCHECK(prepareDagStreamFlags(runnerState));
+  flagcxResult_t localPrepareRes = prepareDagStreamFlags(runnerState);
+#ifdef USE_ASCEND_ADAPTOR
+  if (runnerState->ipcReadySlots != 0) {
+    // A rank-local allocation/copy failure here must be agreed before any
+    // peer submits an IPC node. Otherwise the successful ranks can wait for a
+    // ready signal that the failed rank will never publish.
+    flagcxResult_t collectivePrepareRes = flagcxSuccess;
+    FLAGCXCHECK(agreeAscendUniRunnerIpcResult(
+        comm, localPrepareRes, &collectivePrepareRes));
+    if (collectivePrepareRes != flagcxSuccess)
+      return collectivePrepareRes;
+  } else {
+    FLAGCXCHECK(localPrepareRes);
+  }
+#else
+  FLAGCXCHECK(localPrepareRes);
+#endif
 #ifndef USE_ASCEND_ADAPTOR
   FLAGCXCHECK(prepareUniRunnerIpcParentFlags(runnerState));
 #endif
@@ -4381,6 +4670,9 @@ cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState) {
   runnerState->ipcReadyCapacity = 0;
   runnerState->ipcReadySlots = 0;
   runnerState->ipcOwner = NULL;
+  runnerState->ipcInputExportAttempted = false;
+  runnerState->ipcOutputExportAttempted = false;
+  runnerState->ipcReadyExportAttempted = false;
   if (runnerState->ipcParentFlagsDevice != NULL) {
     FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->ipcParentFlagsDevice,
                                           flagcxMemDevice, NULL));

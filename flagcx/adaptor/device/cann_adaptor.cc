@@ -52,6 +52,7 @@ std::mutex cannIpcMutex;
 std::map<CannDevicePtrKey, CannExportedIpcRecord> cannExportedIpcKeys;
 std::map<CannDevicePtrKey, CannImportedIpcRecord> cannImportedIpcPtrs;
 std::map<CannImportKey, void *> cannImportedIpcKeys;
+std::map<CannDevicePtrKey, size_t> cannDeviceAllocationSizes;
 
 std::mutex cannHostRegistrationMutex;
 std::map<uintptr_t, CannHostRegistration> cannHostRegistrations;
@@ -192,7 +193,14 @@ flagcxResult_t cannAdaptorDeviceMalloc(void **ptr, size_t size,
   if (type == flagcxMemHost) {
     DEVCHECK(aclrtMallocHost(ptr, size));
   } else {
-    DEVCHECK(aclrtMalloc(ptr, size, ACL_MEM_MALLOC_HUGE_FIRST));
+    int device = 0;
+    FLAGCXCHECK(cannGetCurrentDevice(&device));
+    aclError ret = aclrtMalloc(ptr, size, ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ret != ACL_SUCCESS)
+      return flagcxUnhandledDeviceError;
+    std::lock_guard<std::mutex> lock(cannIpcMutex);
+    cannDeviceAllocationSizes[CannDevicePtrKey{
+        device, reinterpret_cast<uintptr_t>(*ptr)}] = size;
   }
   return flagcxSuccess;
 }
@@ -206,10 +214,17 @@ flagcxResult_t cannAdaptorDeviceFree(void *ptr, flagcxMemType_t type,
   if (type == flagcxMemHost) {
     DEVCHECK(aclrtFreeHost(ptr));
   } else {
+    int device = 0;
+    FLAGCXCHECK(cannGetCurrentDevice(&device));
     // ACL requires the exporting process to close its IPC key before freeing
     // the allocation. Imported mappings are closed through ipcMemHandleClose.
     FLAGCXCHECK(cannReleaseExportedIpcMemory(ptr, true));
-    DEVCHECK(aclrtFree(ptr));
+    aclError ret = aclrtFree(ptr);
+    if (ret != ACL_SUCCESS)
+      return flagcxUnhandledDeviceError;
+    std::lock_guard<std::mutex> lock(cannIpcMutex);
+    cannDeviceAllocationSizes.erase(
+        CannDevicePtrKey{device, reinterpret_cast<uintptr_t>(ptr)});
   }
   return flagcxSuccess;
 }
@@ -476,26 +491,97 @@ flagcxResult_t cannAdaptorIpcMemHandleCreate(flagcxIpcMemHandle_t *handle,
   return flagcxSuccess;
 }
 
+flagcxResult_t cannAdaptorIpcMemGetProcessId(int32_t *processId) {
+  if (processId == nullptr)
+    return flagcxInvalidArgument;
+  aclError ret = aclrtDeviceGetBareTgid(processId);
+  if (ret != ACL_SUCCESS) {
+    WARN("cannAdaptorIpcMemGetProcessId: aclrtDeviceGetBareTgid failed "
+         "ret=%d",
+         static_cast<int>(ret));
+    return flagcxUnhandledDeviceError;
+  }
+  return flagcxSuccess;
+}
+
+flagcxResult_t cannAdaptorIpcMemHandleSetImportPid(
+    flagcxIpcMemHandle_t handle, int32_t *processIds, size_t count) {
+  if (handle == nullptr || processIds == nullptr || count == 0)
+    return flagcxInvalidArgument;
+
+  CannIpcKey key = cannRebuildIpcKey(handle);
+  if (key[0] == '\0')
+    return flagcxInvalidArgument;
+
+  std::lock_guard<std::mutex> lock(cannIpcMutex);
+  aclError ret =
+      aclrtIpcMemSetImportPid(key.data(), processIds, count);
+  if (ret != ACL_SUCCESS) {
+    WARN("cannAdaptorIpcMemHandleSetImportPid: "
+         "aclrtIpcMemSetImportPid failed ret=%d count=%zu",
+         static_cast<int>(ret), count);
+    return flagcxUnhandledDeviceError;
+  }
+  return flagcxSuccess;
+}
+
+flagcxResult_t cannAdaptorIpcMemEnablePeerAccess(int peerDevice) {
+  if (peerDevice < 0)
+    return flagcxInvalidArgument;
+  aclError ret = aclrtDeviceEnablePeerAccess(peerDevice, 0);
+  if (ret != ACL_SUCCESS) {
+    WARN("cannAdaptorIpcMemEnablePeerAccess: "
+         "aclrtDeviceEnablePeerAccess failed ret=%d peerDevice=%d",
+         static_cast<int>(ret), peerDevice);
+    return flagcxUnhandledDeviceError;
+  }
+  return flagcxSuccess;
+}
+
 flagcxResult_t cannAdaptorIpcMemHandleGet(flagcxIpcMemHandle_t handle,
                                           void *devPtr) {
   if (handle == nullptr || devPtr == nullptr)
     return flagcxInvalidArgument;
   memset(handle->key, 0, FLAGCX_ASCEND_IPC_KEY_STORAGE_BYTES);
 
+  int device = 0;
+  FLAGCXCHECK(cannGetCurrentDevice(&device));
   void *allocationBase = nullptr;
   size_t allocationSize = 0;
   aclError ret =
       aclrtMemGetAddressRange(devPtr, &allocationBase, &allocationSize);
-  if (ret != ACL_SUCCESS)
+  if (ret == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
+    // CANN 9.0.0 beta runtimes expose aclrtMemGetAddressRange in their ABI but
+    // return FEATURE_NOT_SUPPORT on Atlas A2/910B. Recover the exact allocation
+    // extent recorded by this adaptor's allocator and use the documented
+    // direct aclrtMalloc -> aclrtIpcMemGetExportKey flow.
+    std::lock_guard<std::mutex> lock(cannIpcMutex);
+    auto allocation = cannDeviceAllocationSizes.find(
+        CannDevicePtrKey{device, reinterpret_cast<uintptr_t>(devPtr)});
+    if (allocation == cannDeviceAllocationSizes.end()) {
+      WARN("cannAdaptorIpcMemHandleGet: aclrtMemGetAddressRange is unsupported "
+           "and allocation size is unknown device=%d devPtr=%p",
+           device, devPtr);
+      return flagcxNotSupported;
+    }
+    allocationBase = devPtr;
+    allocationSize = allocation->second;
+  } else if (ret != ACL_SUCCESS) {
+    WARN("cannAdaptorIpcMemHandleGet: aclrtMemGetAddressRange failed "
+         "ret=%d devPtr=%p",
+         static_cast<int>(ret), devPtr);
     return flagcxUnhandledDeviceError;
+  }
   // An ACL IPC key describes the complete underlying allocation. Exporting an
   // interior pointer would lose its offset because FlagCX transports only the
   // opaque 64-byte handle.
-  if (allocationBase != devPtr || allocationSize == 0)
+  if (allocationBase != devPtr || allocationSize == 0) {
+    WARN("cannAdaptorIpcMemHandleGet: allocation is not exportable "
+         "devPtr=%p allocationBase=%p allocationSize=%zu",
+         devPtr, allocationBase, allocationSize);
     return flagcxInvalidArgument;
+  }
 
-  int device = 0;
-  FLAGCXCHECK(cannGetCurrentDevice(&device));
   CannDevicePtrKey allocationKey{
       device, reinterpret_cast<uintptr_t>(allocationBase)};
 
@@ -511,9 +597,14 @@ flagcxResult_t cannAdaptorIpcMemHandleGet(flagcxIpcMemHandle_t handle,
   CannIpcKey key = {};
   ret = aclrtIpcMemGetExportKey(
       allocationBase, allocationSize, key.data(), key.size(),
-      ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION);
-  if (ret != ACL_SUCCESS)
+      ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT);
+  if (ret != ACL_SUCCESS) {
+    WARN("cannAdaptorIpcMemHandleGet: aclrtIpcMemGetExportKey failed "
+         "ret=%d device=%d allocationBase=%p allocationSize=%zu flags=%d",
+         static_cast<int>(ret), device, allocationBase, allocationSize,
+         static_cast<int>(ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT));
     return flagcxUnhandledDeviceError;
+  }
   key[FLAGCX_ASCEND_IPC_KEY_STORAGE_BYTES] = '\0';
   memcpy(handle->key, key.data(), FLAGCX_ASCEND_IPC_KEY_STORAGE_BYTES);
   cannExportedIpcKeys.emplace(
@@ -552,9 +643,14 @@ flagcxResult_t cannAdaptorIpcMemHandleOpen(flagcxIpcMemHandle_t handle,
   void *importedPtr = nullptr;
   aclError ret = aclrtIpcMemImportByKey(
       &importedPtr, key.data(),
-      ACL_RT_IPC_MEM_IMPORT_FLAG_ENABLE_PEER_ACCESS);
-  if (ret != ACL_SUCCESS)
+      ACL_RT_IPC_MEM_IMPORT_FLAG_DEFAULT);
+  if (ret != ACL_SUCCESS) {
+    WARN("cannAdaptorIpcMemHandleOpen: aclrtIpcMemImportByKey failed "
+         "ret=%d device=%d flags=%d",
+         static_cast<int>(ret), device,
+         static_cast<int>(ACL_RT_IPC_MEM_IMPORT_FLAG_DEFAULT));
     return flagcxUnhandledDeviceError;
+  }
   if (importedPtr == nullptr) {
     aclrtIpcMemClose(key.data());
     return flagcxUnhandledDeviceError;
@@ -759,6 +855,10 @@ struct flagcxDeviceAdaptor cannAdaptor {
       cannAdaptorSymFlatUnmap, cannAdaptorSymMulticastSupported,
       cannAdaptorSymMulticastCreate, cannAdaptorSymMulticastBind,
       cannAdaptorSymMulticastTeardown, cannAdaptorSymMulticastFree,
+      // Explicit ACL IPC security and peer-access setup
+      cannAdaptorIpcMemGetProcessId,
+      cannAdaptorIpcMemHandleSetImportPid,
+      cannAdaptorIpcMemEnablePeerAccess,
 };
 
 #endif // USE_ASCEND_ADAPTOR

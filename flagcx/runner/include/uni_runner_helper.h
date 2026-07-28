@@ -98,6 +98,8 @@ inline const char *uniRunnerDagAlgoTypeToString(uniRunnerDagAlgoType algoType) {
       return "tree_red";
     case uniRunnerDagAlgoIpcAR:
       return "ipc_ar";
+    case uniRunnerDagAlgoIpcA2A:
+      return "ipc_a2a";
     default:
       return "unknown";
   }
@@ -123,6 +125,8 @@ inline bool uniRunnerDagAlgoTypeFromString(const std::string &text,
     *algoType = uniRunnerDagAlgoTreeRed;
   } else if (text == "ipc_ar") {
     *algoType = uniRunnerDagAlgoIpcAR;
+  } else if (text == "ipc_a2a") {
+    *algoType = uniRunnerDagAlgoIpcA2A;
   } else {
     return false;
   }

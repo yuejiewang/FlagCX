@@ -16,6 +16,7 @@ FLAGCX_PARAM(UniRunnerUseGroupedAG, "UNIRUNNER_USE_GROUPEDAG", 1);
 FLAGCX_PARAM(UniRunnerGroupSize, "UNIRUNNER_GROUPSIZE", 0);
 #ifdef USE_ASCEND_ADAPTOR
 FLAGCX_PARAM(UniRunnerUseHccsA2A, "UNIRUNNER_USE_HCCSA2A", 0);
+FLAGCX_PARAM(UniRunnerUseIpcA2A, "UNIRUNNER_USE_IPCA2A", 0);
 #endif
 
 static int resolveUniRunnerGroupedAGGroupSize(flagcxComm_t comm) {
@@ -377,11 +378,162 @@ out:
   return res;
 }
 
+#ifdef USE_ASCEND_ADAPTOR
+static flagcxResult_t
+ascendUniRunnerIpcPeerAlltoAll(const void *sendbuff, void *recvbuff,
+                               size_t count, flagcxDataType_t datatype,
+                               flagcxComm_t comm, flagcxStream_t stream) {
+  if (comm == NULL || stream == NULL || comm->nranks < 1 || comm->rank < 0 ||
+      comm->rank >= comm->nranks) {
+    return flagcxInvalidArgument;
+  }
+
+  size_t totalBytes = 0;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(
+      count, static_cast<size_t>(comm->nranks), datatype, &totalBytes));
+  if (totalBytes == 0) {
+    return flagcxSuccess;
+  }
+  if (sendbuff == NULL || recvbuff == NULL) {
+    return flagcxInvalidArgument;
+  }
+  if (flagcxGroupDepth != 0) {
+    WARN("Ascend UniRunner ACL IPC peer-pointer AlltoAll does not support "
+         "FlagCX group capture; refusing to fall back to another transport");
+    return flagcxNotSupported;
+  }
+
+  if (comm->nranks == 1) {
+    if (sendbuff == recvbuff) {
+      return flagcxSuccess;
+    }
+    return deviceAdaptor->deviceMemcpy(
+        recvbuff, const_cast<void *>(sendbuff), totalBytes,
+        flagcxMemcpyDeviceToDevice, stream, NULL);
+  }
+  if (comm->heteroComm == NULL || comm->heteroComm->proxyState == NULL) {
+    WARN("Ascend UniRunner ACL IPC peer-pointer AlltoAll requires "
+         "FLAGCX_USE_HETERO_COMM=1");
+    return flagcxInvalidUsage;
+  }
+
+  flagcxResult_t res = flagcxSuccess;
+  flagcxUniRunnerState *runnerState =
+      &comm->heteroComm->proxyState->uniRunnerState;
+  const void *effectiveSendbuff = sendbuff;
+  void *scratchbuff = NULL;
+  bool runnerInitialized = false;
+  bool scratchSafeToFree = false;
+  flagcxResult_t collectiveRes = flagcxSuccess;
+
+  // AlltoAll permits sendbuff == recvbuff. Snapshot the complete input before
+  // any peer writes into this rank's imported receive-buffer pointer.
+  if (sendbuff == recvbuff) {
+    res = deviceAdaptor->deviceMalloc(&scratchbuff, totalBytes,
+                                      flagcxMemDevice, stream);
+    if (res == flagcxSuccess) {
+      res = deviceAdaptor->deviceMemcpy(
+          scratchbuff, const_cast<void *>(sendbuff), totalBytes,
+          flagcxMemcpyDeviceToDevice, stream, NULL);
+      if (res == flagcxSuccess)
+        effectiveSendbuff = scratchbuff;
+    }
+  }
+
+  // Snapshot allocation/copy can fail independently on one device. Agree
+  // before any rank initializes the collective IPC state.
+  {
+    flagcxResult_t agreeRes =
+        agreeAscendUniRunnerIpcResult(comm, res, &collectiveRes);
+    if (agreeRes != flagcxSuccess) {
+      res = agreeRes;
+      goto out;
+    }
+    if (collectiveRes != flagcxSuccess) {
+      res = collectiveRes;
+      goto out;
+    }
+  }
+
+  res = initUniRunner(comm, stream);
+  runnerInitialized = res == flagcxSuccess;
+  {
+    // Stream creation is also rank-local. A successful rank must clean up its
+    // streams rather than entering IPC setup when a peer failed initialization.
+    flagcxResult_t agreeRes =
+        agreeAscendUniRunnerIpcResult(comm, res, &collectiveRes);
+    if (agreeRes != flagcxSuccess) {
+      res = agreeRes;
+      goto out;
+    }
+    if (collectiveRes != flagcxSuccess) {
+      res = collectiveRes;
+      goto out;
+    }
+  }
+  if (!runnerInitialized) {
+    res = flagcxInternalError;
+    goto out;
+  }
+
+  res = initUniRunnerStateIpcA2A(runnerState, effectiveSendbuff, recvbuff,
+                                 count, datatype, comm);
+  if (res != flagcxSuccess)
+    goto out;
+  INFO(FLAGCX_UNIRUNNER,
+       "Ascend UniRunner AlltoAll "
+       "selected=ASCEND_IPC_A2A_PEER_COPY runner=UNIRUNNER rank=%d "
+       "peer_bytes=%zu transport=aclrtMemcpyAsync acl_ipc=1 peer_pointer=1 "
+       "pid_whitelist=1 peer_access=explicit ready_signal=peer_d2d "
+       "output_export=1 input_export=0 fail_if_unavailable=1 "
+       "hccl_collective=0 hcomm=0 socket=0 host_staging=0",
+       comm->rank, totalBytes / static_cast<size_t>(comm->nranks));
+  res = runUniRunner(comm);
+
+out:
+  if (runnerInitialized) {
+    flagcxResult_t cleanupRes = cleanupUniRunner(comm);
+    if (cleanupRes == flagcxSuccess) {
+      scratchSafeToFree = true;
+    } else if (res == flagcxSuccess) {
+      res = cleanupRes;
+    }
+  } else if (scratchbuff != NULL) {
+    // The in-place snapshot may already be queued on the caller stream.
+    flagcxResult_t syncRes = deviceAdaptor->streamSynchronize(stream);
+    if (syncRes == flagcxSuccess) {
+      scratchSafeToFree = true;
+    } else if (res == flagcxSuccess) {
+      res = syncRes;
+    }
+  }
+
+  if (scratchbuff != NULL && scratchSafeToFree) {
+    flagcxResult_t freeRes =
+        deviceAdaptor->deviceFree(scratchbuff, flagcxMemDevice, stream);
+    if (res == flagcxSuccess)
+      res = freeRes;
+  } else if (scratchbuff != NULL) {
+    WARN("Ascend UniRunner ACL IPC AlltoAll: retaining in-place snapshot %p "
+         "after stream or IPC cleanup failure",
+         scratchbuff);
+  }
+  return res;
+}
+#endif
+
 flagcxResult_t uniRunnerAlltoAll(const void *sendbuff, void *recvbuff,
                                  size_t count, flagcxDataType_t datatype,
                                  flagcxComm_t comm, flagcxStream_t stream) {
 #ifdef USE_ASCEND_ADAPTOR
-  if (flagcxParamUniRunnerUseHccsA2A()) {
+  const bool useHccsA2A = flagcxParamUniRunnerUseHccsA2A() != 0;
+  const bool useIpcA2A = flagcxParamUniRunnerUseIpcA2A() != 0;
+  if (useHccsA2A && useIpcA2A) {
+    WARN("Ascend UniRunner AlltoAll transport selection is ambiguous: "
+         "UNIRUNNER_USE_HCCSA2A and UNIRUNNER_USE_IPCA2A cannot both be set");
+    return flagcxInvalidUsage;
+  }
+  if (useHccsA2A) {
     if (flagcxGroupDepth != 0) {
       WARN("Ascend UniRunner HCCS AlltoAll does not support FlagCX group "
            "capture; refusing to fall back to another transport");
@@ -389,6 +541,10 @@ flagcxResult_t uniRunnerAlltoAll(const void *sendbuff, void *recvbuff,
     }
     return flagcxAscendUniRunnerHccsAlltoAll(sendbuff, recvbuff, count,
                                              datatype, comm, stream);
+  }
+  if (useIpcA2A) {
+    return ascendUniRunnerIpcPeerAlltoAll(sendbuff, recvbuff, count, datatype,
+                                          comm, stream);
   }
 #endif
   size_t size = count * getFlagcxDataTypeSize(datatype);
