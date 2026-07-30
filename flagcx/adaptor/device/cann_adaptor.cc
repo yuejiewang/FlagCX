@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -240,7 +241,13 @@ flagcxResult_t cannAdaptorGetDevice(int *dev) {
 }
 
 flagcxResult_t cannAdaptorGetDeviceCount(int *count) {
-  DEVCHECK(aclrtGetDeviceCount((uint32_t *)count));
+  if (count == nullptr)
+    return flagcxInvalidArgument;
+  uint32_t deviceCount = 0;
+  DEVCHECK(aclrtGetDeviceCount(&deviceCount));
+  if (deviceCount > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+    return flagcxInternalError;
+  *count = static_cast<int>(deviceCount);
   return flagcxSuccess;
 }
 

@@ -406,6 +406,8 @@ void perfSetup(PerfContext &ctx, int argc, char **argv,
 
   // Initialize FlagCX device handle
   flagcxDeviceHandleInit(&ctx.devHandle);
+  int nGpu = 0;
+  flagcxResult_t deviceCountResult = ctx.devHandle->getDeviceCount(&nGpu);
 
   // Initialize MPI environment
   ctx.color = 0;
@@ -421,23 +423,55 @@ void perfSetup(PerfContext &ctx, int argc, char **argv,
     ctx.root = ctx.root % ctx.totalProcs;
 
   // GPU setup
-  int nGpu;
-  ctx.devHandle->getDeviceCount(&nGpu);
-  ctx.devHandle->setDevice(ctx.worldRank % nGpu);
+  if (deviceCountResult != flagcxSuccess || nGpu <= 0) {
+    char vendor[32] = {};
+    flagcxResult_t vendorResult = ctx.devHandle->getVendor(vendor);
+    fprintf(stderr,
+            "Failed to enumerate accelerator devices: vendor=%s "
+            "vendor_result=%d result=%d count=%d\n",
+            vendor, static_cast<int>(vendorResult),
+            static_cast<int>(deviceCountResult), nGpu);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+  flagcxResult_t setDeviceResult =
+      ctx.devHandle->setDevice(ctx.worldRank % nGpu);
+  if (setDeviceResult != flagcxSuccess) {
+    fprintf(stderr, "Failed to select accelerator device %d: result=%d\n",
+            ctx.worldRank % nGpu, static_cast<int>(setDeviceResult));
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
 
   // Create and broadcast uniqueId
   flagcxUniqueId uniqueId;
-  if (ctx.proc == 0)
-    flagcxGetUniqueId(&uniqueId);
+  flagcxResult_t uniqueIdResult = flagcxSuccess;
+  if (ctx.proc == 0) {
+    uniqueIdResult = flagcxGetUniqueId(&uniqueId);
+    if (uniqueIdResult != flagcxSuccess) {
+      fprintf(stderr, "Failed to create communicator unique ID: result=%d\n",
+              static_cast<int>(uniqueIdResult));
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+  }
   MPI_Bcast((void *)&uniqueId, sizeof(flagcxUniqueId), MPI_BYTE, 0,
             ctx.splitComm);
   MPI_Barrier(MPI_COMM_WORLD);
 
   // Initialize communicator
-  flagcxCommInitRank(&ctx.comm, ctx.totalProcs, &uniqueId, ctx.proc);
+  flagcxResult_t commInitResult =
+      flagcxCommInitRank(&ctx.comm, ctx.totalProcs, &uniqueId, ctx.proc);
+  if (commInitResult != flagcxSuccess) {
+    fprintf(stderr, "Rank %d failed to initialize communicator: result=%d\n",
+            ctx.worldRank, static_cast<int>(commInitResult));
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
 
   // Create stream
-  ctx.devHandle->streamCreate(&ctx.stream);
+  flagcxResult_t streamResult = ctx.devHandle->streamCreate(&ctx.stream);
+  if (streamResult != flagcxSuccess) {
+    fprintf(stderr, "Rank %d failed to create device stream: result=%d\n",
+            ctx.worldRank, static_cast<int>(streamResult));
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
 
   // Buffer sizes: call bufSizeFn if provided (totalProcs is now known)
   size_t sBufSize = ctx.maxBytes;

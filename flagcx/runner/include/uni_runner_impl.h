@@ -35,8 +35,16 @@ typedef enum {
   uniRunnerDagAlgoRingRS = 6,
   uniRunnerDagAlgoTreeRed = 7,
   uniRunnerDagAlgoIpcAR = 8,
-  uniRunnerDagAlgoIpcA2A = 9
+  uniRunnerDagAlgoIpcA2A = 9,
+  uniRunnerDagAlgoP2pA2A = 10
 } uniRunnerDagAlgoType;
+
+// P2P DAG nodes are platform independent. The selected transport only
+// changes how their send/recv primitives are submitted.
+typedef enum {
+  uniRunnerP2pTransportDefault = 0,
+  uniRunnerP2pTransportAscendHccs = 1
+} uniRunnerP2pTransport;
 
 // Cache key describing a reusable uniRunner DAG template.
 struct uniRunnerDagCacheKey {
@@ -148,6 +156,8 @@ typedef struct {
   uint64_t uniRunnerIpcChunkSize;
   uint64_t uniRunnerNRedSlices;
   uint64_t uniRunnerRedSliceSize;
+  flagcxComm_t owner;
+  uniRunnerP2pTransport p2pTransport;
   // One launch-wide divisor used by terminal Avg RED nodes. Intermediate
   // Avg nodes are materialized as Sum nodes, so no trigger needs to carry it.
   uint64_t avgDivisor;
@@ -213,6 +223,11 @@ flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
                                        flagcxDataType_t datatype,
                                        flagcxRedOp_t op, flagcxComm_t comm);
 flagcxResult_t initUniRunnerStateIpcA2A(flagcxUniRunnerState *runnerState,
+                                       const void *sendbuff, void *recvbuff,
+                                       size_t count,
+                                       flagcxDataType_t datatype,
+                                       flagcxComm_t comm);
+flagcxResult_t initUniRunnerStateP2pA2A(flagcxUniRunnerState *runnerState,
                                        const void *sendbuff, void *recvbuff,
                                        size_t count,
                                        flagcxDataType_t datatype,

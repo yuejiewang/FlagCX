@@ -1953,6 +1953,83 @@ static int globalRankToLocalRank(flagcxComm_t comm, int globalRank) {
   return -1;
 }
 
+static flagcxResult_t buildUniRunnerStateP2pA2A(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxComm_t comm) {
+  if (runnerState == NULL || comm == NULL || comm->nranks < 1 ||
+      comm->rank < 0 || comm->rank >= comm->nranks) {
+    return flagcxInvalidArgument;
+  }
+  if (!isValidUniRunnerDataType(datatype))
+    return flagcxInvalidArgument;
+  if (count == 0)
+    return flagcxSuccess;
+  if (sendbuff == NULL || recvbuff == NULL)
+    return flagcxInvalidArgument;
+
+  if (comm->nranks == 1) {
+    if (sendbuff == recvbuff)
+      return flagcxSuccess;
+    runnerState->numDagNodes = 1;
+    FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                             sizeof(struct uniRunnerDagNode)));
+    uniRunnerDagNode *node = &runnerState->dagNodes[0];
+    node->nodeIdx = 0;
+    node->nodeType = uniRunnerDagNodeTypeCpy;
+    node->nodeData.cpy.src = const_cast<void *>(sendbuff);
+    node->nodeData.cpy.dst = recvbuff;
+    node->nodeData.cpy.count = count;
+    node->nodeData.cpy.datatype = datatype;
+    FLAGCXCHECK(allocDagNodeDeps(node));
+    flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, node);
+    return validateDagNodes(runnerState);
+  }
+
+  size_t totalBytes = 0;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(
+      count, static_cast<size_t>(comm->nranks), datatype, &totalBytes));
+  const size_t peerBytes =
+      totalBytes / static_cast<size_t>(comm->nranks);
+
+  runnerState->numDagNodes = 1;
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                           sizeof(struct uniRunnerDagNode)));
+  uniRunnerDagNode *node = &runnerState->dagNodes[0];
+  node->nodeIdx = 0;
+  node->nodeType = uniRunnerDagNodeTypeP2p;
+  node->nodeData.p2p.numOps = 2 * comm->nranks;
+  FLAGCXCHECK(flagcxCalloc(
+      &node->nodeData.p2p.ops,
+      static_cast<size_t>(node->nodeData.p2p.numOps) *
+          sizeof(struct uniRunnerP2pOpData)));
+
+  const char *sendBase = static_cast<const char *>(sendbuff);
+  char *recvBase = static_cast<char *>(recvbuff);
+  for (int peer = 0; peer < comm->nranks; ++peer) {
+    uniRunnerP2pOpData *sendOp = &node->nodeData.p2p.ops[2 * peer];
+    sendOp->addr =
+        const_cast<char *>(sendBase + static_cast<size_t>(peer) * peerBytes);
+    sendOp->count = count;
+    sendOp->peerRank = peer;
+    sendOp->datatype = datatype;
+    sendOp->type = flagcxDevicePrimSend;
+
+    uniRunnerP2pOpData *recvOp = &node->nodeData.p2p.ops[2 * peer + 1];
+    recvOp->addr = recvBase + static_cast<size_t>(peer) * peerBytes;
+    recvOp->count = count;
+    recvOp->peerRank = peer;
+    recvOp->datatype = datatype;
+    recvOp->type = flagcxDevicePrimRecv;
+  }
+  FLAGCXCHECK(allocDagNodeDeps(node));
+  flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, node);
+  TRACE(FLAGCX_UNIRUNNER,
+        "rank %d initialized platform-independent P2P AlltoAll DAG: "
+        "ranks=%d peer_bytes=%zu",
+        comm->rank, comm->nranks, peerBytes);
+  return validateDagNodes(runnerState);
+}
+
 static flagcxResult_t buildUniRunnerStateIpcA2A(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     size_t count, flagcxDataType_t datatype, flagcxComm_t comm) {
@@ -3196,6 +3273,20 @@ flagcxResult_t initUniRunnerStateIpcA2A(flagcxUniRunnerState *runnerState,
                                         runnerState->ipcReadySlots);
 }
 
+flagcxResult_t initUniRunnerStateP2pA2A(flagcxUniRunnerState *runnerState,
+                                       const void *sendbuff, void *recvbuff,
+                                       size_t count,
+                                       flagcxDataType_t datatype,
+                                       flagcxComm_t comm) {
+  if (runnerState == NULL || comm == NULL)
+    return flagcxInvalidArgument;
+  runnerState->avgDivisor = 1;
+  // Keep this topology in the ordinary DAG framework, but rebuild the single
+  // node so its send/recv buffer bindings always match the current invocation.
+  return buildUniRunnerStateP2pA2A(runnerState, sendbuff, recvbuff, count,
+                                   datatype, comm);
+}
+
 flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
                                        const void *sendbuff, void *recvbuff,
                                        size_t count,
@@ -3346,21 +3437,56 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
     // Prepare ops list
     struct uniRunnerP2pOpData *ops = current->nodeData.p2p.ops;
 
-    // Start Group P2P
-    FLAGCXCHECK(flagcxHeteroGroupStart());
-    for (int i = 0; i < current->nodeData.p2p.numOps; i++) {
-      struct uniRunnerP2pOpData *op = &ops[i];
-      if (op->type == flagcxDevicePrimSend) {
-        FLAGCXCHECK(flagcxHeteroSend(op->addr, op->count, op->datatype,
-                                     op->peerRank, comm,
-                                     runnerState->commStream));
-      } else if (op->type == flagcxDevicePrimRecv) {
-        FLAGCXCHECK(flagcxHeteroRecv(op->addr, op->count, op->datatype,
-                                     op->peerRank, comm,
-                                     runnerState->commStream));
+    // Submit the platform-independent send/recv list through the selected P2P
+    // backend. NVIDIA and the default heterogeneous path retain the original
+    // FlagCX transport. Ascend HCCS uses communicator-scoped HCOMM resources.
+#ifdef USE_ASCEND_ADAPTOR
+    if (runnerState->p2pTransport == uniRunnerP2pTransportAscendHccs) {
+      if (runnerState->owner == NULL)
+        return flagcxInternalError;
+      flagcxResult_t transportResult =
+          flagcxAscendUniRunnerHccsGroupStart(runnerState->owner,
+                                              runnerState->commStream);
+      for (int i = 0;
+           i < current->nodeData.p2p.numOps &&
+           transportResult == flagcxSuccess;
+           ++i) {
+        struct uniRunnerP2pOpData *op = &ops[i];
+        if (op->type == flagcxDevicePrimSend) {
+          transportResult = flagcxAscendUniRunnerHccsSend(
+              op->addr, op->count, op->datatype, op->peerRank,
+              runnerState->owner);
+        } else if (op->type == flagcxDevicePrimRecv) {
+          transportResult = flagcxAscendUniRunnerHccsRecv(
+              op->addr, op->count, op->datatype, op->peerRank,
+              runnerState->owner);
+        } else {
+          transportResult = flagcxInvalidArgument;
+        }
       }
+      flagcxResult_t endResult =
+          flagcxAscendUniRunnerHccsGroupEnd(runnerState->owner);
+      if (transportResult == flagcxSuccess)
+        transportResult = endResult;
+      FLAGCXCHECK(transportResult);
+    } else
+#endif
+    {
+      FLAGCXCHECK(flagcxHeteroGroupStart());
+      for (int i = 0; i < current->nodeData.p2p.numOps; i++) {
+        struct uniRunnerP2pOpData *op = &ops[i];
+        if (op->type == flagcxDevicePrimSend) {
+          FLAGCXCHECK(flagcxHeteroSend(op->addr, op->count, op->datatype,
+                                       op->peerRank, comm,
+                                       runnerState->commStream));
+        } else if (op->type == flagcxDevicePrimRecv) {
+          FLAGCXCHECK(flagcxHeteroRecv(op->addr, op->count, op->datatype,
+                                       op->peerRank, comm,
+                                       runnerState->commStream));
+        }
+      }
+      FLAGCXCHECK(flagcxHeteroGroupEnd());
     }
-    FLAGCXCHECK(flagcxHeteroGroupEnd());
 
     TRACE(FLAGCX_UNIRUNNER, "rank %d p2p op %d streamWrite flag %d: DONE",
           comm->rank, current->nodeIdx, current->nodeIdx);
@@ -4411,6 +4537,8 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->uniRunnerIpcChunkSize = flagcxParamUniRunnerIpcChunkSize();
   runnerState->uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
   runnerState->uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
+  runnerState->owner = comm;
+  runnerState->p2pTransport = uniRunnerP2pTransportDefault;
   runnerState->avgDivisor = 1;
   if (runnerState->uniRunnerNThreads == 0 ||
       runnerState->uniRunnerNRedBlocks == 0 ||

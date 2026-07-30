@@ -207,6 +207,20 @@ struct AscendHccsState {
   std::vector<void *> remoteBuffers;
   std::vector<uint64_t> remoteBufferSizes;
   std::vector<void *> deferredScratch;
+
+  // One platform-independent P2P DAG node is translated into one symmetric
+  // HCOMM batch. Send/recv primitives register their bindings here; GroupEnd
+  // validates the AlltoAll layout before invoking the HCCS data plane.
+  bool groupActive = false;
+  flagcxStream_t groupStream = nullptr;
+  std::vector<const void *> groupSendBuffers;
+  std::vector<void *> groupRecvBuffers;
+  std::vector<size_t> groupSendCounts;
+  std::vector<size_t> groupRecvCounts;
+  std::vector<flagcxDataType_t> groupSendTypes;
+  std::vector<flagcxDataType_t> groupRecvTypes;
+  std::vector<bool> groupHasSend;
+  std::vector<bool> groupHasRecv;
 };
 
 std::mutex hccsStateCreateMutex;
@@ -538,6 +552,183 @@ static AscendHccsState *getOrCreateHccsState(flagcxComm_t comm) {
   return state;
 }
 
+extern "C" flagcxResult_t
+flagcxAscendUniRunnerHccsPrepare(flagcxComm_t comm) {
+  if (comm == nullptr)
+    return flagcxInvalidArgument;
+  AscendHccsState *state = getOrCreateHccsState(comm);
+  if (state == nullptr)
+    return agreeHccsSetupResult(comm, flagcxSystemError);
+
+  std::lock_guard<std::mutex> guard(state->mutex);
+  if (!state->initAttempted) {
+    // Allocation is rank-local. Agree before entering coordinated channel
+    // acquisition so a failed rank cannot strand its peers.
+    flagcxResult_t allocationResult =
+        agreeHccsSetupResult(comm, flagcxSuccess);
+    if (allocationResult != flagcxSuccess) {
+      state->initAttempted = true;
+      state->initResult = allocationResult;
+      state->poisoned = true;
+      return allocationResult;
+    }
+    state->initAttempted = true;
+    flagcxResult_t localResult = initializeHccsState(state, comm);
+    state->initResult = agreeHccsSetupResult(comm, localResult);
+    state->initialized = state->initResult == flagcxSuccess;
+    state->poisoned = !state->initialized;
+  }
+  if (!state->initialized || state->poisoned)
+    return state->initResult == flagcxSuccess ? flagcxUnhandledDeviceError
+                                              : state->initResult;
+  return flagcxSuccess;
+}
+
+static void resetHccsP2pGroup(AscendHccsState *state) {
+  state->groupActive = false;
+  state->groupStream = nullptr;
+  state->groupSendBuffers.clear();
+  state->groupRecvBuffers.clear();
+  state->groupSendCounts.clear();
+  state->groupRecvCounts.clear();
+  state->groupSendTypes.clear();
+  state->groupRecvTypes.clear();
+  state->groupHasSend.clear();
+  state->groupHasRecv.clear();
+}
+
+extern "C" flagcxResult_t
+flagcxAscendUniRunnerHccsGroupStart(flagcxComm_t comm,
+                                   flagcxStream_t stream) {
+  if (comm == nullptr || stream == nullptr || comm->nranks < 2)
+    return flagcxInvalidArgument;
+  FLAGCXCHECK(flagcxAscendUniRunnerHccsPrepare(comm));
+  AscendHccsState *state =
+      static_cast<AscendHccsState *>(comm->ascendHccsState);
+  if (state == nullptr)
+    return flagcxInternalError;
+
+  std::lock_guard<std::mutex> guard(state->mutex);
+  if (state->groupActive)
+    return flagcxInvalidUsage;
+  const size_t ranks = static_cast<size_t>(comm->nranks);
+  state->groupActive = true;
+  state->groupStream = stream;
+  state->groupSendBuffers.assign(ranks, nullptr);
+  state->groupRecvBuffers.assign(ranks, nullptr);
+  state->groupSendCounts.assign(ranks, 0);
+  state->groupRecvCounts.assign(ranks, 0);
+  state->groupSendTypes.assign(ranks, flagcxInt8);
+  state->groupRecvTypes.assign(ranks, flagcxInt8);
+  state->groupHasSend.assign(ranks, false);
+  state->groupHasRecv.assign(ranks, false);
+  return flagcxSuccess;
+}
+
+extern "C" flagcxResult_t flagcxAscendUniRunnerHccsSend(
+    const void *sendbuff, size_t count, flagcxDataType_t datatype, int peer,
+    flagcxComm_t comm) {
+  if (comm == nullptr || peer < 0 || peer >= comm->nranks ||
+      (count != 0 && sendbuff == nullptr))
+    return flagcxInvalidArgument;
+  AscendHccsState *state =
+      static_cast<AscendHccsState *>(comm->ascendHccsState);
+  if (state == nullptr)
+    return flagcxInvalidUsage;
+  std::lock_guard<std::mutex> guard(state->mutex);
+  const size_t index = static_cast<size_t>(peer);
+  if (!state->groupActive || state->groupHasSend[index])
+    return flagcxInvalidUsage;
+  state->groupSendBuffers[index] = sendbuff;
+  state->groupSendCounts[index] = count;
+  state->groupSendTypes[index] = datatype;
+  state->groupHasSend[index] = true;
+  return flagcxSuccess;
+}
+
+extern "C" flagcxResult_t flagcxAscendUniRunnerHccsRecv(
+    void *recvbuff, size_t count, flagcxDataType_t datatype, int peer,
+    flagcxComm_t comm) {
+  if (comm == nullptr || peer < 0 || peer >= comm->nranks ||
+      (count != 0 && recvbuff == nullptr))
+    return flagcxInvalidArgument;
+  AscendHccsState *state =
+      static_cast<AscendHccsState *>(comm->ascendHccsState);
+  if (state == nullptr)
+    return flagcxInvalidUsage;
+  std::lock_guard<std::mutex> guard(state->mutex);
+  const size_t index = static_cast<size_t>(peer);
+  if (!state->groupActive || state->groupHasRecv[index])
+    return flagcxInvalidUsage;
+  state->groupRecvBuffers[index] = recvbuff;
+  state->groupRecvCounts[index] = count;
+  state->groupRecvTypes[index] = datatype;
+  state->groupHasRecv[index] = true;
+  return flagcxSuccess;
+}
+
+extern "C" flagcxResult_t
+flagcxAscendUniRunnerHccsGroupEnd(flagcxComm_t comm) {
+  if (comm == nullptr)
+    return flagcxInvalidArgument;
+  AscendHccsState *state =
+      static_cast<AscendHccsState *>(comm->ascendHccsState);
+  if (state == nullptr)
+    return flagcxInvalidUsage;
+
+  const void *sendBase = nullptr;
+  void *recvBase = nullptr;
+  size_t count = 0;
+  flagcxDataType_t datatype = flagcxInt8;
+  flagcxStream_t stream = nullptr;
+  flagcxResult_t validation = flagcxSuccess;
+  {
+    std::lock_guard<std::mutex> guard(state->mutex);
+    if (!state->groupActive)
+      return flagcxInvalidUsage;
+    stream = state->groupStream;
+    if (state->groupHasSend.empty() || state->groupHasRecv.empty()) {
+      validation = flagcxInvalidUsage;
+    } else {
+      count = state->groupSendCounts[0];
+      datatype = state->groupSendTypes[0];
+      const size_t typeSize = getFlagcxDataTypeSize(datatype);
+      if (typeSize == 0 ||
+          count > std::numeric_limits<size_t>::max() / typeSize) {
+        validation = flagcxInvalidArgument;
+      } else {
+        const size_t peerBytes = count * typeSize;
+        sendBase = state->groupSendBuffers[0];
+        recvBase = state->groupRecvBuffers[0];
+        const uintptr_t sendAddress =
+            reinterpret_cast<uintptr_t>(sendBase);
+        const uintptr_t recvAddress =
+            reinterpret_cast<uintptr_t>(recvBase);
+        for (int peer = 0; peer < comm->nranks; ++peer) {
+          const size_t index = static_cast<size_t>(peer);
+          if (!state->groupHasSend[index] || !state->groupHasRecv[index] ||
+              state->groupSendCounts[index] != count ||
+              state->groupRecvCounts[index] != count ||
+              state->groupSendTypes[index] != datatype ||
+              state->groupRecvTypes[index] != datatype ||
+              reinterpret_cast<uintptr_t>(state->groupSendBuffers[index]) !=
+                  sendAddress + index * peerBytes ||
+              reinterpret_cast<uintptr_t>(state->groupRecvBuffers[index]) !=
+                  recvAddress + index * peerBytes) {
+            validation = flagcxNotSupported;
+            break;
+          }
+        }
+      }
+    }
+    resetHccsP2pGroup(state);
+  }
+  if (validation != flagcxSuccess)
+    return validation;
+  return flagcxAscendUniRunnerHccsAlltoAll(
+      sendBase, recvBase, count, datatype, comm, stream);
+}
+
 static int checkedHcommResult(int result, const char *operation,
                               uint32_t rank) {
   if (result != 0) {
@@ -766,35 +957,13 @@ extern "C" flagcxResult_t flagcxAscendUniRunnerHccsAlltoAll(
     return flagcxInvalidArgument;
   const size_t totalBytes = peerBytes * static_cast<size_t>(comm->nranks);
 
-  AscendHccsState *state = getOrCreateHccsState(comm);
-  if (state == nullptr) {
-    return agreeHccsSetupResult(comm, flagcxSystemError);
-  }
+  FLAGCXCHECK(flagcxAscendUniRunnerHccsPrepare(comm));
+  AscendHccsState *state =
+      static_cast<AscendHccsState *>(comm->ascendHccsState);
+  if (state == nullptr)
+    return flagcxInternalError;
 
   std::lock_guard<std::mutex> guard(state->mutex);
-  if (!state->initAttempted) {
-    // State allocation itself is rank-local. Match a peer that failed its
-    // allocation at the same control-plane rendezvous before beginning the
-    // multi-stage HCOMM setup; otherwise the successful ranks would perform
-    // one extra agreement and could wait forever.
-    flagcxResult_t allocationResult =
-        agreeHccsSetupResult(comm, flagcxSuccess);
-    if (allocationResult != flagcxSuccess) {
-      state->initAttempted = true;
-      state->initResult = allocationResult;
-      state->poisoned = true;
-      return allocationResult;
-    }
-
-    state->initAttempted = true;
-    flagcxResult_t localResult = initializeHccsState(state, comm);
-    state->initResult = agreeHccsSetupResult(comm, localResult);
-    state->initialized = state->initResult == flagcxSuccess;
-    state->poisoned = !state->initialized;
-  }
-  if (!state->initialized || state->poisoned)
-    return state->initResult == flagcxSuccess ? flagcxUnhandledDeviceError
-                                              : state->initResult;
 
   flagcxResult_t result =
       hccsRuntimeResult(aclrtSetDevice(state->device), "aclrtSetDevice",
@@ -960,6 +1129,48 @@ flagcxAscendUniRunnerHccsFinishDestroy(flagcxComm_t comm) {
 }
 
 #else
+
+extern "C" flagcxResult_t
+flagcxAscendUniRunnerHccsPrepare(flagcxComm_t comm) {
+  (void)comm;
+  return flagcxNotSupported;
+}
+
+extern "C" flagcxResult_t
+flagcxAscendUniRunnerHccsGroupStart(flagcxComm_t comm,
+                                   flagcxStream_t stream) {
+  (void)comm;
+  (void)stream;
+  return flagcxNotSupported;
+}
+
+extern "C" flagcxResult_t flagcxAscendUniRunnerHccsSend(
+    const void *sendbuff, size_t count, flagcxDataType_t datatype, int peer,
+    flagcxComm_t comm) {
+  (void)sendbuff;
+  (void)count;
+  (void)datatype;
+  (void)peer;
+  (void)comm;
+  return flagcxNotSupported;
+}
+
+extern "C" flagcxResult_t flagcxAscendUniRunnerHccsRecv(
+    void *recvbuff, size_t count, flagcxDataType_t datatype, int peer,
+    flagcxComm_t comm) {
+  (void)recvbuff;
+  (void)count;
+  (void)datatype;
+  (void)peer;
+  (void)comm;
+  return flagcxNotSupported;
+}
+
+extern "C" flagcxResult_t
+flagcxAscendUniRunnerHccsGroupEnd(flagcxComm_t comm) {
+  (void)comm;
+  return flagcxNotSupported;
+}
 
 extern "C" flagcxResult_t flagcxAscendUniRunnerHccsAlltoAll(
     const void *sendbuff, void *recvbuff, size_t count,

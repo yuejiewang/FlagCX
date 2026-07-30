@@ -525,6 +525,18 @@ out:
 flagcxResult_t uniRunnerAlltoAll(const void *sendbuff, void *recvbuff,
                                  size_t count, flagcxDataType_t datatype,
                                  flagcxComm_t comm, flagcxStream_t stream) {
+  if (comm == NULL || stream == NULL || comm->heteroComm == NULL ||
+      comm->heteroComm->proxyState == NULL) {
+    return flagcxInvalidArgument;
+  }
+  size_t totalBytes = 0;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(
+      count, static_cast<size_t>(comm->nranks), datatype, &totalBytes));
+  if (totalBytes == 0)
+    return flagcxSuccess;
+  if (sendbuff == NULL || recvbuff == NULL)
+    return flagcxInvalidArgument;
+
 #ifdef USE_ASCEND_ADAPTOR
   const bool useHccsA2A = flagcxParamUniRunnerUseHccsA2A() != 0;
   const bool useIpcA2A = flagcxParamUniRunnerUseIpcA2A() != 0;
@@ -539,26 +551,39 @@ flagcxResult_t uniRunnerAlltoAll(const void *sendbuff, void *recvbuff,
            "capture; refusing to fall back to another transport");
       return flagcxNotSupported;
     }
-    return flagcxAscendUniRunnerHccsAlltoAll(sendbuff, recvbuff, count,
-                                             datatype, comm, stream);
   }
   if (useIpcA2A) {
     return ascendUniRunnerIpcPeerAlltoAll(sendbuff, recvbuff, count, datatype,
                                           comm, stream);
   }
 #endif
-  size_t size = count * getFlagcxDataTypeSize(datatype);
-  const char *bufferIn = static_cast<const char *>(sendbuff);
-  char *bufferOut = static_cast<char *>(recvbuff);
-  FLAGCXCHECK(flagcxHeteroGroupStart());
-  for (int r = 0; r < comm->nranks; r++) {
-    FLAGCXCHECK(flagcxHeteroSend(static_cast<const void *>(bufferIn + r * size),
-                                 count, datatype, r, comm->heteroComm, stream));
-    FLAGCXCHECK(flagcxHeteroRecv(static_cast<void *>(bufferOut + r * size),
-                                 count, datatype, r, comm->heteroComm, stream));
+
+  flagcxResult_t result = initUniRunner(comm, stream);
+  const bool runnerInitialized = result == flagcxSuccess;
+  if (result != flagcxSuccess)
+    return result;
+
+  flagcxUniRunnerState *runnerState =
+      &comm->heteroComm->proxyState->uniRunnerState;
+#ifdef USE_ASCEND_ADAPTOR
+  if (useHccsA2A && comm->nranks > 1) {
+    runnerState->p2pTransport = uniRunnerP2pTransportAscendHccs;
+    result = flagcxAscendUniRunnerHccsPrepare(comm);
   }
-  FLAGCXCHECK(flagcxHeteroGroupEnd());
-  return flagcxSuccess;
+#endif
+  if (result == flagcxSuccess) {
+    result = initUniRunnerStateP2pA2A(runnerState, sendbuff, recvbuff, count,
+                                      datatype, comm);
+  }
+  if (result == flagcxSuccess)
+    result = runUniRunner(comm);
+
+  if (runnerInitialized) {
+    flagcxResult_t cleanupResult = cleanupUniRunner(comm);
+    if (result == flagcxSuccess)
+      result = cleanupResult;
+  }
+  return result;
 }
 
 flagcxResult_t uniRunnerAlltoAllv(const void *sendbuff, size_t *sendcounts,

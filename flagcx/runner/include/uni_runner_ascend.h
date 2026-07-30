@@ -24,15 +24,23 @@ flagcxResult_t flagcxAscendUniRunnerLaunchReduce(
     flagcxDataType_t datatype, flagcxRedOp_t redOp, uint64_t avgDivisor,
     size_t nBlocks, flagcxStream_t stream);
 
-// Correctness-first Ascend A2 AlltoAll for CANN 9.0.0-beta.1, implemented
-// with HCOMM operations over channels that are explicitly constrained to
-// COMM_PROTOCOL_HCCS. User data is staged through the HCCL-managed
-// communication buffer because arbitrary HCOMM memory registration is not
-// available on Atlas A2.
-//
-// The operation is intentionally synchronous: it first orders itself after
-// the caller stream, then drains its dedicated HCOMM stream before returning.
-// It never calls HcclAlltoAll and never falls back to socket or host staging.
+// Prepare communicator-scoped HCOMM/HCCS resources independently from any
+// collective algorithm. P2P DAG nodes subsequently submit send/recv
+// primitives through this group API.
+flagcxResult_t flagcxAscendUniRunnerHccsPrepare(flagcxComm_t comm);
+flagcxResult_t flagcxAscendUniRunnerHccsGroupStart(flagcxComm_t comm,
+                                                  flagcxStream_t stream);
+flagcxResult_t flagcxAscendUniRunnerHccsSend(const void *sendbuff,
+                                            size_t count,
+                                            flagcxDataType_t datatype,
+                                            int peer, flagcxComm_t comm);
+flagcxResult_t flagcxAscendUniRunnerHccsRecv(void *recvbuff, size_t count,
+                                            flagcxDataType_t datatype,
+                                            int peer, flagcxComm_t comm);
+flagcxResult_t flagcxAscendUniRunnerHccsGroupEnd(flagcxComm_t comm);
+
+// Internal symmetric-group executor retained behind the transport interface.
+// Collective entry points must use the P2P DAG and group API above.
 flagcxResult_t flagcxAscendUniRunnerHccsAlltoAll(
     const void *sendbuff, void *recvbuff, size_t count,
     flagcxDataType_t datatype, flagcxComm_t comm, flagcxStream_t stream);
