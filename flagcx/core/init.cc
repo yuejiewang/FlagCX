@@ -469,7 +469,8 @@ flagcxResult_t flagcxHeteroCommDestroy(flagcxHeteroComm_t comm) {
   FLAGCXCHECK(flagcxProxyStop(comm));
   // Destroy: join thread, free proxy resources
   FLAGCXCHECK(flagcxProxyDestroy(comm));
-  if (comm->proxyState->uniRunnerState.streamFlagsPool != NULL ||
+  if (comm->proxyState->uniRunnerState.runtimeInitialized ||
+      comm->proxyState->uniRunnerState.streamFlagsPool != NULL ||
       comm->proxyState->uniRunnerState.streamFlags != NULL ||
       comm->proxyState->uniRunnerState.streamFlagsCapacity != 0 ||
       comm->proxyState->uniRunnerState.ipcInputMem != NULL ||

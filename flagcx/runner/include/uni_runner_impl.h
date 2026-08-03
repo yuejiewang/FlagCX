@@ -128,6 +128,7 @@ typedef struct {
   flagcxStream_t commStream;
   flagcxStream_t redStream;
   flagcxStream_t cpyStream;
+  bool runtimeInitialized;
 
   // new: DAG and scheduling queues
   struct uniRunnerDagNode *dagNodes; // Array of all DAG nodes

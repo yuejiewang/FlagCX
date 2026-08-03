@@ -3511,6 +3511,90 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
   return flagcxSuccess;
 }
 
+static flagcxResult_t resetUniRunnerFifo(flagcxFifo_t fifo) {
+  if (fifo == NULL || fifo->buffer == NULL)
+    return flagcxSuccess;
+  __atomic_store_n(fifo->buffer + flagcxFifoIdxConsumed, uint64_t(0),
+                   __ATOMIC_RELEASE);
+  __atomic_store_n(fifo->buffer + flagcxFifoIdxProduced, uint64_t(0),
+                   __ATOMIC_RELEASE);
+  __atomic_store_n(fifo->buffer + flagcxFifoIdxTerminate, uint64_t(0),
+                   __ATOMIC_RELEASE);
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+destroyUniRunnerRuntimeResources(flagcxUniRunnerState *runnerState) {
+  if (runnerState == NULL)
+    return flagcxSuccess;
+
+  if (runnerState->redStream != NULL) {
+    FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->redStream));
+    FLAGCXCHECK(deviceAdaptor->streamDestroy(runnerState->redStream));
+    runnerState->redStream = NULL;
+  }
+  if (runnerState->cpyStream != NULL) {
+    FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->cpyStream));
+    FLAGCXCHECK(deviceAdaptor->streamDestroy(runnerState->cpyStream));
+    runnerState->cpyStream = NULL;
+  }
+  if (runnerState->fifo != NULL) {
+    if (runnerState->fifo->buffer != NULL) {
+      FLAGCXCHECK(runnerState->fifo->flagcxRedFifoDestroy());
+    }
+    delete runnerState->fifo;
+    runnerState->fifo = NULL;
+  }
+  if (runnerState->ipcFifo != NULL) {
+    if (runnerState->ipcFifo->buffer != NULL) {
+      FLAGCXCHECK(runnerState->ipcFifo->flagcxIpcFifoDestroy());
+    }
+    delete runnerState->ipcFifo;
+    runnerState->ipcFifo = NULL;
+  }
+  runnerState->ipcFifoDevicePtr = NULL;
+  runnerState->runtimeInitialized = false;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+ensureUniRunnerRuntimeResources(flagcxUniRunnerState *runnerState,
+                                flagcxHeteroComm_t hcomm) {
+  if (runnerState->runtimeInitialized) {
+    FLAGCXCHECK(resetUniRunnerFifo(runnerState->fifo));
+    return resetUniRunnerFifo(runnerState->ipcFifo);
+  }
+
+  flagcxResult_t ret = flagcxSuccess;
+  runnerState->fifo = new flagcxFifo();
+  runnerState->fifo->buffer = NULL;
+  FLAGCXCHECKGOTO(runnerState->fifo->flagcxRedFifoInit(), ret, fail);
+  FLAGCXCHECKGOTO(deviceAdaptor->hostGetDevicePointer(
+                      &hcomm->uniRunnerFifoBuffer,
+                      static_cast<void *>(runnerState->fifo->buffer)),
+                  ret, fail);
+
+  runnerState->ipcFifo = new flagcxFifo();
+  runnerState->ipcFifo->buffer = NULL;
+  FLAGCXCHECKGOTO(runnerState->ipcFifo->flagcxIpcFifoInit(), ret, fail);
+  FLAGCXCHECKGOTO(deviceAdaptor->hostGetDevicePointer(
+                      &runnerState->ipcFifoDevicePtr,
+                      static_cast<void *>(runnerState->ipcFifo->buffer)),
+                  ret, fail);
+
+  FLAGCXCHECKGOTO(deviceAdaptor->streamCreate(&runnerState->redStream), ret,
+                  fail);
+  FLAGCXCHECKGOTO(deviceAdaptor->streamCreate(&runnerState->cpyStream), ret,
+                  fail);
+  runnerState->runtimeInitialized = true;
+  return flagcxSuccess;
+
+fail:
+  (void)destroyUniRunnerRuntimeResources(runnerState);
+  hcomm->uniRunnerFifoBuffer = NULL;
+  return ret;
+}
+
 flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
@@ -3530,19 +3614,7 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   // Set device context
   FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
 
-  // Create FIFO
-  runnerState->fifo = new flagcxFifo();
-  FLAGCXCHECK(runnerState->fifo->flagcxRedFifoInit());
-  // hcomm->proxyState->uniRunnerState.fifo->buffer is the host pointer
-  // hcomm->uniRunnerFifoBuffer stores the device pointer to fifo buffer
-  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
-      &hcomm->uniRunnerFifoBuffer, (void *)runnerState->fifo->buffer));
-
-  runnerState->ipcFifo = new flagcxFifo();
-  FLAGCXCHECK(runnerState->ipcFifo->flagcxIpcFifoInit());
-  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
-      &runnerState->ipcFifoDevicePtr,
-      static_cast<void *>(runnerState->ipcFifo->buffer)));
+  FLAGCXCHECK(ensureUniRunnerRuntimeResources(runnerState, hcomm));
 
   // Initialize queues
   flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
@@ -3550,13 +3622,6 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   flagcxIntruQueueConstruct(&runnerState->ipcReadyQueue);
   runnerState->numPendingNodes = 0;
 
-  // Create dedicated reduce and copy streams
-  flagcxStream_t redStream;
-  FLAGCXCHECK(deviceAdaptor->streamCreate(&redStream));
-  flagcxStream_t cpyStream;
-  FLAGCXCHECK(deviceAdaptor->streamCreate(&cpyStream));
-  runnerState->redStream = redStream;
-  runnerState->cpyStream = cpyStream;
   runnerState->commStream = stream;
   return flagcxSuccess;
 }
@@ -3578,20 +3643,6 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
   FLAGCXCHECK(deviceAdaptor->streamSynchronize(commStream));
 
   hcomm->proxyState->uniRunnerState.streamFlagsSize = 0;
-
-  // Destroy streams
-  FLAGCXCHECK(deviceAdaptor->streamDestroy(redStream));
-  FLAGCXCHECK(deviceAdaptor->streamDestroy(cpyStream));
-
-  // Destroy fifo
-  FLAGCXCHECK(hcomm->proxyState->uniRunnerState.fifo->flagcxRedFifoDestroy());
-  delete hcomm->proxyState->uniRunnerState.fifo;
-  hcomm->uniRunnerFifoBuffer = NULL;
-  FLAGCXCHECK(
-      hcomm->proxyState->uniRunnerState.ipcFifo->flagcxIpcFifoDestroy());
-  delete hcomm->proxyState->uniRunnerState.ipcFifo;
-  hcomm->proxyState->uniRunnerState.ipcFifo = NULL;
-  hcomm->proxyState->uniRunnerState.ipcFifoDevicePtr = NULL;
 
   if (hcomm->proxyState->uniRunnerState.ipcParentFlagsDevice != NULL) {
     FLAGCXCHECK(deviceAdaptor->deviceFree(
@@ -3687,5 +3738,5 @@ cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState) {
   }
   runnerState->ipcParentFlagsDevice = NULL;
   runnerState->ipcParentFlagsCount = 0;
-  return flagcxSuccess;
+  return destroyUniRunnerRuntimeResources(runnerState);
 }
