@@ -218,6 +218,10 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
 size_t getUniRunnerDagPatternHash(const uniRunnerDagCacheKey &key);
 flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream);
 
+// Validate executor launch parameters before allocating per-invocation
+// resources. Reduction collectives require at least one RED executor block.
+flagcxResult_t validateUniRunnerLaunchConfig(flagcxCommOp_t commOp);
+
 // Validate public reduction arguments before allocating buffers or publishing
 // any RED node to the FIFO.
 flagcxResult_t validateUniRunnerReduceArgs(size_t count,

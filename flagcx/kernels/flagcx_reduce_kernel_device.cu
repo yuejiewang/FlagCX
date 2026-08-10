@@ -8,6 +8,7 @@
 #endif
 
 #include <math.h>
+#include <limits>
 #include <type_traits>
 
 #define SLOT_IDX 4
@@ -725,6 +726,20 @@ flagcxResult_t flagcxLaunchCollectiveKernel(
     flagcxDevMem_t outputMem, flagcxDevMem_t readyMem,
     const uint64_t *ipcParentFlags, size_t nthreads, size_t nRedBlocks,
     size_t nIpcBlocks, uint64_t avgDivisor, flagcxStream_t stream) {
+  if (nRedBlocks == 0 && nIpcBlocks == 0) {
+    return flagcxSuccess;
+  }
+  const size_t maxBlocks =
+      static_cast<size_t>(std::numeric_limits<int>::max());
+  if (nRedBlocks > maxBlocks || nIpcBlocks > maxBlocks ||
+      nRedBlocks > maxBlocks - nIpcBlocks) {
+    return flagcxInvalidArgument;
+  }
+  if (nthreads == 0) {
+    return flagcxInvalidArgument;
+  }
+  const size_t nblocks = nRedBlocks + nIpcBlocks;
+
   flagcxDevMem input;
   flagcxDevMem output;
   flagcxDevMem ready;
@@ -734,7 +749,6 @@ flagcxResult_t flagcxLaunchCollectiveKernel(
     output = flagcxDevMem(*outputMem);
   if (readyMem != nullptr)
     ready = flagcxDevMem(*readyMem);
-  size_t nblocks = nRedBlocks + nIpcBlocks;
   flagcxCollectiveKernel<<<nblocks, nthreads, 0,
                            *(FLAGCX_DEVICE_STREAM_PTR)stream>>>(
       redFifoBuffer, ipcFifoBuffer, input, output, ready, ipcParentFlags,

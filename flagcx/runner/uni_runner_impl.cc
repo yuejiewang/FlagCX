@@ -37,6 +37,48 @@ FLAGCX_PARAM(UniRunnerIpcChunkSize, "UNIRUNNER_IPCCHUNKSIZE", 262144);
 FLAGCX_PARAM(UniRunnerNRedSlices, "UNIRUNNER_NREDSLICES", 0);
 FLAGCX_PARAM(UniRunnerRedSliceSize, "UNIRUNNER_REDSLICESIZE", 65536);
 
+static flagcxResult_t loadUniRunnerLaunchConfig(uint64_t *nthreads,
+                                                uint64_t *nRedBlocks,
+                                                uint64_t *nIpcBlocks) {
+  const int64_t rawNthreads = flagcxParamUniRunnerNThreads();
+  const int64_t rawNRedBlocks = flagcxParamUniRunnerNRedBlocks();
+  const int64_t rawNIpcBlocks = flagcxParamUniRunnerNIpcBlocks();
+  const int64_t maxBlocks = std::numeric_limits<int>::max();
+
+  if (rawNthreads <= 0 || rawNRedBlocks < 0 || rawNIpcBlocks < 0) {
+    WARN("UniRunner requires NTHREADS > 0, NREDBLOCKS >= 0 and "
+         "NIPCBLOCKS >= 0");
+    return flagcxInvalidArgument;
+  }
+  if (rawNRedBlocks > maxBlocks || rawNIpcBlocks > maxBlocks ||
+      rawNRedBlocks > maxBlocks - rawNIpcBlocks) {
+    WARN("UniRunner executor block count exceeds the supported launch range");
+    return flagcxInvalidArgument;
+  }
+
+  *nthreads = static_cast<uint64_t>(rawNthreads);
+  *nRedBlocks = static_cast<uint64_t>(rawNRedBlocks);
+  *nIpcBlocks = static_cast<uint64_t>(rawNIpcBlocks);
+  return flagcxSuccess;
+}
+
+flagcxResult_t validateUniRunnerLaunchConfig(flagcxCommOp_t commOp) {
+  uint64_t nthreads = 0;
+  uint64_t nRedBlocks = 0;
+  uint64_t nIpcBlocks = 0;
+  FLAGCXCHECK(
+      loadUniRunnerLaunchConfig(&nthreads, &nRedBlocks, &nIpcBlocks));
+
+  if (nRedBlocks == 0 &&
+      (commOp == flagcxCommOpReduce || commOp == flagcxCommOpAllReduce ||
+       commOp == flagcxCommOpReduceScatter)) {
+    WARN("FLAGCX_UNIRUNNER_NREDBLOCKS=0 is not valid for %s",
+         uniRunnerCommOpToString(commOp));
+    return flagcxInvalidArgument;
+  }
+  return flagcxSuccess;
+}
+
 static flagcxResult_t ensureUniRunnerIpcDataViews(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm,
     const void *sendbuff, void *recvbuff, size_t bytes);
@@ -501,6 +543,10 @@ static flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState) {
         }
         break;
       case uniRunnerDagNodeTypeRed:
+        if (runnerState->uniRunnerNRedBlocks == 0) {
+          WARN("UniRunner DAG contains RED work but NREDBLOCKS is zero");
+          return flagcxInvalidArgument;
+        }
         if (!isValidUniRunnerDataType(node->nodeData.red.datatype) ||
             !isValidUniRunnerRedOp(node->nodeData.red.redOp) ||
             node->nodeData.red.count >
@@ -518,6 +564,10 @@ static flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState) {
         }
         break;
       case uniRunnerDagNodeTypeIpc:
+        if (runnerState->uniRunnerNIpcBlocks == 0) {
+          WARN("UniRunner DAG contains IPC work but NIPCBLOCKS is zero");
+          return flagcxInvalidArgument;
+        }
         break;
       default:
         return flagcxInternalError;
@@ -3470,21 +3520,13 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->ipcReadySlots = 0;
 
   runnerState->uniRunnerNSlices = flagcxParamUniRunnerNSlices();
-  runnerState->uniRunnerNThreads = flagcxParamUniRunnerNThreads();
-  runnerState->uniRunnerNRedBlocks = flagcxParamUniRunnerNRedBlocks();
-  runnerState->uniRunnerNIpcBlocks = flagcxParamUniRunnerNIpcBlocks();
+  FLAGCXCHECK(loadUniRunnerLaunchConfig(
+      &runnerState->uniRunnerNThreads, &runnerState->uniRunnerNRedBlocks,
+      &runnerState->uniRunnerNIpcBlocks));
   runnerState->uniRunnerIpcChunkSize = flagcxParamUniRunnerIpcChunkSize();
   runnerState->uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
   runnerState->uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
   runnerState->avgDivisor = 1;
-  if (runnerState->uniRunnerNThreads == 0 ||
-      runnerState->uniRunnerNRedBlocks == 0 ||
-      runnerState->uniRunnerNIpcBlocks == 0) {
-    WARN("UniRunner requires NTHREADS, NREDBLOCKS and NIPCBLOCKS to be "
-         "greater than zero");
-    return flagcxInvalidArgument;
-  }
-
   // Set device context
   FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
 
@@ -3567,6 +3609,7 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   flagcxFifo_t fifo = hcomm->proxyState->uniRunnerState.fifo;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
+  FLAGCXCHECK(validateDagNodes(runnerState));
   FLAGCXCHECK(prepareDagStreamFlags(runnerState));
   FLAGCXCHECK(prepareUniRunnerIpcParentFlags(runnerState));
   if (runnerState->ipcReadySlots != 0) {
@@ -3576,14 +3619,20 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   }
 
 #ifdef COMPILE_KERNEL_HOST
-  // Launch collective kernel
-  FLAGCXCHECK(flagcxLaunchCollectiveKernel(
-      hcomm->uniRunnerFifoBuffer, runnerState->ipcFifoDevicePtr,
-      runnerState->ipcInputMem, runnerState->ipcOutputMem,
-      runnerState->ipcReadyMem, runnerState->ipcParentFlagsDevice,
-      runnerState->uniRunnerNThreads, runnerState->uniRunnerNRedBlocks,
-      runnerState->uniRunnerNIpcBlocks, runnerState->avgDivisor,
-      runnerState->redStream));
+  if (runnerState->uniRunnerNRedBlocks != 0 ||
+      runnerState->uniRunnerNIpcBlocks != 0) {
+    FLAGCXCHECK(flagcxLaunchCollectiveKernel(
+        hcomm->uniRunnerFifoBuffer, runnerState->ipcFifoDevicePtr,
+        runnerState->ipcInputMem, runnerState->ipcOutputMem,
+        runnerState->ipcReadyMem, runnerState->ipcParentFlagsDevice,
+        runnerState->uniRunnerNThreads, runnerState->uniRunnerNRedBlocks,
+        runnerState->uniRunnerNIpcBlocks, runnerState->avgDivisor,
+        runnerState->redStream));
+  } else {
+    TRACE(FLAGCX_UNIRUNNER,
+          "runUniRunner: skipping collective kernel launch because both "
+          "executor block counts are zero");
+  }
 #endif
 
   // Main scheduling loop using DAG-based queue scheduling
@@ -3604,9 +3653,9 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
 
     FLAGCXCHECK(processReadyQueue(runnerState, hcomm));
   }
-  deviceAdaptor->streamSynchronize(runnerState->redStream);
-  deviceAdaptor->streamSynchronize(runnerState->cpyStream);
-  deviceAdaptor->streamSynchronize(runnerState->commStream);
+  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->redStream));
+  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->cpyStream));
+  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->commStream));
 
   return flagcxSuccess;
 }

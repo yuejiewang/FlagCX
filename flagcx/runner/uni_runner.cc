@@ -44,6 +44,7 @@ flagcxResult_t uniRunnerReduce(const void *sendbuff, void *recvbuff,
   void *scratchbuff = nullptr;
   size_t scratchBytes = 0;
   FLAGCXCHECK(validateUniRunnerReduceArgs(count, datatype, op));
+  FLAGCXCHECK(validateUniRunnerLaunchConfig(flagcxCommOpReduce));
   FLAGCXCHECK(checkedUniRunnerTypeBytes(count, 2, datatype, &scratchBytes));
   FLAGCXCHECK(deviceAdaptor->deviceMalloc(&scratchbuff, scratchBytes,
                                           flagcxMemDevice, stream));
@@ -126,6 +127,7 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   FLAGCXCHECK(validateUniRunnerReduceArgs(count, datatype, op));
+  FLAGCXCHECK(validateUniRunnerLaunchConfig(flagcxCommOpAllReduce));
   FLAGCXCHECK(initUniRunner(comm, stream));
   if (flagcxParamUniRunnerUseIpcAR()) {
     /* Sliced AllReduce with intra-node IPC/LSA push transport. */
@@ -170,6 +172,7 @@ flagcxResult_t uniRunnerReduceScatter(const void *sendbuff, void *recvbuff,
   void *scratchbuff = nullptr;
   size_t scratchBytes = 0;
   FLAGCXCHECK(validateUniRunnerReduceArgs(recvcount, datatype, op));
+  FLAGCXCHECK(validateUniRunnerLaunchConfig(flagcxCommOpReduceScatter));
   FLAGCXCHECK(checkedUniRunnerTypeBytes(recvcount, comm->nranks, datatype,
                                         &scratchBytes));
   FLAGCXCHECK(deviceAdaptor->deviceMalloc(&scratchbuff, scratchBytes,
@@ -209,6 +212,7 @@ flagcxResult_t uniRunnerAllGather(const void *sendbuff, void *recvbuff,
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   int groupSize = resolveUniRunnerGroupedAGGroupSize(comm);
 
+  FLAGCXCHECK(validateUniRunnerLaunchConfig(flagcxCommOpAllGather));
   FLAGCXCHECKGOTO(initUniRunner(comm, stream), res, out);
   FLAGCXCHECKGOTO(initUniRunnerStateGroupedAG(runnerState, sendbuff, recvbuff,
                                               sendcount, datatype, comm,
