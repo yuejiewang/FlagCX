@@ -95,7 +95,8 @@ flagcxResult_t flagcxGetStaticReduceKernelMaxExecutorBlocks(
     size_t nthreads, size_t *maxExecutorBlocks);
 flagcxResult_t flagcxLaunchStaticReduceKernel(
     void *redFifoDeviceBuffer, size_t numTriggers, size_t nthreads,
-    size_t nRedBlocks, uint64_t avgDivisor, flagcxStream_t stream);
+    size_t nRedBlocks, size_t maxExecutorBlocks, uint64_t avgDivisor,
+    flagcxStream_t stream);
 
 // ==========================================================================
 // Device Communicator — Host-side lifecycle management

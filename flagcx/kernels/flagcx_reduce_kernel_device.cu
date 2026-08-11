@@ -918,7 +918,8 @@ flagcxResult_t flagcxGetStaticReduceKernelMaxExecutorBlocks(
 
 flagcxResult_t flagcxLaunchStaticReduceKernel(
     void *redFifoDeviceBuffer, size_t numTriggers, size_t nthreads,
-    size_t nRedBlocks, uint64_t avgDivisor, flagcxStream_t stream) {
+    size_t nRedBlocks, size_t maxExecutorBlocks, uint64_t avgDivisor,
+    flagcxStream_t stream) {
   if (numTriggers == 0) {
     return nRedBlocks == 0 ? flagcxSuccess : flagcxInvalidArgument;
   }
@@ -926,17 +927,9 @@ flagcxResult_t flagcxLaunchStaticReduceKernel(
       static_cast<size_t>(std::numeric_limits<int>::max());
   if (redFifoDeviceBuffer == nullptr || stream == nullptr || nthreads == 0 ||
       nRedBlocks == 0 || nRedBlocks > numTriggers || avgDivisor == 0 ||
-      numTriggers > maxInt || nthreads > maxInt || nRedBlocks > maxInt) {
-    return flagcxInvalidArgument;
-  }
-
-  size_t maxExecutorBlocks = 0;
-  flagcxResult_t result = flagcxGetStaticReduceKernelMaxExecutorBlocks(
-      nthreads, &maxExecutorBlocks);
-  if (result != flagcxSuccess) {
-    return result;
-  }
-  if (nRedBlocks > maxExecutorBlocks) {
+      numTriggers > maxInt || nthreads > maxInt || nRedBlocks > maxInt ||
+      maxExecutorBlocks == 0 || maxExecutorBlocks > maxInt ||
+      nRedBlocks > maxExecutorBlocks) {
     return flagcxInvalidArgument;
   }
 

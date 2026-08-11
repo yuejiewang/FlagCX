@@ -20,6 +20,7 @@
 #include <math.h>
 #include <limits>
 #include <mutex>
+#include <sched.h>
 #include <string>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -3482,11 +3483,14 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
   });
 }
 
-static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
-                                   flagcxHeteroComm_t comm) {
-  // Dequeue
-  uniRunnerDagNode *current =
-      flagcxIntruQueueDequeue(&runnerState->p2pReadyQueue);
+static flagcxResult_t launchHostDagNode(flagcxUniRunnerState *runnerState,
+                                        flagcxHeteroComm_t comm,
+                                        uniRunnerDagNode *current) {
+  if (runnerState == NULL || comm == NULL || current == NULL ||
+      current->nodeIdx < 0 ||
+      current->nodeIdx >= runnerState->numDagNodes) {
+    return flagcxInvalidArgument;
+  }
   void *flag = getDagNodeFlag(runnerState, current->nodeIdx);
   flagcxStream_t currentStream =
       getDagNodeExecutionStream(runnerState, current);
@@ -3576,6 +3580,35 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
     return flagcxSystemError;
   }
 
+  return flagcxSuccess;
+}
+
+static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
+                                   flagcxHeteroComm_t comm) {
+  uniRunnerDagNode *current =
+      flagcxIntruQueueDequeue(&runnerState->p2pReadyQueue);
+  if (current == NULL) {
+    return flagcxInternalError;
+  }
+  return launchHostDagNode(runnerState, comm, current);
+}
+
+static flagcxResult_t submitStaticHostDag(flagcxUniRunnerState *runnerState,
+                                          flagcxHeteroComm_t comm) {
+  for (size_t topoSlot = 0; topoSlot < runnerState->dagPlan.numNodes;
+       ++topoSlot) {
+    const int nodeIdx = runnerState->dagPlan.topoOrder[topoSlot];
+    if (nodeIdx < 0 || nodeIdx >= runnerState->numDagNodes) {
+      return flagcxInternalError;
+    }
+    uniRunnerDagNode *node = &runnerState->dagNodes[nodeIdx];
+    if (node->nodeType == uniRunnerDagNodeTypeP2p ||
+        node->nodeType == uniRunnerDagNodeTypeCpy) {
+      FLAGCXCHECK(launchHostDagNode(runnerState, comm, node));
+    } else if (node->nodeType != uniRunnerDagNodeTypeRed) {
+      return flagcxInternalError;
+    }
+  }
   return flagcxSuccess;
 }
 
@@ -3888,6 +3921,10 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->dagPlan.numIpcNodes = 0;
   runnerState->streamFlagsSize = 0;
   runnerState->ipcReadySlots = 0;
+  runnerState->fifo = NULL;
+  runnerState->ipcFifo = NULL;
+  runnerState->ipcFifoDevicePtr = NULL;
+  hcomm->uniRunnerFifoBuffer = NULL;
 
   FLAGCXCHECK(loadUniRunnerDagBuilderConfig(
       &runnerState->uniRunnerNSlices, &runnerState->uniRunnerNRedSlices,
@@ -3900,13 +3937,10 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   // Set device context
   FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
 
-  // Create FIFO
+  // RED allocation is deferred until the DAG plan is known. Static execution
+  // uses the exact RED node count, while the IPC fallback retains the legacy
+  // configured ring capacity.
   runnerState->fifo = new flagcxFifo();
-  FLAGCXCHECK(runnerState->fifo->flagcxRedFifoInit());
-  // hcomm->proxyState->uniRunnerState.fifo->buffer is the host pointer
-  // hcomm->uniRunnerFifoBuffer stores the device pointer to fifo buffer
-  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
-      &hcomm->uniRunnerFifoBuffer, (void *)runnerState->fifo->buffer));
 
   runnerState->ipcFifo = new flagcxFifo();
   FLAGCXCHECK(runnerState->ipcFifo->flagcxIpcFifoInit());
@@ -3956,6 +3990,7 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
   // Destroy fifo
   FLAGCXCHECK(hcomm->proxyState->uniRunnerState.fifo->flagcxRedFifoDestroy());
   delete hcomm->proxyState->uniRunnerState.fifo;
+  hcomm->proxyState->uniRunnerState.fifo = NULL;
   hcomm->uniRunnerFifoBuffer = NULL;
   FLAGCXCHECK(
       hcomm->proxyState->uniRunnerState.ipcFifo->flagcxIpcFifoDestroy());
@@ -3974,9 +4009,313 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
   return flagcxSuccess;
 }
 
+static flagcxResult_t initializeDynamicRedFifo(flagcxHeteroComm_t hcomm) {
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  if (runnerState->fifo == NULL || runnerState->fifo->buffer != NULL ||
+      hcomm->uniRunnerFifoBuffer != NULL) {
+    return flagcxInternalError;
+  }
+  FLAGCXCHECK(runnerState->fifo->flagcxRedFifoInit());
+  void *deviceBuffer = NULL;
+  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
+      &deviceBuffer, static_cast<void *>(runnerState->fifo->buffer)));
+  if (deviceBuffer == NULL) {
+    return flagcxSystemError;
+  }
+  hcomm->uniRunnerFifoBuffer = deviceBuffer;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t prepareStaticRedExecution(
+    flagcxHeteroComm_t hcomm, uniRunnerStaticExecutorSchedule *schedule,
+    size_t *numTriggers, size_t *maxExecutorBlocks) {
+  if (hcomm == NULL || schedule == NULL || numTriggers == NULL ||
+      maxExecutorBlocks == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *schedule = {};
+  *numTriggers = 0;
+  *maxExecutorBlocks = 0;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  if (runnerState->dagPlan.numIpcNodes != 0 || runnerState->fifo == NULL ||
+      runnerState->fifo->buffer != NULL ||
+      hcomm->uniRunnerFifoBuffer != NULL) {
+    return flagcxInternalError;
+  }
+
+  if (runnerState->dagPlan.numRedNodes == 0) {
+    return resolveUniRunnerStaticExecutorSchedule(
+        &runnerState->dagPlan,
+        static_cast<size_t>(runnerState->uniRunnerNRedBlocks), 0, 0,
+        schedule);
+  }
+
+#ifdef COMPILE_KERNEL_HOST
+  FLAGCXCHECK(flagcxGetStaticReduceKernelMaxExecutorBlocks(
+      static_cast<size_t>(runnerState->uniRunnerNThreads),
+      maxExecutorBlocks));
+  FLAGCXCHECK(resolveUniRunnerStaticExecutorSchedule(
+      &runnerState->dagPlan,
+      static_cast<size_t>(runnerState->uniRunnerNRedBlocks), 0,
+      *maxExecutorBlocks, schedule));
+#else
+  return flagcxNotSupported;
+#endif
+
+  if (schedule->numRedTasks != runnerState->dagPlan.numRedNodes ||
+      schedule->numIpcTasks != 0 || schedule->numRedBlocks == 0 ||
+      schedule->numIpcBlocks != 0) {
+    return flagcxInternalError;
+  }
+
+  const size_t redTasks = schedule->numRedTasks;
+  FLAGCXCHECK(runnerState->fifo->flagcxRedFifoInit(redTasks));
+  void *deviceBuffer = NULL;
+  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
+      &deviceBuffer, static_cast<void *>(runnerState->fifo->buffer)));
+  if (deviceBuffer == NULL) {
+    return flagcxSystemError;
+  }
+  hcomm->uniRunnerFifoBuffer = deviceBuffer;
+
+  flagcxReduceTrigger *triggers =
+      reinterpret_cast<flagcxReduceTrigger *>(
+          runnerState->fifo->buffer + flagcxFifoIdxData);
+  FLAGCXCHECK(populateUniRunnerStaticRedTriggers(
+      runnerState->dagNodes, static_cast<size_t>(runnerState->numDagNodes),
+      &runnerState->dagPlan, runnerState->streamFlags,
+      runnerState->streamFlagsSize, triggers, redTasks, numTriggers));
+  if (*numTriggers != redTasks ||
+      runnerState->fifo->buffer[flagcxFifoIdxCapacity] != redTasks) {
+    return flagcxInternalError;
+  }
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "static RED schedule: tasks=%zu requested_blocks=%llu "
+        "effective_blocks=%zu",
+        redTasks,
+        static_cast<unsigned long long>(runnerState->uniRunnerNRedBlocks),
+        schedule->numRedBlocks);
+  return flagcxSuccess;
+}
+
+static void preserveFirstUniRunnerError(flagcxResult_t candidate,
+                                        flagcxResult_t *result) {
+  if (*result == flagcxSuccess && candidate != flagcxSuccess) {
+    *result = candidate;
+  }
+}
+
+static flagcxResult_t drainUniRunnerStreams(flagcxUniRunnerState *runnerState,
+                                            flagcxResult_t result) {
+  preserveFirstUniRunnerError(
+      deviceAdaptor->streamSynchronize(runnerState->redStream), &result);
+  preserveFirstUniRunnerError(
+      deviceAdaptor->streamSynchronize(runnerState->cpyStream), &result);
+  preserveFirstUniRunnerError(
+      deviceAdaptor->streamSynchronize(runnerState->commStream), &result);
+  return result;
+}
+
+static flagcxResult_t abortAndDrainStaticExecution(
+    flagcxUniRunnerState *runnerState, flagcxStream_t recoveryStream,
+    flagcxResult_t result) {
+  if (runnerState->fifo != NULL && runnerState->fifo->buffer != NULL) {
+    __atomic_store_n(runnerState->fifo->buffer + flagcxFifoIdxTerminate, 1,
+                     __ATOMIC_RELEASE);
+  }
+
+  // The independent recovery stream can run even when an original stream is
+  // blocked behind a flag whose producer failed. The static RED kernel also
+  // observes the abort word and publishes its remaining output flags.
+  for (size_t flagIdx = 0; flagIdx < runnerState->streamFlagsSize; ++flagIdx) {
+    preserveFirstUniRunnerError(
+        deviceAdaptor->streamWriteValue64(
+            recoveryStream, runnerState->streamFlags[flagIdx],
+            flagcxStreamFlagDone, 0),
+        &result);
+  }
+
+  flagcxStream_t streams[] = {runnerState->redStream,
+                              runnerState->cpyStream,
+                              runnerState->commStream, recoveryStream};
+  const size_t numStreams =
+      recoveryStream == runnerState->redStream ||
+              recoveryStream == runnerState->cpyStream ||
+              recoveryStream == runnerState->commStream
+          ? 3
+          : sizeof(streams) / sizeof(streams[0]);
+  bool complete[] = {false, false, false, false};
+  size_t remaining = numStreams;
+  while (remaining != 0) {
+    bool madeProgress = false;
+    for (size_t streamIdx = 0; streamIdx < numStreams; ++streamIdx) {
+      if (complete[streamIdx]) {
+        continue;
+      }
+      flagcxResult_t queryResult =
+          deviceAdaptor->streamQuery(streams[streamIdx]);
+      if (queryResult != flagcxInProgress) {
+        complete[streamIdx] = true;
+        --remaining;
+        madeProgress = true;
+        preserveFirstUniRunnerError(queryResult, &result);
+      }
+    }
+    if (!madeProgress && remaining != 0) {
+      sched_yield();
+    }
+  }
+  return result;
+}
+
+static flagcxResult_t waitForStaticStreamCompletion(
+    flagcxUniRunnerState *runnerState, flagcxStream_t recoveryStream) {
+  flagcxStream_t streams[] = {runnerState->redStream,
+                              runnerState->cpyStream,
+                              runnerState->commStream};
+  bool complete[] = {false, false, false};
+  size_t remaining = sizeof(streams) / sizeof(streams[0]);
+  while (remaining != 0) {
+    bool madeProgress = false;
+    for (size_t streamIdx = 0;
+         streamIdx < sizeof(streams) / sizeof(streams[0]); ++streamIdx) {
+      if (complete[streamIdx]) {
+        continue;
+      }
+      flagcxResult_t queryResult =
+          deviceAdaptor->streamQuery(streams[streamIdx]);
+      if (queryResult == flagcxSuccess) {
+        complete[streamIdx] = true;
+        --remaining;
+        madeProgress = true;
+      } else if (queryResult != flagcxInProgress) {
+        return abortAndDrainStaticExecution(runnerState, recoveryStream,
+                                            queryResult);
+      }
+    }
+    if (!madeProgress && remaining != 0) {
+      sched_yield();
+    }
+  }
+  return flagcxSuccess;
+}
+
+static flagcxResult_t runDynamicDagFallback(flagcxHeteroComm_t hcomm);
+
+static flagcxResult_t runStaticHostRed(flagcxHeteroComm_t hcomm) {
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  uniRunnerStaticExecutorSchedule schedule;
+  size_t numTriggers = 0;
+  size_t maxExecutorBlocks = 0;
+  flagcxResult_t prepareResult = prepareStaticRedExecution(
+      hcomm, &schedule, &numTriggers, &maxExecutorBlocks);
+  if (prepareResult != flagcxSuccess) {
+#ifdef COMPILE_KERNEL_HOST
+    // Capability/occupancy probing happens before the exact static FIFO is
+    // allocated. Preserve the legacy executor on devices where the static
+    // cooperative-progress contract is unavailable or cannot be queried.
+    if ((prepareResult == flagcxNotSupported ||
+         prepareResult == flagcxUnhandledDeviceError) &&
+        runnerState->fifo != NULL && runnerState->fifo->buffer == NULL &&
+        hcomm->uniRunnerFifoBuffer == NULL) {
+      TRACE(FLAGCX_UNIRUNNER,
+            "static RED unavailable (%d); using dynamic DAG fallback",
+            prepareResult);
+      return runDynamicDagFallback(hcomm);
+    }
+#endif
+    return prepareResult;
+  }
+
+#ifdef COMPILE_KERNEL_HOST
+  flagcxStream_t recoveryStream = runnerState->redStream;
+  bool ownsRecoveryStream = false;
+  if (numTriggers != 0) {
+    flagcxResult_t createResult =
+        deviceAdaptor->streamCreate(&recoveryStream);
+    if (createResult != flagcxSuccess) {
+      return createResult;
+    }
+    ownsRecoveryStream = true;
+  }
+
+  if (numTriggers != 0) {
+    flagcxResult_t launchResult = flagcxLaunchStaticReduceKernel(
+        hcomm->uniRunnerFifoBuffer, numTriggers,
+        static_cast<size_t>(runnerState->uniRunnerNThreads),
+        schedule.numRedBlocks, maxExecutorBlocks, runnerState->avgDivisor,
+        runnerState->redStream);
+    if (launchResult != flagcxSuccess) {
+      preserveFirstUniRunnerError(
+          deviceAdaptor->streamDestroy(recoveryStream), &launchResult);
+      return launchResult;
+    }
+  }
+#else
+  flagcxStream_t recoveryStream = runnerState->redStream;
+  const bool ownsRecoveryStream = false;
+  if (numTriggers != 0) {
+    return flagcxNotSupported;
+  }
+#endif
+
+  flagcxResult_t result = submitStaticHostDag(runnerState, hcomm);
+  if (result != flagcxSuccess) {
+    result = abortAndDrainStaticExecution(runnerState, recoveryStream, result);
+  } else {
+    result = waitForStaticStreamCompletion(runnerState, recoveryStream);
+  }
+  if (ownsRecoveryStream) {
+    preserveFirstUniRunnerError(
+        deviceAdaptor->streamDestroy(recoveryStream), &result);
+  }
+  return result;
+}
+
+static flagcxResult_t runDynamicDagFallback(flagcxHeteroComm_t hcomm) {
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  FLAGCXCHECK(initializeDynamicRedFifo(hcomm));
+  FLAGCXCHECK(prepareUniRunnerIpcParentFlags(runnerState));
+  if (runnerState->ipcReadySlots != 0) {
+    runnerState->ipcEpoch++;
+    if (runnerState->ipcEpoch == 0)
+      runnerState->ipcEpoch++;
+  }
+
+#ifdef COMPILE_KERNEL_HOST
+  FLAGCXCHECK(flagcxLaunchCollectiveKernel(
+      hcomm->uniRunnerFifoBuffer, runnerState->ipcFifoDevicePtr,
+      runnerState->ipcInputMem, runnerState->ipcOutputMem,
+      runnerState->ipcReadyMem, runnerState->ipcParentFlagsDevice,
+      runnerState->uniRunnerNThreads, runnerState->uniRunnerNRedBlocks,
+      runnerState->uniRunnerNIpcBlocks, runnerState->avgDivisor,
+      runnerState->redStream));
+#else
+  return flagcxNotSupported;
+#endif
+
+  while (true) {
+    if (flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue) &&
+        flagcxIntruQueueEmpty(&runnerState->redReadyQueue) &&
+        flagcxIntruQueueEmpty(&runnerState->ipcReadyQueue) &&
+        runnerState->numPendingNodes == 0) {
+      TRACE(
+          FLAGCX_UNIRUNNER,
+          "runUniRunner: dynamic DAG fallback drained, terminating executors");
+      __atomic_store_n(runnerState->fifo->buffer + flagcxFifoIdxTerminate, 1,
+                       __ATOMIC_RELEASE);
+      __atomic_store_n(runnerState->ipcFifo->buffer + flagcxFifoIdxTerminate,
+                       1, __ATOMIC_RELEASE);
+      break;
+    }
+    FLAGCXCHECK(processReadyQueue(runnerState, hcomm));
+  }
+  return drainUniRunnerStreams(runnerState, flagcxSuccess);
+}
+
 flagcxResult_t runUniRunner(flagcxComm_t comm) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
-  flagcxFifo_t fifo = hcomm->proxyState->uniRunnerState.fifo;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
   FLAGCXCHECK(validateDagNodes(runnerState));
@@ -3989,53 +4328,9 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
     return flagcxInternalError;
   }
   FLAGCXCHECK(prepareDagStreamFlags(runnerState));
-  FLAGCXCHECK(prepareUniRunnerIpcParentFlags(runnerState));
-  if (runnerState->ipcReadySlots != 0) {
-    runnerState->ipcEpoch++;
-    if (runnerState->ipcEpoch == 0)
-      runnerState->ipcEpoch++;
-  }
-
-#ifdef COMPILE_KERNEL_HOST
-  if (runnerState->uniRunnerNRedBlocks != 0 ||
-      runnerState->uniRunnerNIpcBlocks != 0) {
-    FLAGCXCHECK(flagcxLaunchCollectiveKernel(
-        hcomm->uniRunnerFifoBuffer, runnerState->ipcFifoDevicePtr,
-        runnerState->ipcInputMem, runnerState->ipcOutputMem,
-        runnerState->ipcReadyMem, runnerState->ipcParentFlagsDevice,
-        runnerState->uniRunnerNThreads, runnerState->uniRunnerNRedBlocks,
-        runnerState->uniRunnerNIpcBlocks, runnerState->avgDivisor,
-        runnerState->redStream));
-  } else {
-    TRACE(FLAGCX_UNIRUNNER,
-          "runUniRunner: skipping collective kernel launch because both "
-          "executor block counts are zero");
-  }
-#endif
-
-  // Main scheduling loop using DAG-based queue scheduling
-  while (true) {
-    if (flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue) &&
-        flagcxIntruQueueEmpty(&runnerState->redReadyQueue) &&
-        flagcxIntruQueueEmpty(&runnerState->ipcReadyQueue) &&
-        runnerState->numPendingNodes == 0) {
-      TRACE(
-          FLAGCX_UNIRUNNER,
-          "runUniRunner: all submitted work drained, terminating runner loop");
-      __atomic_store_n(fifo->buffer + flagcxFifoIdxTerminate, 1,
-                       __ATOMIC_RELEASE);
-      __atomic_store_n(runnerState->ipcFifo->buffer + flagcxFifoIdxTerminate,
-                       1, __ATOMIC_RELEASE);
-      break;
-    }
-
-    FLAGCXCHECK(processReadyQueue(runnerState, hcomm));
-  }
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->redStream));
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->cpyStream));
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(runnerState->commStream));
-
-  return flagcxSuccess;
+  return runnerState->dagPlan.numIpcNodes == 0
+             ? runStaticHostRed(hcomm)
+             : runDynamicDagFallback(hcomm);
 }
 
 flagcxResult_t
