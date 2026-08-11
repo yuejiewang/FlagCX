@@ -303,6 +303,38 @@ flagcxResult_t resolveUniRunnerStaticExecutorSchedule(
   return flagcxSuccess;
 }
 
+flagcxResult_t resolveUniRunnerStaticExecutorResidencyBudget(
+    bool cooperativeLaunch, bool concurrentKernels, size_t smCount,
+    size_t activeBlocksPerSm, size_t maxThreadsPerBlock, size_t nthreads,
+    size_t *maxExecutorBlocks) {
+  if (maxExecutorBlocks == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *maxExecutorBlocks = 0;
+  if (nthreads == 0 || maxThreadsPerBlock == 0 ||
+      nthreads > maxThreadsPerBlock) {
+    return flagcxInvalidArgument;
+  }
+  if (!cooperativeLaunch || !concurrentKernels || smCount <= 1 ||
+      activeBlocksPerSm == 0) {
+    return flagcxNotSupported;
+  }
+  if (activeBlocksPerSm >
+      std::numeric_limits<size_t>::max() / smCount) {
+    return flagcxInvalidArgument;
+  }
+
+  const size_t residentCapacity = activeBlocksPerSm * smCount;
+  const size_t launchRange =
+      static_cast<size_t>(std::numeric_limits<int>::max());
+  *maxExecutorBlocks =
+      std::min(std::min(residentCapacity, smCount - 1), launchRange);
+  if (*maxExecutorBlocks == 0) {
+    return flagcxNotSupported;
+  }
+  return flagcxSuccess;
+}
+
 flagcxResult_t getUniRunnerStaticTaskAssignment(
     size_t taskOrdinal, size_t numTasks, size_t numBlocks, size_t *blockIdx,
     size_t *blockTaskOrdinal) {

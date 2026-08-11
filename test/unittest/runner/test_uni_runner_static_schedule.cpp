@@ -198,3 +198,51 @@ TEST(UniRunnerStaticSchedule, RejectsInvalidTaskAssignments) {
   EXPECT_EQ(flagcxInvalidArgument, getUniRunnerStaticTaskAssignment(
                                           0, 1, 1, &blockIdx, nullptr));
 }
+
+TEST(UniRunnerStaticResidency, ReservesOneWholeSmForProducerStreams) {
+  size_t budget = 0;
+  EXPECT_EQ(flagcxSuccess,
+            resolveUniRunnerStaticExecutorResidencyBudget(
+                true, true, 132, 3, 1024, 256, &budget));
+  EXPECT_EQ(131u, budget);
+
+  EXPECT_EQ(flagcxSuccess,
+            resolveUniRunnerStaticExecutorResidencyBudget(
+                true, true, 2, 1, 1024, 1024, &budget));
+  EXPECT_EQ(1u, budget);
+}
+
+TEST(UniRunnerStaticResidency, RejectsUnsupportedProgressCapabilities) {
+  size_t budget = 99;
+  EXPECT_EQ(flagcxNotSupported,
+            resolveUniRunnerStaticExecutorResidencyBudget(
+                false, true, 132, 1, 1024, 32, &budget));
+  EXPECT_EQ(0u, budget);
+  EXPECT_EQ(flagcxNotSupported,
+            resolveUniRunnerStaticExecutorResidencyBudget(
+                true, false, 132, 1, 1024, 32, &budget));
+  EXPECT_EQ(flagcxNotSupported,
+            resolveUniRunnerStaticExecutorResidencyBudget(
+                true, true, 1, 1, 1024, 32, &budget));
+  EXPECT_EQ(flagcxNotSupported,
+            resolveUniRunnerStaticExecutorResidencyBudget(
+                true, true, 132, 0, 1024, 32, &budget));
+}
+
+TEST(UniRunnerStaticResidency, RejectsInvalidThreadsAndArithmeticOverflow) {
+  size_t budget = 99;
+  EXPECT_EQ(flagcxInvalidArgument,
+            resolveUniRunnerStaticExecutorResidencyBudget(
+                true, true, 132, 1, 1024, 0, &budget));
+  EXPECT_EQ(0u, budget);
+  EXPECT_EQ(flagcxInvalidArgument,
+            resolveUniRunnerStaticExecutorResidencyBudget(
+                true, true, 132, 1, 1024, 1025, &budget));
+  EXPECT_EQ(flagcxInvalidArgument,
+            resolveUniRunnerStaticExecutorResidencyBudget(
+                true, true, 2, std::numeric_limits<size_t>::max(), 1024, 32,
+                &budget));
+  EXPECT_EQ(flagcxInvalidArgument,
+            resolveUniRunnerStaticExecutorResidencyBudget(
+                true, true, 132, 1, 1024, 32, nullptr));
+}

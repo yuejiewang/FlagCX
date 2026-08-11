@@ -291,6 +291,10 @@ flagcxResult_t resolveUniRunnerStaticExecutorSchedule(
     const uniRunnerDagExecutionPlan *plan, size_t requestedRedBlocks,
     size_t requestedIpcBlocks, size_t maxExecutorBlocks,
     uniRunnerStaticExecutorSchedule *schedule);
+flagcxResult_t resolveUniRunnerStaticExecutorResidencyBudget(
+    bool cooperativeLaunch, bool concurrentKernels, size_t smCount,
+    size_t activeBlocksPerSm, size_t maxThreadsPerBlock, size_t nthreads,
+    size_t *maxExecutorBlocks);
 flagcxResult_t getUniRunnerStaticTaskAssignment(
     size_t taskOrdinal, size_t numTasks, size_t numBlocks, size_t *blockIdx,
     size_t *blockTaskOrdinal);
