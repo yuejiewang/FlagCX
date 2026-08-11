@@ -5273,6 +5273,11 @@ static flagcxResult_t runStaticHostRed(flagcxHeteroComm_t hcomm) {
   flagcxResult_t result = submitStaticHostDag(runnerState, hcomm);
   if (result != flagcxSuccess) {
     result = abortAndDrainStaticExecution(runnerState, NULL, result);
+  } else if (numTriggers == 0) {
+    // Host-only DAGs have no persistent executor that can fail while waiting
+    // for another stream. Avoid the multi-stream query loop on this latency-
+    // sensitive path; every dependency-producing operation is already queued.
+    result = drainUniRunnerStreams(runnerState, flagcxSuccess);
   } else {
     result = waitForStaticStreamCompletion(runnerState, NULL);
   }
