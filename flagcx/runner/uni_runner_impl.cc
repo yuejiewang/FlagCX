@@ -20,6 +20,7 @@
 #include <math.h>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <sched.h>
 #include <string>
 #include <sys/stat.h>
@@ -110,10 +111,14 @@ flagcxResult_t validateUniRunnerLaunchConfig(flagcxCommOp_t commOp) {
 
 static flagcxResult_t ensureUniRunnerIpcDataViews(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm,
-    const void *sendbuff, void *recvbuff, size_t bytes);
+    const void *sendbuff, void *recvbuff, size_t bytes,
+    flagcxResult_t localPreparationResult);
 static flagcxResult_t ensureUniRunnerIpcReadyStorage(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm,
     size_t requiredSlots);
+static flagcxResult_t agreeUniRunnerInvocationState(
+    flagcxComm_t comm, uint64_t localSignature, flagcxResult_t localResult,
+    flagcxResult_t *collectiveResult);
 
 static bool isValidUniRunnerDataType(flagcxDataType_t datatype) {
   return static_cast<int>(datatype) >= 0 &&
@@ -3394,27 +3399,40 @@ flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
                                        flagcxDataType_t datatype,
                                        flagcxRedOp_t op, flagcxComm_t comm) {
   setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
+  flagcxResult_t result = flagcxSuccess;
   if (runnerState->uniRunnerIpcChunkSize < 16 ||
       runnerState->uniRunnerIpcChunkSize % 16 != 0) {
     WARN("UniRunner IPCCHUNKSIZE must be a positive multiple of 16 bytes");
-    return flagcxInvalidArgument;
+    result = flagcxInvalidArgument;
   }
-  FLAGCXCHECK(
-      setEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks));
+  if (result == flagcxSuccess) {
+    result =
+        setEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
+  }
   size_t bytes = 0;
-  FLAGCXCHECK(checkedUniRunnerTypeBytes(count, 1, datatype, &bytes));
+  if (result == flagcxSuccess) {
+    result = checkedUniRunnerTypeBytes(count, 1, datatype, &bytes);
+  }
   // IPC nodes carry runtime Window/DevMem bindings and therefore intentionally
   // bypass the static JSON DAG cache. The underlying SlicedAR topology remains
   // unchanged and all existing cached algorithms are preserved.
-  FLAGCXCHECK(buildUniRunnerStateIpcAR(runnerState, sendbuff, recvbuff, count,
-                                       datatype, op, comm));
-  FLAGCXCHECK(prepareUniRunnerDagExecutionPlan(runnerState));
+  if (result == flagcxSuccess) {
+    result = buildUniRunnerStateIpcAR(
+        runnerState, sendbuff, recvbuff, count, datatype, op, comm);
+  }
+  if (result == flagcxSuccess) {
+    result = prepareUniRunnerDagExecutionPlan(runnerState);
+  }
+  // The data-view agreement below also makes DAG-build status, data bytes and
+  // IPC-node cardinality collective before any rank enters DevMem creation.
+  FLAGCXCHECK(ensureUniRunnerIpcDataViews(
+      runnerState, comm, sendbuff, recvbuff, bytes, result));
   if (runnerState->ipcReadySlots == 0)
     return flagcxSuccess;
-  FLAGCXCHECK(ensureUniRunnerIpcDataViews(runnerState, comm, sendbuff,
-                                          recvbuff, bytes));
-  return ensureUniRunnerIpcReadyStorage(runnerState, comm,
-                                        runnerState->ipcReadySlots);
+  // Static IPC prepends abort and rank-done control slots to the logical ready
+  // array. Allocate that collective storage only after static occupancy and
+  // schedule validation have succeeded.
+  return flagcxSuccess;
 }
 
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
@@ -3613,7 +3631,8 @@ static flagcxResult_t submitStaticHostDag(flagcxUniRunnerState *runnerState,
     if (node->nodeType == uniRunnerDagNodeTypeP2p ||
         node->nodeType == uniRunnerDagNodeTypeCpy) {
       FLAGCXCHECK(launchHostDagNode(runnerState, comm, node));
-    } else if (node->nodeType != uniRunnerDagNodeTypeRed) {
+    } else if (node->nodeType != uniRunnerDagNodeTypeRed &&
+               node->nodeType != uniRunnerDagNodeTypeIpc) {
       return flagcxInternalError;
     }
   }
@@ -3666,64 +3685,287 @@ static flagcxResult_t freeUniRunnerIpcReadyBuffer(void *ptr) {
   return deviceAdaptor->deviceFree(ptr, flagcxMemDevice, NULL);
 }
 
+struct uniRunnerResourceAgreement {
+  uint64_t canReuse;
+  int result;
+};
+
+struct uniRunnerInvocationAgreement {
+  uint64_t signature;
+  int result;
+};
+
+struct uniRunnerDataViewAgreement {
+  uint64_t readySlots;
+  uint64_t dataBytes;
+  uint64_t canReuse;
+  int result;
+};
+
+static flagcxResult_t agreeUniRunnerResourceState(
+    flagcxComm_t comm, bool localCanReuse, flagcxResult_t localResult,
+    bool *allCanReuse, flagcxResult_t *collectiveResult) {
+  if (comm == NULL || comm->bootstrap == NULL || comm->nranks <= 0 ||
+      comm->nranks > FLAGCX_MAX_LOCAL_RANKS || comm->rank < 0 ||
+      comm->rank >= comm->nranks || allCanReuse == NULL ||
+      collectiveResult == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *allCanReuse = false;
+  *collectiveResult = flagcxSuccess;
+  uniRunnerResourceAgreement exchanges[FLAGCX_MAX_LOCAL_RANKS] = {};
+  exchanges[comm->rank].canReuse = localCanReuse ? uint64_t{1} : uint64_t{0};
+  exchanges[comm->rank].result = static_cast<int>(localResult);
+  FLAGCXCHECK(bootstrapCollAllGather(
+      comm->bootstrap, exchanges, sizeof(uniRunnerResourceAgreement)));
+
+  *allCanReuse = true;
+  for (int rank = 0; rank < comm->nranks; ++rank) {
+    if (exchanges[rank].result != static_cast<int>(flagcxSuccess) &&
+        *collectiveResult == flagcxSuccess) {
+      *collectiveResult =
+          static_cast<flagcxResult_t>(exchanges[rank].result);
+    }
+    if (exchanges[rank].canReuse == 0) {
+      *allCanReuse = false;
+    }
+  }
+  return flagcxSuccess;
+}
+
+static flagcxResult_t agreeUniRunnerInvocationState(
+    flagcxComm_t comm, uint64_t localSignature, flagcxResult_t localResult,
+    flagcxResult_t *collectiveResult) {
+  if (comm == NULL || comm->bootstrap == NULL || comm->nranks <= 0 ||
+      comm->nranks > FLAGCX_MAX_LOCAL_RANKS || comm->rank < 0 ||
+      comm->rank >= comm->nranks ||
+      collectiveResult == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *collectiveResult = flagcxSuccess;
+  uniRunnerInvocationAgreement exchanges[FLAGCX_MAX_LOCAL_RANKS] = {};
+  exchanges[comm->rank].signature = localSignature;
+  exchanges[comm->rank].result = static_cast<int>(localResult);
+  FLAGCXCHECK(bootstrapCollAllGather(
+      comm->bootstrap, exchanges, sizeof(uniRunnerInvocationAgreement)));
+
+  const uint64_t expectedSignature = exchanges[0].signature;
+  for (int rank = 0; rank < comm->nranks; ++rank) {
+    if (exchanges[rank].result != static_cast<int>(flagcxSuccess) &&
+        *collectiveResult == flagcxSuccess) {
+      *collectiveResult =
+          static_cast<flagcxResult_t>(exchanges[rank].result);
+    }
+  }
+  if (*collectiveResult == flagcxSuccess) {
+    for (int rank = 1; rank < comm->nranks; ++rank) {
+      if (exchanges[rank].signature != expectedSignature) {
+        WARN("UniRunner invocation signature mismatch: rank 0=0x%llx "
+             "rank %d=0x%llx",
+             static_cast<unsigned long long>(expectedSignature), rank,
+             static_cast<unsigned long long>(exchanges[rank].signature));
+        *collectiveResult = flagcxInvalidUsage;
+        break;
+      }
+    }
+  }
+  return flagcxSuccess;
+}
+
+static flagcxResult_t agreeUniRunnerDataViewState(
+    flagcxComm_t comm, size_t localReadySlots, size_t localDataBytes,
+    bool localCanReuse, flagcxResult_t localResult, bool *allCanReuse,
+    flagcxResult_t *collectiveResult) {
+  if (comm == NULL || comm->bootstrap == NULL || comm->nranks <= 0 ||
+      comm->nranks > FLAGCX_MAX_LOCAL_RANKS || comm->rank < 0 ||
+      comm->rank >= comm->nranks || allCanReuse == NULL ||
+      collectiveResult == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *allCanReuse = false;
+  *collectiveResult = flagcxSuccess;
+  uniRunnerDataViewAgreement exchanges[FLAGCX_MAX_LOCAL_RANKS] = {};
+  exchanges[comm->rank].readySlots = static_cast<uint64_t>(localReadySlots);
+  exchanges[comm->rank].dataBytes = static_cast<uint64_t>(localDataBytes);
+  exchanges[comm->rank].canReuse = localCanReuse ? uint64_t{1} : uint64_t{0};
+  exchanges[comm->rank].result = static_cast<int>(localResult);
+  FLAGCXCHECK(bootstrapCollAllGather(
+      comm->bootstrap, exchanges, sizeof(uniRunnerDataViewAgreement)));
+
+  *allCanReuse = true;
+  for (int rank = 0; rank < comm->nranks; ++rank) {
+    if (exchanges[rank].result != static_cast<int>(flagcxSuccess) &&
+        *collectiveResult == flagcxSuccess) {
+      *collectiveResult =
+          static_cast<flagcxResult_t>(exchanges[rank].result);
+    }
+    if (exchanges[rank].canReuse == 0) {
+      *allCanReuse = false;
+    }
+  }
+  if (*collectiveResult == flagcxSuccess) {
+    for (int rank = 1; rank < comm->nranks; ++rank) {
+      if (exchanges[rank].readySlots != exchanges[0].readySlots ||
+          exchanges[rank].dataBytes != exchanges[0].dataBytes) {
+        WARN("UniRunner IPC DAG/data cardinality differs across ranks");
+        *collectiveResult = flagcxInvalidUsage;
+        break;
+      }
+    }
+  }
+  return flagcxSuccess;
+}
+
+static uint64_t mixUniRunnerInvocationSignature(uint64_t signature,
+                                                 uint64_t value) {
+  // Boost-style 64-bit hash combine. This is a consistency guard rather than a
+  // cache identity; all inputs below are already range-validated integers.
+  return signature ^
+         (value + uint64_t{0x9e3779b97f4a7c15} + (signature << 6) +
+          (signature >> 2));
+}
+
 static flagcxResult_t destroyUniRunnerIpcDataViews(
     flagcxUniRunnerState *runnerState) {
   if (runnerState->ipcOwner == NULL)
     return flagcxSuccess;
   flagcxComm_t comm = runnerState->ipcOwner;
-  bool aliased = runnerState->ipcInputMem != NULL &&
-                 runnerState->ipcInputMem == runnerState->ipcOutputMem;
-  if (runnerState->ipcInputMem != NULL && !aliased) {
-    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->ipcInputMem));
+  // Input and output are always distinct DevMem handles, including in-place
+  // collectives. Keeping the create/destroy count rank-invariant prevents an
+  // out-of-place rank from entering an IPC bootstrap that an in-place rank
+  // skipped.
+  flagcxResult_t result = flagcxSuccess;
+  if (runnerState->ipcInputMem != NULL) {
+    result = flagcxDevMemDestroy(comm, runnerState->ipcInputMem);
   }
   if (runnerState->ipcOutputMem != NULL) {
-    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->ipcOutputMem));
+    flagcxResult_t outputResult =
+        flagcxDevMemDestroy(comm, runnerState->ipcOutputMem);
+    if (result == flagcxSuccess) {
+      result = outputResult;
+    }
   }
   runnerState->ipcInputMem = NULL;
   runnerState->ipcOutputMem = NULL;
   runnerState->ipcInputBase = NULL;
   runnerState->ipcOutputBase = NULL;
   runnerState->ipcDataBytes = 0;
-  return flagcxSuccess;
+  return result;
 }
 
 static flagcxResult_t ensureUniRunnerIpcDataViews(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm,
-    const void *sendbuff, void *recvbuff, size_t bytes) {
-  if (runnerState->ipcInputMem != NULL && runnerState->ipcOutputMem != NULL &&
+    const void *sendbuff, void *recvbuff, size_t bytes,
+    flagcxResult_t localPreparationResult) {
+  const bool localCanReuse =
+      localPreparationResult == flagcxSuccess &&
+      runnerState->ipcReadySlots != 0 && runnerState->ipcOwner == comm &&
+      runnerState->ipcInputMem != NULL &&
+      runnerState->ipcOutputMem != NULL &&
       runnerState->ipcInputBase == sendbuff &&
-      runnerState->ipcOutputBase == recvbuff) {
-    runnerState->ipcDataBytes = std::max(runnerState->ipcDataBytes, bytes);
+      runnerState->ipcOutputBase == recvbuff &&
+      bytes <= runnerState->ipcDataBytes;
+  bool allCanReuse = false;
+  flagcxResult_t collectiveResult = flagcxSuccess;
+  FLAGCXCHECK(agreeUniRunnerDataViewState(
+      comm, runnerState->ipcReadySlots, bytes, localCanReuse,
+      localPreparationResult, &allCanReuse, &collectiveResult));
+  if (collectiveResult != flagcxSuccess) {
+    return collectiveResult;
+  }
+  if (runnerState->ipcReadySlots == 0) {
+    return flagcxSuccess;
+  }
+  if (allCanReuse) {
     return flagcxSuccess;
   }
 
-  FLAGCXCHECK(destroyUniRunnerIpcDataViews(runnerState));
-  runnerState->ipcOwner = comm;
   flagcxResult_t res = flagcxSuccess;
+  flagcxDevMem_t newInputMem = NULL;
+  flagcxDevMem_t newOutputMem = NULL;
+  flagcxResult_t oldDestroyResult = flagcxSuccess;
 
-  FLAGCXCHECKGOTO(flagcxDevMemCreate(comm, recvbuff, bytes, NULL,
-                                     &runnerState->ipcOutputMem),
-                  res, fail);
-  if (sendbuff == recvbuff) {
-    runnerState->ipcInputMem = runnerState->ipcOutputMem;
-  } else {
-    FLAGCXCHECKGOTO(flagcxDevMemCreate(
-                        comm, const_cast<void *>(sendbuff), bytes, NULL,
-                        &runnerState->ipcInputMem),
-                    res, fail);
+  // Every rank performs exactly two creates in the same output-then-input
+  // order. Even when sendbuff == recvbuff the second handle participates in
+  // the all-rank reuse consensus and retains its own IPC-table reference.
+  res = flagcxDevMemCreate(comm, recvbuff, bytes, NULL, &newOutputMem);
+  if (res == flagcxSuccess && newOutputMem == NULL) {
+    res = flagcxSystemError;
   }
-  if (!runnerState->ipcInputMem->hasWindow ||
-      !runnerState->ipcOutputMem->hasWindow) {
-    res = flagcxNotSupported;
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, res, &allCanReuse, &collectiveResult),
+                  res, fail);
+  if (collectiveResult != flagcxSuccess) {
+    res = collectiveResult;
     goto fail;
   }
-  runnerState->ipcInputBase = sendbuff;
-  runnerState->ipcOutputBase = recvbuff;
-  runnerState->ipcDataBytes = bytes;
+  res = flagcxDevMemCreate(comm, const_cast<void *>(sendbuff), bytes, NULL,
+                           &newInputMem);
+  if (res == flagcxSuccess && newInputMem == NULL) {
+    res = flagcxSystemError;
+  }
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, res, &allCanReuse, &collectiveResult),
+                  res, fail);
+  if (collectiveResult != flagcxSuccess) {
+    res = collectiveResult;
+    goto fail;
+  }
+  res = newInputMem->hasWindow && newOutputMem->hasWindow
+            ? flagcxSuccess
+            : flagcxNotSupported;
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, res, &allCanReuse, &collectiveResult),
+                  res, fail);
+  if (collectiveResult != flagcxSuccess) {
+    res = collectiveResult;
+    goto fail;
+  }
+
+  {
+    flagcxDevMem_t oldInputMem = runnerState->ipcInputMem;
+    flagcxDevMem_t oldOutputMem = runnerState->ipcOutputMem;
+    flagcxComm_t oldOwner = runnerState->ipcOwner;
+
+    // Retain the prior peer bindings until both new collective creates have
+    // completed. At that point every rank has left any kernel which could still
+    // dereference the old views. The backing allocations remain user-owned;
+    // their lifetime continues to follow the existing registered-buffer API
+    // contract after these handles release their table references.
+    runnerState->ipcOwner = comm;
+    runnerState->ipcInputMem = newInputMem;
+    runnerState->ipcOutputMem = newOutputMem;
+    runnerState->ipcInputBase = sendbuff;
+    runnerState->ipcOutputBase = recvbuff;
+    runnerState->ipcDataBytes = bytes;
+    newInputMem = NULL;
+    newOutputMem = NULL;
+
+    if (oldInputMem != NULL) {
+      oldDestroyResult = flagcxDevMemDestroy(oldOwner, oldInputMem);
+    }
+    if (oldOutputMem != NULL) {
+      flagcxResult_t outputResult =
+          flagcxDevMemDestroy(oldOwner, oldOutputMem);
+      if (oldDestroyResult == flagcxSuccess) {
+        oldDestroyResult = outputResult;
+      }
+    }
+  }
+  FLAGCXCHECK(agreeUniRunnerResourceState(
+      comm, false, oldDestroyResult, &allCanReuse, &collectiveResult));
+  if (collectiveResult != flagcxSuccess) {
+    return collectiveResult;
+  }
   return flagcxSuccess;
 
 fail:
-  (void)destroyUniRunnerIpcDataViews(runnerState);
+  if (newInputMem != NULL) {
+    (void)flagcxDevMemDestroy(comm, newInputMem);
+  }
+  if (newOutputMem != NULL) {
+    (void)flagcxDevMemDestroy(comm, newOutputMem);
+  }
   return res;
 }
 
@@ -3736,51 +3978,88 @@ static flagcxResult_t ensureUniRunnerIpcReadyStorage(
       std::numeric_limits<size_t>::max() / sizeof(uint64_t)) {
     return flagcxInvalidArgument;
   }
+  // requiredSlots is derived solely from the collective DAG and local-rank
+  // topology and is stable for the cached IPCAR configuration. Keep this
+  // runner-owned export for the communicator lifetime: flagcxDevMemDestroy
+  // releases a table reference but imported CUDA IPC mappings are closed only
+  // when the table is rebound or the communicator is destroyed, so an online
+  // resize must not free the old exporter allocation.
   if (runnerState->ipcReadyMem != NULL &&
+      runnerState->ipcReadyBuffer != NULL &&
       runnerState->ipcReadyCapacity >= requiredSlots) {
     return flagcxSuccess;
   }
-
-  if (runnerState->ipcReadyMem != NULL) {
-    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->ipcReadyMem));
-    runnerState->ipcReadyMem = NULL;
+  if (runnerState->ipcReadyMem != NULL ||
+      runnerState->ipcReadyBuffer != NULL ||
+      runnerState->ipcReadyCapacity != 0) {
+    WARN("UniRunner static IPC ready storage cannot grow safely during the "
+         "communicator lifetime (required=%zu capacity=%zu)",
+         requiredSlots, runnerState->ipcReadyCapacity);
+    return flagcxInvalidUsage;
   }
-  if (runnerState->ipcReadyBuffer != NULL) {
-    FLAGCXCHECK(
-        freeUniRunnerIpcReadyBuffer(runnerState->ipcReadyBuffer));
-    runnerState->ipcReadyBuffer = NULL;
-  }
-  runnerState->ipcReadyCapacity = 0;
-
   size_t bytes = requiredSlots * sizeof(uint64_t);
   flagcxResult_t res = flagcxSuccess;
-  FLAGCXCHECKGOTO(allocUniRunnerIpcReadyBuffer(
-                      &runnerState->ipcReadyBuffer, bytes),
+  bool allCanReuse = false;
+  flagcxResult_t collectiveResult = flagcxSuccess;
+  void *newBuffer = NULL;
+  flagcxDevMem_t newMem = NULL;
+  bool devMemCreateEntered = false;
+  res = allocUniRunnerIpcReadyBuffer(&newBuffer, bytes);
+  if (res == flagcxSuccess) {
+    res = deviceAdaptor->deviceMemset(newBuffer, 0, bytes, flagcxMemDevice,
+                                      NULL);
+  }
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, res, &allCanReuse, &collectiveResult),
                   res, fail);
-  FLAGCXCHECKGOTO(deviceAdaptor->deviceMemset(runnerState->ipcReadyBuffer, 0,
-                                               bytes, flagcxMemDevice, NULL),
-                  res, fail);
-  FLAGCXCHECKGOTO(flagcxDevMemCreate(
-                      comm, runnerState->ipcReadyBuffer, bytes, NULL,
-                      &runnerState->ipcReadyMem),
-                  res, fail);
-  if (!runnerState->ipcReadyMem->hasWindow) {
-    res = flagcxNotSupported;
+  if (collectiveResult != flagcxSuccess) {
+    res = collectiveResult;
     goto fail;
   }
+  // Creating a DevMem binding exchanges the backing allocation across all
+  // ranks. The allocation remains bound until communicator teardown.
+  devMemCreateEntered = true;
+  res = flagcxDevMemCreate(comm, newBuffer, bytes, NULL, &newMem);
+  if (res == flagcxSuccess && newMem == NULL) {
+    res = flagcxSystemError;
+  }
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, res, &allCanReuse, &collectiveResult),
+                  res, fail);
+  if (collectiveResult != flagcxSuccess) {
+    res = collectiveResult;
+    goto fail;
+  }
+  res = newMem->hasWindow ? flagcxSuccess : flagcxNotSupported;
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, res, &allCanReuse, &collectiveResult),
+                  res, fail);
+  if (collectiveResult != flagcxSuccess) {
+    res = collectiveResult;
+    goto fail;
+  }
+
+  runnerState->ipcReadyMem = newMem;
+  runnerState->ipcReadyBuffer = newBuffer;
   runnerState->ipcReadyCapacity = requiredSlots;
+  newMem = NULL;
+  newBuffer = NULL;
   return flagcxSuccess;
 
 fail:
-  if (runnerState->ipcReadyMem != NULL) {
-    (void)flagcxDevMemDestroy(comm, runnerState->ipcReadyMem);
-    runnerState->ipcReadyMem = NULL;
+  if (newMem != NULL) {
+    (void)flagcxDevMemDestroy(comm, newMem);
   }
-  if (runnerState->ipcReadyBuffer != NULL) {
-    (void)freeUniRunnerIpcReadyBuffer(runnerState->ipcReadyBuffer);
-    runnerState->ipcReadyBuffer = NULL;
+  if (newBuffer != NULL) {
+    if (devMemCreateEntered) {
+      // Once DevMemCreate is entered, a peer may have imported this exporter
+      // even when the local call eventually reports an error or never returns
+      // a handle. Never infer mapping absence from newMem == NULL.
+      flagcxCommDeferFree(comm, newBuffer, flagcxMemDevice);
+    } else {
+      (void)freeUniRunnerIpcReadyBuffer(newBuffer);
+    }
   }
-  runnerState->ipcReadyCapacity = 0;
   return res;
 }
 
@@ -3920,6 +4199,23 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
 flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  if (runnerState->dagNodes != NULL || runnerState->numDagNodes != 0 ||
+      runnerState->numPendingNodes != 0 ||
+      runnerState->dagPlan.topoOrder != NULL ||
+      runnerState->dagPlan.numNodes != 0 ||
+      runnerState->dagPlan.numHostNodes != 0 ||
+      runnerState->dagPlan.numRedNodes != 0 ||
+      runnerState->dagPlan.numIpcNodes != 0 ||
+      runnerState->streamFlagsSize != 0 || runnerState->ipcReadySlots != 0 ||
+      runnerState->fifo != NULL || runnerState->ipcFifo != NULL ||
+      runnerState->ipcFifoDevicePtr != NULL ||
+      runnerState->commStream != NULL || runnerState->redStream != NULL ||
+      runnerState->cpyStream != NULL || hcomm->uniRunnerFifoBuffer != NULL ||
+      runnerState->ipcParentFlagsDevice != NULL ||
+      runnerState->ipcParentFlagsCount != 0) {
+    WARN("UniRunner invocation-local state was not fully cleaned before init");
+    return flagcxInvalidUsage;
+  }
   runnerState->dagNodes = NULL;
   runnerState->numDagNodes = 0;
   runnerState->dagPlan.topoOrder = NULL;
@@ -3932,6 +4228,9 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->fifo = NULL;
   runnerState->ipcFifo = NULL;
   runnerState->ipcFifoDevicePtr = NULL;
+  runnerState->commStream = NULL;
+  runnerState->redStream = NULL;
+  runnerState->cpyStream = NULL;
   hcomm->uniRunnerFifoBuffer = NULL;
 
   FLAGCXCHECK(loadUniRunnerDagBuilderConfig(
@@ -3948,16 +4247,19 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   // Set device context
   FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
 
-  // RED allocation is deferred until the DAG plan is known. Static execution
-  // uses the exact RED node count, while the IPC fallback retains the legacy
-  // configured ring capacity.
-  runnerState->fifo = new flagcxFifo();
-
-  runnerState->ipcFifo = new flagcxFifo();
-  FLAGCXCHECK(runnerState->ipcFifo->flagcxIpcFifoInit());
-  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
-      &runnerState->ipcFifoDevicePtr,
-      static_cast<void *>(runnerState->ipcFifo->buffer)));
+  // Both executor FIFOs are allocated only after the DAG plan and execution
+  // mode are known. Static execution uses exact trigger counts; the RED-only
+  // dynamic fallback initializes its legacy FIFO lazily.
+  runnerState->fifo = new (std::nothrow) flagcxFifo();
+  if (runnerState->fifo == NULL) {
+    return flagcxSystemError;
+  }
+  runnerState->ipcFifo = new (std::nothrow) flagcxFifo();
+  if (runnerState->ipcFifo == NULL) {
+    delete runnerState->fifo;
+    runnerState->fifo = NULL;
+    return flagcxSystemError;
+  }
 
   // Initialize queues
   flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
@@ -3966,10 +4268,25 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->numPendingNodes = 0;
 
   // Create dedicated reduce and copy streams
-  flagcxStream_t redStream;
-  FLAGCXCHECK(deviceAdaptor->streamCreate(&redStream));
-  flagcxStream_t cpyStream;
-  FLAGCXCHECK(deviceAdaptor->streamCreate(&cpyStream));
+  flagcxStream_t redStream = NULL;
+  flagcxResult_t result = deviceAdaptor->streamCreate(&redStream);
+  if (result != flagcxSuccess) {
+    delete runnerState->ipcFifo;
+    runnerState->ipcFifo = NULL;
+    delete runnerState->fifo;
+    runnerState->fifo = NULL;
+    return result;
+  }
+  flagcxStream_t cpyStream = NULL;
+  result = deviceAdaptor->streamCreate(&cpyStream);
+  if (result != flagcxSuccess) {
+    (void)deviceAdaptor->streamDestroy(redStream);
+    delete runnerState->ipcFifo;
+    runnerState->ipcFifo = NULL;
+    delete runnerState->fifo;
+    runnerState->fifo = NULL;
+    return result;
+  }
   runnerState->redStream = redStream;
   runnerState->cpyStream = cpyStream;
   runnerState->commStream = stream;
@@ -3984,29 +4301,47 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
 
   // Clean up DAG scheduler
   FLAGCXCHECK(cleanupDagScheduler(&hcomm->proxyState->uniRunnerState));
+  hcomm->proxyState->uniRunnerState.ipcReadySlots = 0;
 
   // Outstanding stream waits/writes may still touch streamFlags when
   // runUniRunner exits early on an error path, so synchronize before marking
   // the reusable flag-address queue inactive for this invocation.
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(redStream));
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(cpyStream));
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(commStream));
+  if (redStream != NULL) {
+    FLAGCXCHECK(deviceAdaptor->streamSynchronize(redStream));
+  }
+  if (cpyStream != NULL) {
+    FLAGCXCHECK(deviceAdaptor->streamSynchronize(cpyStream));
+  }
+  if (commStream != NULL) {
+    FLAGCXCHECK(deviceAdaptor->streamSynchronize(commStream));
+  }
 
   hcomm->proxyState->uniRunnerState.streamFlagsSize = 0;
 
   // Destroy streams
-  FLAGCXCHECK(deviceAdaptor->streamDestroy(redStream));
-  FLAGCXCHECK(deviceAdaptor->streamDestroy(cpyStream));
+  if (redStream != NULL) {
+    FLAGCXCHECK(deviceAdaptor->streamDestroy(redStream));
+    hcomm->proxyState->uniRunnerState.redStream = NULL;
+  }
+  if (cpyStream != NULL) {
+    FLAGCXCHECK(deviceAdaptor->streamDestroy(cpyStream));
+    hcomm->proxyState->uniRunnerState.cpyStream = NULL;
+  }
+  hcomm->proxyState->uniRunnerState.commStream = NULL;
 
   // Destroy fifo
-  FLAGCXCHECK(hcomm->proxyState->uniRunnerState.fifo->flagcxRedFifoDestroy());
-  delete hcomm->proxyState->uniRunnerState.fifo;
-  hcomm->proxyState->uniRunnerState.fifo = NULL;
+  if (hcomm->proxyState->uniRunnerState.fifo != NULL) {
+    FLAGCXCHECK(hcomm->proxyState->uniRunnerState.fifo->flagcxRedFifoDestroy());
+    delete hcomm->proxyState->uniRunnerState.fifo;
+    hcomm->proxyState->uniRunnerState.fifo = NULL;
+  }
   hcomm->uniRunnerFifoBuffer = NULL;
-  FLAGCXCHECK(
-      hcomm->proxyState->uniRunnerState.ipcFifo->flagcxIpcFifoDestroy());
-  delete hcomm->proxyState->uniRunnerState.ipcFifo;
-  hcomm->proxyState->uniRunnerState.ipcFifo = NULL;
+  if (hcomm->proxyState->uniRunnerState.ipcFifo != NULL) {
+    FLAGCXCHECK(
+        hcomm->proxyState->uniRunnerState.ipcFifo->flagcxIpcFifoDestroy());
+    delete hcomm->proxyState->uniRunnerState.ipcFifo;
+    hcomm->proxyState->uniRunnerState.ipcFifo = NULL;
+  }
   hcomm->proxyState->uniRunnerState.ipcFifoDevicePtr = NULL;
 
   if (hcomm->proxyState->uniRunnerState.ipcParentFlagsDevice != NULL) {
@@ -4026,15 +4361,408 @@ static flagcxResult_t initializeDynamicRedFifo(flagcxHeteroComm_t hcomm) {
       hcomm->uniRunnerFifoBuffer != NULL) {
     return flagcxInternalError;
   }
-  FLAGCXCHECK(runnerState->fifo->flagcxRedFifoInit());
+  flagcxResult_t result = runnerState->fifo->flagcxRedFifoInit();
+  if (result != flagcxSuccess) {
+    return result;
+  }
   void *deviceBuffer = NULL;
-  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
-      &deviceBuffer, static_cast<void *>(runnerState->fifo->buffer)));
-  if (deviceBuffer == NULL) {
-    return flagcxSystemError;
+  result = deviceAdaptor->hostGetDevicePointer(
+      &deviceBuffer, static_cast<void *>(runnerState->fifo->buffer));
+  if (result != flagcxSuccess || deviceBuffer == NULL) {
+    if (result == flagcxSuccess) {
+      result = flagcxSystemError;
+    }
+    flagcxResult_t destroyResult =
+        runnerState->fifo->flagcxRedFifoDestroy();
+    if (result == flagcxSuccess) {
+      result = destroyResult;
+    }
+    return result;
   }
   hcomm->uniRunnerFifoBuffer = deviceBuffer;
   return flagcxSuccess;
+}
+
+static flagcxResult_t releaseUniRunnerIpcParentFlags(
+    flagcxUniRunnerState *runnerState) {
+  if (runnerState == NULL || runnerState->ipcParentFlagsDevice == NULL) {
+    return flagcxSuccess;
+  }
+  flagcxResult_t result = deviceAdaptor->deviceFree(
+      runnerState->ipcParentFlagsDevice, flagcxMemDevice, NULL);
+  if (result == flagcxSuccess) {
+    runnerState->ipcParentFlagsDevice = NULL;
+    runnerState->ipcParentFlagsCount = 0;
+  }
+  return result;
+}
+
+static flagcxResult_t releaseUniRunnerInvocationFifos(
+    flagcxHeteroComm_t hcomm) {
+  if (hcomm == NULL || hcomm->proxyState == NULL) {
+    return flagcxInvalidArgument;
+  }
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  flagcxResult_t result = flagcxSuccess;
+  if (runnerState->fifo != NULL && runnerState->fifo->buffer != NULL) {
+    flagcxResult_t redResult = runnerState->fifo->flagcxRedFifoDestroy();
+    if (result == flagcxSuccess && redResult != flagcxSuccess) {
+      result = redResult;
+    }
+  }
+  hcomm->uniRunnerFifoBuffer = NULL;
+  if (runnerState->ipcFifo != NULL && runnerState->ipcFifo->buffer != NULL) {
+    flagcxResult_t ipcResult = runnerState->ipcFifo->flagcxIpcFifoDestroy();
+    if (result == flagcxSuccess && ipcResult != flagcxSuccess) {
+      result = ipcResult;
+    }
+  }
+  runnerState->ipcFifoDevicePtr = NULL;
+  return result;
+}
+
+static flagcxResult_t getUniRunnerStaticIpcMaxChunks(
+    const flagcxUniRunnerState *runnerState, size_t *maxChunks) {
+  if (runnerState == NULL || maxChunks == NULL ||
+      runnerState->dagPlan.numIpcNodes == 0 ||
+      runnerState->dagPlan.numNodes !=
+          static_cast<size_t>(runnerState->numDagNodes) ||
+      runnerState->dagPlan.topoOrder == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *maxChunks = 0;
+  size_t ipcNodes = 0;
+  for (size_t topoSlot = 0; topoSlot < runnerState->dagPlan.numNodes;
+       ++topoSlot) {
+    const int nodeIdx = runnerState->dagPlan.topoOrder[topoSlot];
+    if (nodeIdx < 0 || nodeIdx >= runnerState->numDagNodes) {
+      return flagcxInternalError;
+    }
+    const uniRunnerDagNode *node = &runnerState->dagNodes[nodeIdx];
+    if (node->nodeType != uniRunnerDagNodeTypeIpc) {
+      continue;
+    }
+    uint32_t chunks = 0;
+    FLAGCXCHECK(checkedUniRunnerIpcChunkCount(
+        node->nodeData.ipc.bytes,
+        static_cast<size_t>(runnerState->uniRunnerIpcChunkSize), &chunks));
+    *maxChunks = std::max(*maxChunks, static_cast<size_t>(chunks));
+    ++ipcNodes;
+  }
+  return ipcNodes == runnerState->dagPlan.numIpcNodes && *maxChunks != 0
+             ? flagcxSuccess
+             : flagcxInternalError;
+}
+
+static flagcxResult_t prepareStaticCollectiveExecution(
+    flagcxComm_t comm, uniRunnerStaticExecutorSchedule *schedule,
+    size_t *numRedTriggers, size_t *numIpcTriggers,
+    size_t *maxExecutorBlocks, flagcxStaticIpcControl *ipcControl,
+    flagcxResult_t localPreparationResult) {
+  if (comm == NULL || comm->heteroComm == NULL || schedule == NULL ||
+      numRedTriggers == NULL || numIpcTriggers == NULL ||
+      maxExecutorBlocks == NULL || ipcControl == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *schedule = {};
+  *numRedTriggers = 0;
+  *numIpcTriggers = 0;
+  *maxExecutorBlocks = 0;
+  *ipcControl = {};
+
+  flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  const size_t ipcTasks = runnerState->dagPlan.numIpcNodes;
+  const size_t redTasks = runnerState->dagPlan.numRedNodes;
+  flagcxResult_t result = localPreparationResult;
+  if (result == flagcxSuccess &&
+      (ipcTasks == 0 || runnerState->ipcReadySlots != ipcTasks ||
+      runnerState->fifo == NULL || runnerState->ipcFifo == NULL ||
+      runnerState->fifo->buffer != NULL ||
+      runnerState->ipcFifo->buffer != NULL ||
+      hcomm->uniRunnerFifoBuffer != NULL ||
+      runnerState->ipcFifoDevicePtr != NULL ||
+      runnerState->ipcOwner != comm || runnerState->ipcInputMem == NULL ||
+      runnerState->ipcOutputMem == NULL || runnerState->ipcDataBytes == 0 ||
+      comm->localRanks <= 0 || comm->localRank < 0 ||
+       comm->localRank >= comm->localRanks)) {
+    result = flagcxInternalError;
+  }
+
+  size_t maxIpcParallelism = 0;
+  if (result == flagcxSuccess) {
+    result = getUniRunnerStaticIpcMaxChunks(runnerState, &maxIpcParallelism);
+  }
+
+#ifdef COMPILE_KERNEL_HOST
+  if (result == flagcxSuccess) {
+    result = flagcxGetStaticCollectiveKernelMaxExecutorBlocks(
+        static_cast<size_t>(runnerState->uniRunnerNThreads),
+        maxExecutorBlocks);
+  }
+#else
+  if (result == flagcxSuccess) {
+    result = flagcxNotSupported;
+  }
+#endif
+
+  if (result == flagcxSuccess) {
+    result = resolveUniRunnerStaticExecutorSchedule(
+        &runnerState->dagPlan,
+        static_cast<size_t>(runnerState->uniRunnerNRedBlocks),
+        static_cast<size_t>(runnerState->uniRunnerNIpcBlocks),
+        maxIpcParallelism, *maxExecutorBlocks, schedule);
+  }
+  if (result == flagcxSuccess &&
+      (schedule->numRedTasks != redTasks ||
+       schedule->numIpcTasks != ipcTasks || schedule->numIpcBlocks == 0 ||
+       (redTasks != 0 && schedule->numRedBlocks == 0) ||
+       (redTasks == 0 && schedule->numRedBlocks != 0))) {
+    result = flagcxInternalError;
+  }
+
+  const size_t localRanks = comm->localRanks > 0
+                                ? static_cast<size_t>(comm->localRanks)
+                                : size_t{0};
+  size_t controlSlots = 0;
+  size_t requiredReadySlots = 0;
+  const uint64_t maxControlEpoch =
+      flagcxIpcControlAbortBit - uint64_t{1};
+  uint64_t epoch = 0;
+  uint64_t invocationSignature = 0;
+  uint64_t preflightSignature = 0;
+  uint64_t readyState = 0;
+  if (result == flagcxSuccess && redTasks != 0) {
+    result = runnerState->fifo->flagcxRedFifoInit(redTasks);
+    if (result == flagcxSuccess) {
+      void *redDeviceBuffer = NULL;
+      result = deviceAdaptor->hostGetDevicePointer(
+          &redDeviceBuffer, static_cast<void *>(runnerState->fifo->buffer));
+      if (result == flagcxSuccess && redDeviceBuffer == NULL) {
+        result = flagcxSystemError;
+      }
+      if (result == flagcxSuccess) {
+        hcomm->uniRunnerFifoBuffer = redDeviceBuffer;
+      }
+    }
+  }
+
+  if (result == flagcxSuccess) {
+    result = runnerState->ipcFifo->flagcxIpcFifoInit(ipcTasks);
+    if (result == flagcxSuccess) {
+      result = deviceAdaptor->hostGetDevicePointer(
+          &runnerState->ipcFifoDevicePtr,
+          static_cast<void *>(runnerState->ipcFifo->buffer));
+      if (result == flagcxSuccess && runnerState->ipcFifoDevicePtr == NULL) {
+        result = flagcxSystemError;
+      }
+    }
+  }
+
+  if (result == flagcxSuccess) {
+    result = prepareUniRunnerIpcParentFlags(runnerState);
+  }
+
+  if (result == flagcxSuccess) {
+    if (localRanks > std::numeric_limits<size_t>::max() - size_t{1}) {
+      result = flagcxInvalidArgument;
+    } else {
+      controlSlots = size_t{1} + localRanks;
+      if (runnerState->ipcReadySlots >
+          std::numeric_limits<size_t>::max() - controlSlots) {
+        result = flagcxInvalidArgument;
+      } else {
+        requiredReadySlots = controlSlots + runnerState->ipcReadySlots;
+      }
+    }
+  }
+
+  const bool hasReadyMem = runnerState->ipcReadyMem != NULL;
+  const bool hasReadyBuffer = runnerState->ipcReadyBuffer != NULL;
+  if (!hasReadyMem && !hasReadyBuffer &&
+      runnerState->ipcReadyCapacity == 0) {
+    readyState = 0; // Empty: every rank must enter initial creation.
+  } else if (hasReadyMem && hasReadyBuffer) {
+    readyState = runnerState->ipcReadyCapacity >= requiredReadySlots ? 1 : 2;
+  } else {
+    readyState = 3; // Partial state is never safe to reuse or rebuild.
+  }
+  preflightSignature = uint64_t{0xcbf29ce484222325};
+  preflightSignature = mixUniRunnerInvocationSignature(
+      preflightSignature, static_cast<uint64_t>(requiredReadySlots));
+  preflightSignature =
+      mixUniRunnerInvocationSignature(preflightSignature, readyState);
+  preflightSignature = mixUniRunnerInvocationSignature(
+      preflightSignature,
+      static_cast<uint64_t>(runnerState->ipcReadyCapacity));
+
+  // Everything above is rank-local, while ready DevMem creation below is a
+  // bootstrap collective. Agree once before entering it so an occupancy,
+  // schedule, exact-FIFO, mapping, or parent-flag allocation failure cannot
+  // make one rank return while its peers block in that collective.
+  {
+    flagcxResult_t collectiveResult = flagcxSuccess;
+    flagcxResult_t agreementResult = agreeUniRunnerInvocationState(
+        comm, preflightSignature, result, &collectiveResult);
+    if (agreementResult != flagcxSuccess) {
+      result = agreementResult;
+      goto fail;
+    }
+    if (collectiveResult != flagcxSuccess) {
+      result = collectiveResult;
+      goto fail;
+    }
+  }
+  if (result != flagcxSuccess) {
+    goto fail;
+  }
+
+  result = ensureUniRunnerIpcReadyStorage(runnerState, comm,
+                                          requiredReadySlots);
+  if (result != flagcxSuccess) {
+    goto fail;
+  }
+  if (runnerState->ipcReadyMem == NULL ||
+      runnerState->ipcReadyCapacity < requiredReadySlots) {
+    result = flagcxInternalError;
+  }
+
+  if (result == flagcxSuccess && runnerState->ipcEpoch >= maxControlEpoch) {
+    WARN("UniRunner static IPC control epoch exhausted at %llu; refusing "
+         "unsafe wraparound",
+         static_cast<unsigned long long>(runnerState->ipcEpoch));
+    result = flagcxInvalidUsage;
+  }
+  if (result == flagcxSuccess) {
+    epoch = runnerState->ipcEpoch + uint64_t{1};
+    if (!flagcxIpcControlEpochValid(epoch)) {
+      result = flagcxInternalError;
+    }
+  }
+
+  if (result == flagcxSuccess) {
+    ipcControl->epoch = epoch;
+    ipcControl->abortSlot = 0;
+    ipcControl->doneBase = 1;
+    ipcControl->readyDataOffset = static_cast<uint64_t>(controlSlots);
+    ipcControl->localRank = static_cast<uint32_t>(comm->localRank);
+    ipcControl->localRanks = static_cast<uint32_t>(comm->localRanks);
+  }
+
+  if (result == flagcxSuccess && redTasks != 0) {
+    flagcxReduceTrigger *redTriggers =
+        reinterpret_cast<flagcxReduceTrigger *>(
+            runnerState->fifo->buffer + flagcxFifoIdxData);
+    result = populateUniRunnerStaticRedTriggers(
+        runnerState->dagNodes, static_cast<size_t>(runnerState->numDagNodes),
+        &runnerState->dagPlan, runnerState->streamFlags,
+        runnerState->streamFlagsSize, redTriggers, redTasks,
+        numRedTriggers);
+  }
+
+  if (result == flagcxSuccess) {
+    uniRunnerStaticIpcTriggerConfig config = {};
+    config.chunkSize =
+        static_cast<size_t>(runnerState->uniRunnerIpcChunkSize);
+    config.epoch = epoch;
+    config.dataBytes = runnerState->ipcDataBytes;
+    config.readySlots = runnerState->ipcReadySlots;
+    config.parentFlagsCount = runnerState->ipcParentFlagsCount;
+    config.localRanks = comm->localRanks;
+    flagcxIpcTrigger *ipcTriggers = reinterpret_cast<flagcxIpcTrigger *>(
+        runnerState->ipcFifo->buffer + flagcxFifoIdxData);
+    size_t materializedMaxChunks = 0;
+    result = populateUniRunnerStaticIpcTriggers(
+        runnerState->dagNodes, static_cast<size_t>(runnerState->numDagNodes),
+        &runnerState->dagPlan, runnerState->streamFlags,
+        runnerState->streamFlagsSize, &config, ipcTriggers, ipcTasks,
+        numIpcTriggers, &materializedMaxChunks);
+    if (result == flagcxSuccess &&
+        materializedMaxChunks != maxIpcParallelism) {
+      result = flagcxInternalError;
+    }
+  }
+
+  if (result == flagcxSuccess &&
+      (*numRedTriggers != redTasks || *numIpcTriggers != ipcTasks ||
+       (redTasks != 0 &&
+        runnerState->fifo->buffer[flagcxFifoIdxCapacity] != redTasks) ||
+       runnerState->ipcFifo->buffer[flagcxFifoIdxCapacity] != ipcTasks)) {
+    result = flagcxInternalError;
+  }
+
+  invocationSignature = uint64_t{0xcbf29ce484222325};
+  invocationSignature =
+      mixUniRunnerInvocationSignature(invocationSignature, epoch);
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature, static_cast<uint64_t>(ipcTasks));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature, static_cast<uint64_t>(redTasks));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature,
+      static_cast<uint64_t>(runnerState->ipcReadySlots));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature, static_cast<uint64_t>(controlSlots));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature, static_cast<uint64_t>(requiredReadySlots));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature, static_cast<uint64_t>(schedule->numRedBlocks));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature, static_cast<uint64_t>(schedule->numIpcBlocks));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature, static_cast<uint64_t>(*maxExecutorBlocks));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature,
+      static_cast<uint64_t>(runnerState->ipcDataBytes));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature,
+      static_cast<uint64_t>(runnerState->uniRunnerIpcChunkSize));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature,
+      static_cast<uint64_t>(runnerState->ipcParentFlagsCount));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature, static_cast<uint64_t>(maxIpcParallelism));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature, static_cast<uint64_t>(*numRedTriggers));
+  invocationSignature = mixUniRunnerInvocationSignature(
+      invocationSignature, static_cast<uint64_t>(*numIpcTriggers));
+  {
+    flagcxResult_t collectiveResult = flagcxSuccess;
+    flagcxResult_t agreementResult = agreeUniRunnerInvocationState(
+        comm, invocationSignature, result, &collectiveResult);
+    if (agreementResult != flagcxSuccess) {
+      result = agreementResult;
+      goto fail;
+    }
+    if (collectiveResult != flagcxSuccess) {
+      result = collectiveResult;
+      goto fail;
+    }
+  }
+  runnerState->ipcEpoch = epoch;
+
+  TRACE(FLAGCX_UNIRUNNER,
+        "static RED+IPC schedule: red_tasks=%zu ipc_tasks=%zu "
+        "max_ipc_chunks=%zu red_blocks=%zu ipc_blocks=%zu budget=%zu "
+        "epoch=%llu",
+        redTasks, ipcTasks, maxIpcParallelism, schedule->numRedBlocks,
+        schedule->numIpcBlocks, *maxExecutorBlocks,
+        static_cast<unsigned long long>(epoch));
+  return flagcxSuccess;
+
+fail:
+  {
+    flagcxResult_t parentResult =
+        releaseUniRunnerIpcParentFlags(runnerState);
+    if (result == flagcxSuccess && parentResult != flagcxSuccess) {
+      result = parentResult;
+    }
+    flagcxResult_t fifoResult = releaseUniRunnerInvocationFifos(hcomm);
+    if (result == flagcxSuccess && fifoResult != flagcxSuccess) {
+      result = fifoResult;
+    }
+  }
+  return result;
 }
 
 static flagcxResult_t prepareStaticRedExecution(
@@ -4080,25 +4808,35 @@ static flagcxResult_t prepareStaticRedExecution(
   }
 
   const size_t redTasks = schedule->numRedTasks;
-  FLAGCXCHECK(runnerState->fifo->flagcxRedFifoInit(redTasks));
+  flagcxResult_t result = runnerState->fifo->flagcxRedFifoInit(redTasks);
+  if (result != flagcxSuccess) {
+    return result;
+  }
   void *deviceBuffer = NULL;
-  FLAGCXCHECK(deviceAdaptor->hostGetDevicePointer(
-      &deviceBuffer, static_cast<void *>(runnerState->fifo->buffer)));
-  if (deviceBuffer == NULL) {
-    return flagcxSystemError;
+  flagcxReduceTrigger *triggers = NULL;
+  result = deviceAdaptor->hostGetDevicePointer(
+      &deviceBuffer, static_cast<void *>(runnerState->fifo->buffer));
+  if (result != flagcxSuccess || deviceBuffer == NULL) {
+    if (result == flagcxSuccess) {
+      result = flagcxSystemError;
+    }
+    goto fail;
   }
   hcomm->uniRunnerFifoBuffer = deviceBuffer;
 
-  flagcxReduceTrigger *triggers =
-      reinterpret_cast<flagcxReduceTrigger *>(
-          runnerState->fifo->buffer + flagcxFifoIdxData);
-  FLAGCXCHECK(populateUniRunnerStaticRedTriggers(
+  triggers = reinterpret_cast<flagcxReduceTrigger *>(
+      runnerState->fifo->buffer + flagcxFifoIdxData);
+  result = populateUniRunnerStaticRedTriggers(
       runnerState->dagNodes, static_cast<size_t>(runnerState->numDagNodes),
       &runnerState->dagPlan, runnerState->streamFlags,
-      runnerState->streamFlagsSize, triggers, redTasks, numTriggers));
+      runnerState->streamFlagsSize, triggers, redTasks, numTriggers);
+  if (result != flagcxSuccess) {
+    goto fail;
+  }
   if (*numTriggers != redTasks ||
       runnerState->fifo->buffer[flagcxFifoIdxCapacity] != redTasks) {
-    return flagcxInternalError;
+    result = flagcxInternalError;
+    goto fail;
   }
 
   TRACE(FLAGCX_UNIRUNNER,
@@ -4108,6 +4846,17 @@ static flagcxResult_t prepareStaticRedExecution(
         static_cast<unsigned long long>(runnerState->uniRunnerNRedBlocks),
         schedule->numRedBlocks);
   return flagcxSuccess;
+
+fail:
+  {
+    flagcxResult_t destroyResult =
+        runnerState->fifo->flagcxRedFifoDestroy();
+    hcomm->uniRunnerFifoBuffer = NULL;
+    if (result == flagcxSuccess) {
+      result = destroyResult;
+    }
+  }
+  return result;
 }
 
 static void preserveFirstUniRunnerError(flagcxResult_t candidate,
@@ -4128,49 +4877,83 @@ static flagcxResult_t drainUniRunnerStreams(flagcxUniRunnerState *runnerState,
   return result;
 }
 
-static flagcxResult_t abortAndDrainStaticExecution(
-    flagcxUniRunnerState *runnerState, flagcxStream_t recoveryStream,
-    flagcxResult_t result) {
+static void requestUniRunnerStaticAbort(flagcxUniRunnerState *runnerState) {
   if (runnerState->fifo != NULL && runnerState->fifo->buffer != NULL) {
     __atomic_store_n(runnerState->fifo->buffer + flagcxFifoIdxTerminate, 1,
                      __ATOMIC_RELEASE);
   }
+  if (runnerState->ipcFifo != NULL &&
+      runnerState->ipcFifo->buffer != NULL) {
+    // The combined static kernel deliberately uses the IPC FIFO terminate word
+    // as its one rank-local abort flag.
+    __atomic_store_n(runnerState->ipcFifo->buffer + flagcxFifoIdxTerminate, 1,
+                     __ATOMIC_RELEASE);
+  }
+}
 
-  // The independent recovery stream can run even when an original stream is
-  // blocked behind a flag whose producer failed. The static RED kernel also
-  // observes the abort word and publishes its remaining output flags.
+enum uniRunnerStaticStreamIndex {
+  uniRunnerStaticRedStream = 0,
+  uniRunnerStaticCpyStream = 1,
+  uniRunnerStaticCommStream = 2,
+  uniRunnerStaticNumStreams = 3,
+  uniRunnerStaticNoFailedStream = -1,
+};
+
+static flagcxResult_t repairUniRunnerStaticFlags(
+    flagcxUniRunnerState *runnerState, flagcxStream_t stream) {
+  flagcxResult_t result = flagcxSuccess;
   for (size_t flagIdx = 0; flagIdx < runnerState->streamFlagsSize; ++flagIdx) {
     preserveFirstUniRunnerError(
         deviceAdaptor->streamWriteValue64(
-            recoveryStream, runnerState->streamFlags[flagIdx],
-            flagcxStreamFlagDone, 0),
+            stream, runnerState->streamFlags[flagIdx], flagcxStreamFlagDone,
+            0),
         &result);
   }
+  return result;
+}
 
-  flagcxStream_t streams[] = {runnerState->redStream,
-                              runnerState->cpyStream,
-                              runnerState->commStream, recoveryStream};
-  const size_t numStreams =
-      recoveryStream == runnerState->redStream ||
-              recoveryStream == runnerState->cpyStream ||
-              recoveryStream == runnerState->commStream
-          ? 3
-          : sizeof(streams) / sizeof(streams[0]);
-  bool complete[] = {false, false, false, false};
-  size_t remaining = numStreams;
+static flagcxResult_t recoverPoisonedUniRunnerRedStream(
+    flagcxUniRunnerState *runnerState,
+    const flagcxStaticIpcControl *ipcControl, flagcxResult_t result);
+
+static flagcxResult_t pollUniRunnerStaticStreams(
+    flagcxUniRunnerState *runnerState,
+    const flagcxStaticIpcControl *ipcControl, flagcxResult_t result,
+    int knownCompleteStream) {
+  flagcxStream_t streams[uniRunnerStaticNumStreams] = {
+      runnerState->redStream, runnerState->cpyStream,
+      runnerState->commStream};
+  bool complete[uniRunnerStaticNumStreams] = {false, false, false};
+  size_t remaining = uniRunnerStaticNumStreams;
+  if (knownCompleteStream >= 0 &&
+      knownCompleteStream < uniRunnerStaticNumStreams) {
+    complete[knownCompleteStream] = true;
+    --remaining;
+  }
+
   while (remaining != 0) {
     bool madeProgress = false;
-    for (size_t streamIdx = 0; streamIdx < numStreams; ++streamIdx) {
+    for (int streamIdx = 0; streamIdx < uniRunnerStaticNumStreams;
+         ++streamIdx) {
       if (complete[streamIdx]) {
         continue;
       }
       flagcxResult_t queryResult =
           deviceAdaptor->streamQuery(streams[streamIdx]);
-      if (queryResult != flagcxInProgress) {
-        complete[streamIdx] = true;
-        --remaining;
-        madeProgress = true;
-        preserveFirstUniRunnerError(queryResult, &result);
+      if (queryResult == flagcxInProgress) {
+        continue;
+      }
+      complete[streamIdx] = true;
+      --remaining;
+      madeProgress = true;
+      preserveFirstUniRunnerError(queryResult, &result);
+      if (streamIdx == uniRunnerStaticRedStream &&
+          queryResult != flagcxSuccess) {
+        // streamQuery returning a terminal error establishes that the local
+        // executor is no longer running. Only now is an independent recovery
+        // stream safe: it cannot race peer writes from the failed executor.
+        return recoverPoisonedUniRunnerRedStream(
+            runnerState, ipcControl, result);
       }
     }
     if (!madeProgress && remaining != 0) {
@@ -4180,17 +4963,87 @@ static flagcxResult_t abortAndDrainStaticExecution(
   return result;
 }
 
+static flagcxResult_t recoverPoisonedUniRunnerRedStream(
+    flagcxUniRunnerState *runnerState,
+    const flagcxStaticIpcControl *ipcControl, flagcxResult_t result) {
+  requestUniRunnerStaticAbort(runnerState);
+
+  // This stream is created only on the asynchronous-error path. The failed RED
+  // stream is already terminal, so IPC recovery may safely publish this rank's
+  // abort/done epoch and join the peer quiescence barrier before releasing any
+  // host-stream DAG waits.
+  flagcxStream_t recoveryStream = NULL;
+  flagcxResult_t createResult =
+      deviceAdaptor->streamCreate(&recoveryStream);
+  if (createResult == flagcxSuccess && recoveryStream == NULL) {
+    createResult = flagcxSystemError;
+  }
+  preserveFirstUniRunnerError(createResult, &result);
+  if (createResult != flagcxSuccess || recoveryStream == NULL) {
+    return result;
+  }
+
+  flagcxResult_t recoveryResult = flagcxSuccess;
+#ifdef COMPILE_KERNEL_HOST
+  if (ipcControl != NULL) {
+    recoveryResult = flagcxLaunchStaticIpcRecoveryKernel(
+        runnerState->ipcReadyMem, ipcControl, recoveryStream);
+  }
+#else
+  if (ipcControl != NULL) {
+    recoveryResult = flagcxNotSupported;
+  }
+#endif
+  preserveFirstUniRunnerError(recoveryResult, &result);
+
+  flagcxResult_t repairResult =
+      repairUniRunnerStaticFlags(runnerState, recoveryStream);
+  preserveFirstUniRunnerError(repairResult, &result);
+  flagcxResult_t syncResult =
+      deviceAdaptor->streamSynchronize(recoveryStream);
+  preserveFirstUniRunnerError(syncResult, &result);
+  preserveFirstUniRunnerError(
+      deviceAdaptor->streamDestroy(recoveryStream), &result);
+
+  if (recoveryResult != flagcxSuccess || repairResult != flagcxSuccess ||
+      syncResult != flagcxSuccess) {
+    // Do not poll streams which may still be blocked when recovery itself could
+    // not be established. Returning the original terminal error avoids turning
+    // a failed GPU/context into an unbounded host busy wait.
+    return result;
+  }
+  return pollUniRunnerStaticStreams(
+      runnerState, ipcControl, result, uniRunnerStaticRedStream);
+}
+
+static flagcxResult_t abortAndDrainStaticExecution(
+    flagcxUniRunnerState *runnerState,
+    const flagcxStaticIpcControl *ipcControl, flagcxResult_t result,
+    int knownFailedStream = uniRunnerStaticNoFailedStream) {
+  requestUniRunnerStaticAbort(runnerState);
+
+  // Host submission failures and non-RED stream failures leave redStream
+  // healthy. Queue repair after the executor: stream order establishes local
+  // quiescence before releasing host streams blocked on unfinished DAG flags.
+  preserveFirstUniRunnerError(
+      repairUniRunnerStaticFlags(runnerState, runnerState->redStream),
+      &result);
+  return pollUniRunnerStaticStreams(
+      runnerState, ipcControl, result, knownFailedStream);
+}
+
 static flagcxResult_t waitForStaticStreamCompletion(
-    flagcxUniRunnerState *runnerState, flagcxStream_t recoveryStream) {
-  flagcxStream_t streams[] = {runnerState->redStream,
-                              runnerState->cpyStream,
-                              runnerState->commStream};
-  bool complete[] = {false, false, false};
-  size_t remaining = sizeof(streams) / sizeof(streams[0]);
+    flagcxUniRunnerState *runnerState,
+    const flagcxStaticIpcControl *ipcControl) {
+  flagcxStream_t streams[uniRunnerStaticNumStreams] = {
+      runnerState->redStream, runnerState->cpyStream,
+      runnerState->commStream};
+  bool complete[uniRunnerStaticNumStreams] = {false, false, false};
+  size_t remaining = uniRunnerStaticNumStreams;
   while (remaining != 0) {
     bool madeProgress = false;
-    for (size_t streamIdx = 0;
-         streamIdx < sizeof(streams) / sizeof(streams[0]); ++streamIdx) {
+    for (int streamIdx = 0; streamIdx < uniRunnerStaticNumStreams;
+         ++streamIdx) {
       if (complete[streamIdx]) {
         continue;
       }
@@ -4201,8 +5054,12 @@ static flagcxResult_t waitForStaticStreamCompletion(
         --remaining;
         madeProgress = true;
       } else if (queryResult != flagcxInProgress) {
-        return abortAndDrainStaticExecution(runnerState, recoveryStream,
-                                            queryResult);
+        if (streamIdx == uniRunnerStaticRedStream) {
+          return recoverPoisonedUniRunnerRedStream(
+              runnerState, ipcControl, queryResult);
+        }
+        return abortAndDrainStaticExecution(
+            runnerState, ipcControl, queryResult, streamIdx);
       }
     }
     if (!madeProgress && remaining != 0) {
@@ -4240,17 +5097,6 @@ static flagcxResult_t runStaticHostRed(flagcxHeteroComm_t hcomm) {
   }
 
 #ifdef COMPILE_KERNEL_HOST
-  flagcxStream_t recoveryStream = runnerState->redStream;
-  bool ownsRecoveryStream = false;
-  if (numTriggers != 0) {
-    flagcxResult_t createResult =
-        deviceAdaptor->streamCreate(&recoveryStream);
-    if (createResult != flagcxSuccess) {
-      return createResult;
-    }
-    ownsRecoveryStream = true;
-  }
-
   if (numTriggers != 0) {
     flagcxResult_t launchResult = flagcxLaunchStaticReduceKernel(
         hcomm->uniRunnerFifoBuffer, numTriggers,
@@ -4258,14 +5104,14 @@ static flagcxResult_t runStaticHostRed(flagcxHeteroComm_t hcomm) {
         schedule.numRedBlocks, maxExecutorBlocks, runnerState->avgDivisor,
         runnerState->redStream);
     if (launchResult != flagcxSuccess) {
-      preserveFirstUniRunnerError(
-          deviceAdaptor->streamDestroy(recoveryStream), &launchResult);
-      return launchResult;
+      // A runtime launch API may report an earlier asynchronous error even if
+      // this executor was accepted. Abort and queue flag repair behind it on
+      // redStream so both the enqueued and definitely-unlaunched cases drain.
+      return abortAndDrainStaticExecution(
+          runnerState, NULL, launchResult);
     }
   }
 #else
-  flagcxStream_t recoveryStream = runnerState->redStream;
-  const bool ownsRecoveryStream = false;
   if (numTriggers != 0) {
     return flagcxNotSupported;
   }
@@ -4273,32 +5119,129 @@ static flagcxResult_t runStaticHostRed(flagcxHeteroComm_t hcomm) {
 
   flagcxResult_t result = submitStaticHostDag(runnerState, hcomm);
   if (result != flagcxSuccess) {
-    result = abortAndDrainStaticExecution(runnerState, recoveryStream, result);
+    result = abortAndDrainStaticExecution(runnerState, NULL, result);
   } else {
-    result = waitForStaticStreamCompletion(runnerState, recoveryStream);
+    result = waitForStaticStreamCompletion(runnerState, NULL);
   }
-  if (ownsRecoveryStream) {
-    preserveFirstUniRunnerError(
-        deviceAdaptor->streamDestroy(recoveryStream), &result);
+  return result;
+}
+
+static flagcxResult_t recoverFailedStaticCollectiveLaunch(
+    flagcxUniRunnerState *runnerState,
+    const flagcxStaticIpcControl *ipcControl,
+    flagcxStream_t executorStream, flagcxResult_t launchResult) {
+  // Queue recovery on the same RED stream as the attempted cooperative launch.
+  // If the launch actually enqueued but reported an earlier asynchronous error,
+  // stream order delays recovery until the executor has stopped peer writes and
+  // completed its done barrier. If it was not enqueued, recovery safely fills
+  // the missing rank-local done publication. This must be the same stream used
+  // for the attempted executor launch.
+  requestUniRunnerStaticAbort(runnerState);
+#ifdef COMPILE_KERNEL_HOST
+  flagcxResult_t recoveryResult = flagcxLaunchStaticIpcRecoveryKernel(
+      runnerState->ipcReadyMem, ipcControl, executorStream);
+  preserveFirstUniRunnerError(recoveryResult, &launchResult);
+  // Synchronize even when the recovery launch reports an error: both the
+  // original executor launch and this recovery launch may have been accepted
+  // while the API surfaced an earlier asynchronous failure. Stream order is
+  // the only safe way to resolve that ambiguity.
+  flagcxResult_t syncResult =
+      deviceAdaptor->streamSynchronize(executorStream);
+  preserveFirstUniRunnerError(syncResult, &launchResult);
+  if (recoveryResult != flagcxSuccess || syncResult != flagcxSuccess) {
+    // Resolve any remaining launch ambiguity explicitly. Host abort makes a
+    // live main executor leave its polling loops; once streamQuery is terminal,
+    // an independent stream can retry the idempotent recovery without racing
+    // executor peer writes. A true hardware hang remains an external-abort case.
+    flagcxResult_t queryResult = flagcxInProgress;
+    while (queryResult == flagcxInProgress) {
+      queryResult = deviceAdaptor->streamQuery(executorStream);
+      if (queryResult == flagcxInProgress) {
+        sched_yield();
+      }
+    }
+    preserveFirstUniRunnerError(queryResult, &launchResult);
+    return recoverPoisonedUniRunnerRedStream(
+        runnerState, ipcControl, launchResult);
+  }
+#else
+  (void)ipcControl;
+  (void)executorStream;
+#endif
+  return launchResult;
+}
+
+static flagcxResult_t runStaticHostRedIpc(
+    flagcxComm_t comm, flagcxResult_t localPreparationResult) {
+  flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  uniRunnerStaticExecutorSchedule schedule = {};
+  flagcxStaticIpcControl ipcControl = {};
+  size_t numRedTriggers = 0;
+  size_t numIpcTriggers = 0;
+  size_t maxExecutorBlocks = 0;
+  FLAGCXCHECK(prepareStaticCollectiveExecution(
+      comm, &schedule, &numRedTriggers, &numIpcTriggers, &maxExecutorBlocks,
+      &ipcControl, localPreparationResult));
+
+#ifdef COMPILE_KERNEL_HOST
+  flagcxResult_t launchResult = flagcxLaunchStaticCollectiveKernel(
+      hcomm->uniRunnerFifoBuffer, numRedTriggers,
+      runnerState->ipcFifoDevicePtr, numIpcTriggers,
+      runnerState->ipcInputMem, runnerState->ipcOutputMem,
+      runnerState->ipcReadyMem, runnerState->ipcParentFlagsDevice,
+      runnerState->ipcParentFlagsCount,
+      static_cast<size_t>(runnerState->uniRunnerNThreads),
+      schedule.numRedBlocks, schedule.numIpcBlocks, maxExecutorBlocks,
+      runnerState->avgDivisor, &ipcControl, runnerState->redStream);
+  if (launchResult != flagcxSuccess) {
+    // The runtime API may surface an earlier asynchronous error even if this
+    // launch was accepted. Recovery therefore follows the attempted executor
+    // on redStream. An independent retry is allowed only after synchronizing
+    // that stream has established a terminal/quiesced state.
+    return recoverFailedStaticCollectiveLaunch(
+        runnerState, &ipcControl, runnerState->redStream, launchResult);
+  }
+#else
+  return flagcxNotSupported;
+#endif
+
+  flagcxResult_t result = submitStaticHostDag(runnerState, hcomm);
+  if (result != flagcxSuccess) {
+    // The executor is already live. Signal its own abort word and let its
+    // blocksDone epilogue establish quiescence; never launch recovery here.
+    result = abortAndDrainStaticExecution(
+        runnerState, &ipcControl, result);
+  } else {
+    result = waitForStaticStreamCompletion(runnerState, &ipcControl);
+    if (result == flagcxSuccess && runnerState->ipcFifo != NULL &&
+        runnerState->ipcFifo->buffer != NULL &&
+        __atomic_load_n(runnerState->ipcFifo->buffer + flagcxFifoIdxTerminate,
+                        __ATOMIC_ACQUIRE) != 0) {
+      result = flagcxRemoteError;
+    }
   }
   return result;
 }
 
 static flagcxResult_t runDynamicDagFallback(flagcxHeteroComm_t hcomm) {
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
-  FLAGCXCHECK(initializeDynamicRedFifo(hcomm));
-  FLAGCXCHECK(prepareUniRunnerIpcParentFlags(runnerState));
-  if (runnerState->ipcReadySlots != 0) {
-    runnerState->ipcEpoch = flagcxNextIpcEpoch(runnerState->ipcEpoch);
+  // IPC FIFOs now carry a control prefix and are materialized statically.
+  // Feeding IPC nodes through the legacy producer/dequeue path would alias its
+  // ready slot zero with the abort word, so fallback is intentionally RED-only.
+  if (runnerState->dagPlan.numIpcNodes != 0 ||
+      runnerState->ipcFifo == NULL ||
+      runnerState->ipcFifo->buffer != NULL ||
+      runnerState->ipcFifoDevicePtr != NULL) {
+    return flagcxNotSupported;
   }
+  FLAGCXCHECK(initializeDynamicRedFifo(hcomm));
 
 #ifdef COMPILE_KERNEL_HOST
   FLAGCXCHECK(flagcxLaunchCollectiveKernel(
-      hcomm->uniRunnerFifoBuffer, runnerState->ipcFifoDevicePtr,
-      runnerState->ipcInputMem, runnerState->ipcOutputMem,
-      runnerState->ipcReadyMem, runnerState->ipcParentFlagsDevice,
+      hcomm->uniRunnerFifoBuffer, NULL, NULL, NULL, NULL, NULL,
       runnerState->uniRunnerNThreads, runnerState->uniRunnerNRedBlocks,
-      runnerState->uniRunnerNIpcBlocks, runnerState->avgDivisor,
+      0, runnerState->avgDivisor,
       runnerState->redStream));
 #else
   return flagcxNotSupported;
@@ -4311,11 +5254,9 @@ static flagcxResult_t runDynamicDagFallback(flagcxHeteroComm_t hcomm) {
         runnerState->numPendingNodes == 0) {
       TRACE(
           FLAGCX_UNIRUNNER,
-          "runUniRunner: dynamic DAG fallback drained, terminating executors");
+          "runUniRunner: dynamic RED fallback drained, terminating executor");
       __atomic_store_n(runnerState->fifo->buffer + flagcxFifoIdxTerminate, 1,
                        __ATOMIC_RELEASE);
-      __atomic_store_n(runnerState->ipcFifo->buffer + flagcxFifoIdxTerminate,
-                       1, __ATOMIC_RELEASE);
       break;
     }
     FLAGCXCHECK(processReadyQueue(runnerState, hcomm));
@@ -4327,19 +5268,33 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
-  FLAGCXCHECK(validateDagNodes(runnerState));
-  const size_t numDagNodes = static_cast<size_t>(runnerState->numDagNodes);
-  if (runnerState->dagPlan.numNodes != numDagNodes ||
-      (numDagNodes != 0 && runnerState->dagPlan.topoOrder == NULL) ||
-      runnerState->dagPlan.numHostNodes + runnerState->dagPlan.numRedNodes +
-              runnerState->dagPlan.numIpcNodes !=
-          numDagNodes) {
-    return flagcxInternalError;
+  const bool ipcIntent =
+      runnerState->ipcOwner == comm && runnerState->ipcReadySlots != 0;
+  flagcxResult_t localPreparationResult = validateDagNodes(runnerState);
+  if (localPreparationResult == flagcxSuccess) {
+    const size_t numDagNodes =
+        static_cast<size_t>(runnerState->numDagNodes);
+    if (runnerState->dagPlan.numNodes != numDagNodes ||
+        (numDagNodes != 0 && runnerState->dagPlan.topoOrder == NULL) ||
+        runnerState->dagPlan.numHostNodes + runnerState->dagPlan.numRedNodes +
+                runnerState->dagPlan.numIpcNodes !=
+            numDagNodes) {
+      localPreparationResult = flagcxInternalError;
+    }
   }
-  FLAGCXCHECK(prepareDagStreamFlags(runnerState));
-  return runnerState->dagPlan.numIpcNodes == 0
-             ? runStaticHostRed(hcomm)
-             : runDynamicDagFallback(hcomm);
+  if (localPreparationResult == flagcxSuccess) {
+    localPreparationResult = prepareDagStreamFlags(runnerState);
+  }
+  if (ipcIntent) {
+    // IPC initialization already agreed this intent across ranks. Preserve the
+    // static preparation collective even when one rank fails validation or
+    // stream-flag setup, so no peer enters the preflight all-gather alone.
+    return runStaticHostRedIpc(comm, localPreparationResult);
+  }
+  if (localPreparationResult != flagcxSuccess) {
+    return localPreparationResult;
+  }
+  return runStaticHostRed(hcomm);
 }
 
 flagcxResult_t
@@ -4356,8 +5311,14 @@ cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState) {
   }
   runnerState->ipcReadyMem = NULL;
   if (runnerState->ipcReadyBuffer != NULL) {
-    FLAGCXCHECK(
-        freeUniRunnerIpcReadyBuffer(runnerState->ipcReadyBuffer));
+    if (comm == NULL) {
+      return flagcxInternalError;
+    }
+    // Peer CUDA IPC mappings are closed later by
+    // flagcxCommCleanupIpcTable(). Defer the exporter allocation until the
+    // communicator subsequently drains deferred frees. The communicator's
+    // overflow chain preserves safety if its fixed inline slots are exhausted.
+    flagcxCommDeferFree(comm, runnerState->ipcReadyBuffer, flagcxMemDevice);
   }
   runnerState->ipcReadyBuffer = NULL;
   runnerState->ipcReadyCapacity = 0;

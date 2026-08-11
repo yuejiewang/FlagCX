@@ -211,8 +211,9 @@ typedef struct {
   size_t streamFlagsCapacity;
 
   // IPC/LSA AllReduce runtime resources. User-buffer DevMem views are reused
-  // while their base/size bindings remain unchanged; owned ready storage is
-  // communicator scoped and reused with monotonically increasing epochs.
+  // while their base/size bindings remain unchanged. ipcReadySlots counts only
+  // logical DAG-ready entries; ipcReadyCapacity includes the static executor's
+  // abort/done control prefix and is the number of allocated uint64_t slots.
   flagcxComm_t ipcOwner;
   flagcxDevMem_t ipcInputMem;
   flagcxDevMem_t ipcOutputMem;
