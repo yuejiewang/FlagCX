@@ -384,6 +384,23 @@ TEST(UniRunnerStaticIpcTrigger, ComparesAndAdvancesWrappingEpochs) {
   EXPECT_EQ(1u, flagcxNextIpcEpoch(maxEpoch));
 }
 
+TEST(UniRunnerStaticIpcTrigger, EncodesBoundedControlEpochsAndAbortState) {
+  const uint64_t maxControlEpoch = flagcxIpcControlAbortBit - 1;
+
+  EXPECT_FALSE(flagcxIpcControlEpochValid(0));
+  EXPECT_TRUE(flagcxIpcControlEpochValid(1));
+  EXPECT_TRUE(flagcxIpcControlEpochValid(maxControlEpoch));
+  EXPECT_FALSE(flagcxIpcControlEpochValid(flagcxIpcControlAbortBit));
+  EXPECT_FALSE(flagcxIpcControlEpochValid(
+      flagcxIpcControlAbortBit | uint64_t{1}));
+
+  EXPECT_TRUE(flagcxIpcControlEpochMatches(7, 7));
+  EXPECT_TRUE(flagcxIpcControlEpochMatches(
+      flagcxIpcControlAbortBit | uint64_t{7}, 7));
+  EXPECT_FALSE(flagcxIpcControlEpochMatches(6, 7));
+  EXPECT_FALSE(flagcxIpcControlEpochMatches(7, 0));
+}
+
 TEST(UniRunnerStaticIpcTrigger,
      MaterializesMixedPlanInFilteredTopoOrderAndReportsMaxChunks) {
   uniRunnerDagNode nodes[4] = {};

@@ -86,6 +86,30 @@ FLAGCX_HOST_DEVICE_INLINE uint64_t flagcxNextIpcEpoch(uint64_t epoch) {
   return epoch == 0 ? 1 : epoch;
 }
 
+// Static IPC reserves the high bit of an end-of-invocation control value to
+// propagate a remote abort. Epoch zero remains uninitialized, so a static IPC
+// invocation uses the closed interval [1, INT64_MAX].
+static constexpr uint64_t flagcxIpcControlAbortBit = uint64_t(1) << 63;
+
+FLAGCX_HOST_DEVICE_INLINE bool flagcxIpcControlEpochValid(uint64_t epoch) {
+  return epoch != 0 && (epoch & flagcxIpcControlAbortBit) == 0;
+}
+
+FLAGCX_HOST_DEVICE_INLINE bool flagcxIpcControlEpochMatches(uint64_t value,
+                                                            uint64_t epoch) {
+  return flagcxIpcControlEpochValid(epoch) &&
+         (value & ~flagcxIpcControlAbortBit) == epoch;
+}
+
+struct alignas(16) flagcxStaticIpcControl {
+  uint64_t epoch;
+  uint64_t readyDataOffset;
+  uint64_t abortSlot;
+  uint64_t doneBase;
+  uint32_t localRank;
+  uint32_t localRanks;
+};
+
 // ==========================================================================
 // flagcxDeviceTrigger bit layout (24 bytes = 3 × uint64_t: fst, snd, trd)
 //

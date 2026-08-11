@@ -673,23 +673,52 @@ copyIpcBytes(void *dst, const void *src, size_t bytes) {
   }
 }
 
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t *getStaticIpcReadyPointer(
+    const flagcxDevMem &readyMem, uint64_t slot) {
+  return static_cast<uint64_t *>(flagcxGetLocalPointer(
+      readyMem, slot * sizeof(uint64_t)));
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticIpcControlValue(
+    const flagcxDevMem &readyMem, uint64_t slot, uint64_t value,
+    uint32_t localRanks) {
+  for (uint32_t peer = 0; peer < localRanks; ++peer) {
+    uint64_t *remote = static_cast<uint64_t *>(flagcxGetIntraPointer(
+        readyMem, slot * sizeof(uint64_t), static_cast<int>(peer)));
+    DeviceAPI::Atomic::store(remote, value, flagcxDeviceMemoryOrderRelease);
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR bool isStaticIpcAbortRequested(
+    const uint64_t *abortFlag, const flagcxDevMem &readyMem,
+    const flagcxStaticIpcControl &control) {
+  if (isStaticAbortRequested(abortFlag)) {
+    return true;
+  }
+  const uint64_t observed = DeviceAPI::Atomic::load(
+      getStaticIpcReadyPointer(readyMem, control.abortSlot),
+      flagcxDeviceMemoryOrderAcquire);
+  if (flagcxIpcEpochReached(observed, control.epoch)) {
+    requestStaticAbort(abortFlag);
+    return true;
+  }
+  return false;
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticIpcRemoteAbort(
+    const flagcxDevMem &readyMem,
+    const flagcxStaticIpcControl &control) {
+  publishStaticIpcControlValue(readyMem, control.abortSlot, control.epoch,
+                               control.localRanks);
+}
+
 FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticIpcAbort(
     flagcxIpcTrigger *triggers, uint64_t numTriggers,
-    const flagcxDevMem &readyMem, uint64_t firstOrdinal,
-    uint64_t stride) {
+    uint64_t firstOrdinal, uint64_t stride) {
   if (FLAGCX_THREAD_IDX_X == 0) {
     for (uint64_t ordinal = firstOrdinal; ordinal < numTriggers;
          ordinal += stride) {
       flagcxIpcTrigger *trigger = &triggers[ordinal];
-      // A peer may be blocked on any logical IPC node that this rank will no
-      // longer execute. Publish every owned epoch before recycling local
-      // state, so a one-sided abort cannot strand the remote static kernel.
-      uint64_t *remoteReady =
-          static_cast<uint64_t *>(flagcxGetIntraPointer(
-              readyMem, trigger->readySlot * sizeof(uint64_t),
-              static_cast<int>(trigger->peerLocalRank)));
-      DeviceAPI::Atomic::store(remoteReady, trigger->epoch,
-                               flagcxDeviceMemoryOrderRelease);
       if (trigger->flagOut != 0) {
         // This cleanup is deliberately idempotent. Future triggers can still
         // be Idle when abort is observed, but their submitted stream waits
@@ -708,6 +737,18 @@ FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticIpcAbort(
   FLAGCX_DEVICE_SYNC_THREADS();
 }
 
+FLAGCX_DEVICE_INLINE_DECORATOR void abortStaticIpcExecutor(
+    flagcxIpcTrigger *triggers, uint64_t numTriggers,
+    const flagcxDevMem &readyMem,
+    const flagcxStaticIpcControl &control, uint64_t firstOrdinal,
+    uint64_t stride) {
+  if (FLAGCX_THREAD_IDX_X == 0) {
+    publishStaticIpcRemoteAbort(readyMem, control);
+  }
+  FLAGCX_DEVICE_SYNC_THREADS();
+  publishStaticIpcAbort(triggers, numTriggers, firstOrdinal, stride);
+}
+
 // Static IPC keeps a flat logical-trigger array in topological order. Every
 // IPC block advances that array in lockstep, while chunk c is permanently
 // assigned to local IPC block c % numIpcBlocks. The per-trigger state and
@@ -718,13 +759,15 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
     const flagcxDevMem &inputMem, const flagcxDevMem &outputMem,
     const flagcxDevMem &readyMem, const uint64_t *parentFlags,
     uint64_t numParentFlags, uint64_t localBlockIdx,
-    uint64_t numIpcBlocks, const uint64_t *abortFlag, uint64_t *shm) {
+    uint64_t numIpcBlocks, const uint64_t *abortFlag,
+    const flagcxStaticIpcControl &control, uint64_t *shm) {
   for (uint64_t ordinal = 0; ordinal < numTriggers; ++ordinal) {
     flagcxIpcTrigger *trigger = &triggers[ordinal];
     const bool leader = ordinal % numIpcBlocks == localBlockIdx;
 
     if (FLAGCX_THREAD_IDX_X == 0) {
-      shm[STATIC_IPC_ABORT_IDX] = isStaticAbortRequested(abortFlag) ? 1 : 0;
+      shm[STATIC_IPC_ABORT_IDX] =
+          isStaticIpcAbortRequested(abortFlag, readyMem, control) ? 1 : 0;
       shm[STATIC_IPC_STATE_IDX] = DeviceAPI::Atomic::load(
           &trigger->state, flagcxDeviceMemoryOrderAcquire);
       if (shm[STATIC_IPC_ABORT_IDX] == 0 && leader &&
@@ -754,7 +797,7 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
               parentFlags[trigger->parentFlagsOffset + parent];
           int backoff = 0;
           while (!isStreamFlagStateDone(loadStreamFlagState(flagAddr))) {
-            if (isStaticAbortRequested(abortFlag)) {
+            if (isStaticIpcAbortRequested(abortFlag, readyMem, control)) {
               shm[STATIC_IPC_ABORT_IDX] = 1;
               break;
             }
@@ -775,8 +818,8 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
     }
     FLAGCX_DEVICE_SYNC_THREADS();
     if (shm[STATIC_IPC_ABORT_IDX] != 0) {
-      publishStaticIpcAbort(triggers, numTriggers, readyMem,
-                            localBlockIdx, numIpcBlocks);
+      abortStaticIpcExecutor(triggers, numTriggers, readyMem, control,
+                             localBlockIdx, numIpcBlocks);
       return;
     }
 
@@ -785,7 +828,7 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
         int backoff = 0;
         while (shm[STATIC_IPC_STATE_IDX] ==
                flagcxReduceTriggerEnqueued) {
-          if (isStaticAbortRequested(abortFlag)) {
+          if (isStaticIpcAbortRequested(abortFlag, readyMem, control)) {
             shm[STATIC_IPC_ABORT_IDX] = 1;
             break;
           }
@@ -796,8 +839,8 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
       }
       FLAGCX_DEVICE_SYNC_THREADS();
       if (shm[STATIC_IPC_ABORT_IDX] != 0) {
-        publishStaticIpcAbort(triggers, numTriggers, readyMem,
-                              localBlockIdx, numIpcBlocks);
+        abortStaticIpcExecutor(triggers, numTriggers, readyMem, control,
+                               localBlockIdx, numIpcBlocks);
         return;
       }
     }
@@ -813,7 +856,7 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
          chunk += numIpcBlocks) {
       if (FLAGCX_THREAD_IDX_X == 0) {
         shm[STATIC_IPC_ABORT_IDX] =
-            isStaticAbortRequested(abortFlag) ? 1 : 0;
+            isStaticIpcAbortRequested(abortFlag, readyMem, control) ? 1 : 0;
       }
       FLAGCX_DEVICE_SYNC_THREADS();
       if (shm[STATIC_IPC_ABORT_IDX] != 0) {
@@ -839,8 +882,8 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
     }
 
     if (shm[STATIC_IPC_ABORT_IDX] != 0) {
-      publishStaticIpcAbort(triggers, numTriggers, readyMem,
-                            localBlockIdx, numIpcBlocks);
+      abortStaticIpcExecutor(triggers, numTriggers, readyMem, control,
+                             localBlockIdx, numIpcBlocks);
       return;
     }
     if (localCompletedChunks != 0) {
@@ -862,7 +905,7 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
         while (DeviceAPI::Atomic::load(
                    &trigger->completedChunks,
                    flagcxDeviceMemoryOrderAcquire) != trigger->numChunks) {
-          if (isStaticAbortRequested(abortFlag)) {
+          if (isStaticIpcAbortRequested(abortFlag, readyMem, control)) {
             shm[STATIC_IPC_ABORT_IDX] = 1;
             break;
           }
@@ -871,20 +914,24 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
         if (shm[STATIC_IPC_ABORT_IDX] == 0) {
           uint64_t *remoteReady =
               static_cast<uint64_t *>(flagcxGetIntraPointer(
-                  readyMem, trigger->readySlot * sizeof(uint64_t),
+                  readyMem,
+                  (control.readyDataOffset + trigger->readySlot) *
+                      sizeof(uint64_t),
                   static_cast<int>(trigger->peerLocalRank)));
           DeviceAPI::Atomic::store(remoteReady, trigger->epoch,
                                    flagcxDeviceMemoryOrderRelease);
 
           uint64_t *localReady =
               static_cast<uint64_t *>(flagcxGetLocalPointer(
-                  readyMem, trigger->readySlot * sizeof(uint64_t)));
+                  readyMem,
+                  (control.readyDataOffset + trigger->readySlot) *
+                      sizeof(uint64_t)));
           backoff = 0;
           while (!flagcxIpcEpochReached(
               DeviceAPI::Atomic::load(localReady,
                                       flagcxDeviceMemoryOrderAcquire),
               trigger->epoch)) {
-            if (isStaticAbortRequested(abortFlag)) {
+            if (isStaticIpcAbortRequested(abortFlag, readyMem, control)) {
               shm[STATIC_IPC_ABORT_IDX] = 1;
               break;
             }
@@ -906,8 +953,8 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
       }
       FLAGCX_DEVICE_SYNC_THREADS();
       if (shm[STATIC_IPC_ABORT_IDX] != 0) {
-        publishStaticIpcAbort(triggers, numTriggers, readyMem,
-                              localBlockIdx, numIpcBlocks);
+        abortStaticIpcExecutor(triggers, numTriggers, readyMem, control,
+                               localBlockIdx, numIpcBlocks);
         return;
       }
     } else {
@@ -917,7 +964,7 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
                    &trigger->state,
                    flagcxDeviceMemoryOrderAcquire) !=
                flagcxReduceTriggerAvailable) {
-          if (isStaticAbortRequested(abortFlag)) {
+          if (isStaticIpcAbortRequested(abortFlag, readyMem, control)) {
             shm[STATIC_IPC_ABORT_IDX] = 1;
             break;
           }
@@ -926,12 +973,77 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
       }
       FLAGCX_DEVICE_SYNC_THREADS();
       if (shm[STATIC_IPC_ABORT_IDX] != 0) {
-        publishStaticIpcAbort(triggers, numTriggers, readyMem,
-                              localBlockIdx, numIpcBlocks);
+        abortStaticIpcExecutor(triggers, numTriggers, readyMem, control,
+                               localBlockIdx, numIpcBlocks);
         return;
       }
     }
   }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void finishStaticCollectiveExecution(
+    const flagcxDevMem &readyMem, uint64_t *blocksDone,
+    uint64_t numExecutorBlocks, const uint64_t *abortFlag,
+    const flagcxStaticIpcControl &control, uint64_t *shm) {
+  // Every executor block reaches this epilogue only after it has stopped all
+  // peer writes. The last block therefore represents rank-local quiescence.
+  DeviceAPI::Intrin::threadfenceSystem();
+  FLAGCX_DEVICE_SYNC_THREADS();
+  if (FLAGCX_THREAD_IDX_X == 0) {
+    const uint64_t completedBefore = DeviceAPI::Atomic::fetchAdd(
+        blocksDone, uint64_t(1), flagcxDeviceMemoryOrderAcqRel);
+    shm[STATIC_IPC_STATE_IDX] =
+        completedBefore + 1 == numExecutorBlocks ? 1 : 0;
+  }
+  FLAGCX_DEVICE_SYNC_THREADS();
+  if (shm[STATIC_IPC_STATE_IDX] == 0) {
+    return;
+  }
+
+  if (FLAGCX_THREAD_IDX_X == 0) {
+    bool aborted =
+        isStaticIpcAbortRequested(abortFlag, readyMem, control);
+    if (aborted) {
+      publishStaticIpcRemoteAbort(readyMem, control);
+    }
+
+    uint64_t doneValue =
+        control.epoch | (aborted ? flagcxIpcControlAbortBit : uint64_t(0));
+    publishStaticIpcControlValue(
+        readyMem, control.doneBase + control.localRank, doneValue,
+        control.localRanks);
+
+    for (uint32_t peer = 0; peer < control.localRanks; ++peer) {
+      uint64_t *localDone = getStaticIpcReadyPointer(
+          readyMem, control.doneBase + static_cast<uint64_t>(peer));
+      int backoff = 0;
+      while (true) {
+        const uint64_t observed = DeviceAPI::Atomic::load(
+            localDone, flagcxDeviceMemoryOrderAcquire);
+        if (flagcxIpcControlEpochMatches(observed, control.epoch)) {
+          if ((observed & flagcxIpcControlAbortBit) != 0) {
+            aborted = true;
+          }
+          break;
+        }
+        if (isStaticIpcAbortRequested(abortFlag, readyMem, control)) {
+          aborted = true;
+        }
+        DeviceAPI::Intrin::spinBackoff(backoff++);
+      }
+    }
+
+    if (aborted) {
+      requestStaticAbort(abortFlag);
+      publishStaticIpcRemoteAbort(readyMem, control);
+      // A remote abort can arrive after this rank first published a normal
+      // done value. Upgrade it so every peer reports the same failed epoch.
+      publishStaticIpcControlValue(
+          readyMem, control.doneBase + control.localRank,
+          control.epoch | flagcxIpcControlAbortBit, control.localRanks);
+    }
+  }
+  FLAGCX_DEVICE_SYNC_THREADS();
 }
 
 FLAGCX_DEVICE_INLINE_DECORATOR void runIpcExecutor(
@@ -1104,7 +1216,8 @@ FLAGCX_GLOBAL_DECORATOR void flagcxStaticCollectiveKernel(
     flagcxDevMem inputMem, flagcxDevMem outputMem, flagcxDevMem readyMem,
     const uint64_t *ipcParentFlags, uint64_t numIpcParentFlags,
     uint64_t numRedBlocks, uint64_t numIpcBlocks,
-    const uint64_t *abortFlag, uint64_t avgDivisor) {
+    uint64_t *blocksDone, const uint64_t *abortFlag,
+    flagcxStaticIpcControl ipcControl, uint64_t avgDivisor) {
   FLAGCX_SHARED uint64_t shm[16];
   const uint64_t globalBlock = static_cast<uint64_t>(FLAGCX_BLOCK_IDX_X);
   if (globalBlock < numRedBlocks) {
@@ -1114,17 +1227,36 @@ FLAGCX_GLOBAL_DECORATOR void flagcxStaticCollectiveKernel(
     runStaticIpcExecutor(ipcTriggers, numIpcTriggers, inputMem, outputMem,
                          readyMem, ipcParentFlags, numIpcParentFlags,
                          globalBlock - numRedBlocks, numIpcBlocks, abortFlag,
-                         shm);
+                         ipcControl, shm);
   }
+  finishStaticCollectiveExecution(
+      readyMem, blocksDone, numRedBlocks + numIpcBlocks, abortFlag,
+      ipcControl, shm);
 }
 
 // Error-only launch used when the cooperative collective kernel did not start
-// (or cannot be relied upon to unwind itself). One block is sufficient: it
-// releases every local DAG flag and publishes every peer-ready epoch.
+// on this rank. It propagates the failed epoch and joins the same cross-rank
+// quiescence barrier as successfully launched peers.
 FLAGCX_GLOBAL_DECORATOR void flagcxStaticIpcRecoveryKernel(
-    flagcxIpcTrigger *ipcTriggers, uint64_t numIpcTriggers,
-    flagcxDevMem readyMem) {
-  publishStaticIpcAbort(ipcTriggers, numIpcTriggers, readyMem, 0, 1);
+    flagcxDevMem readyMem, flagcxStaticIpcControl ipcControl) {
+  if (FLAGCX_THREAD_IDX_X != 0) {
+    return;
+  }
+  publishStaticIpcRemoteAbort(readyMem, ipcControl);
+  DeviceAPI::Intrin::threadfenceSystem();
+  publishStaticIpcControlValue(
+      readyMem, ipcControl.doneBase + ipcControl.localRank,
+      ipcControl.epoch | flagcxIpcControlAbortBit, ipcControl.localRanks);
+  for (uint32_t peer = 0; peer < ipcControl.localRanks; ++peer) {
+    uint64_t *localDone = getStaticIpcReadyPointer(
+        readyMem, ipcControl.doneBase + static_cast<uint64_t>(peer));
+    int backoff = 0;
+    while (!flagcxIpcControlEpochMatches(
+        DeviceAPI::Atomic::load(localDone, flagcxDeviceMemoryOrderAcquire),
+        ipcControl.epoch)) {
+      DeviceAPI::Intrin::spinBackoff(backoff++);
+    }
+  }
 }
 
 flagcxResult_t flagcxLaunchCollectiveKernel(
@@ -1282,12 +1414,13 @@ flagcxResult_t flagcxLaunchStaticCollectiveKernel(
     flagcxDevMem_t readyMem, const uint64_t *ipcParentFlags,
     size_t numIpcParentFlags, size_t nthreads, size_t nRedBlocks,
     size_t nIpcBlocks, size_t maxExecutorBlocks, uint64_t avgDivisor,
-    flagcxStream_t stream) {
+    const flagcxStaticIpcControl *ipcControl, flagcxStream_t stream) {
   const bool hasRed = numRedTriggers != 0;
   const bool hasIpc = numIpcTriggers != 0;
-  if (!hasRed && !hasIpc) {
-    return nRedBlocks == 0 && nIpcBlocks == 0 ? flagcxSuccess
-                                              : flagcxInvalidArgument;
+  if (!hasIpc) {
+    // RED-only static execution uses flagcxLaunchStaticReduceKernel. The
+    // combined kernel requires IPC control storage for its rank barrier.
+    return flagcxInvalidArgument;
   }
 
   const size_t maxInt =
@@ -1298,13 +1431,26 @@ flagcxResult_t flagcxLaunchStaticCollectiveKernel(
                   nRedBlocks > numRedTriggers)) ||
       (hasIpc && (ipcFifoDeviceBuffer == nullptr || inputMem == nullptr ||
                   outputMem == nullptr || readyMem == nullptr ||
+                  ipcControl == nullptr ||
                   (numIpcParentFlags != 0 && ipcParentFlags == nullptr))) ||
-      (!hasIpc && (ipcParentFlags != nullptr || numIpcParentFlags != 0)) ||
       numRedTriggers > maxInt || numIpcTriggers > maxInt ||
       nthreads > maxInt || nRedBlocks > maxInt || nIpcBlocks > maxInt ||
       nRedBlocks > maxInt - nIpcBlocks || maxExecutorBlocks == 0 ||
       maxExecutorBlocks > maxInt ||
       nRedBlocks + nIpcBlocks > maxExecutorBlocks) {
+    return flagcxInvalidArgument;
+  }
+  const uint64_t controlSlots =
+      uint64_t(1) + static_cast<uint64_t>(ipcControl->localRanks);
+  if (!flagcxIpcControlEpochValid(ipcControl->epoch) ||
+      ipcControl->localRanks == 0 ||
+      ipcControl->localRank >= ipcControl->localRanks ||
+      ipcControl->abortSlot != 0 || ipcControl->doneBase != 1 ||
+      ipcControl->readyDataOffset != controlSlots ||
+      ipcControl->readyDataOffset >
+          std::numeric_limits<uint64_t>::max() - numIpcTriggers ||
+      ipcControl->readyDataOffset + numIpcTriggers >
+          std::numeric_limits<size_t>::max() / sizeof(uint64_t)) {
     return flagcxInvalidArgument;
   }
 
@@ -1321,6 +1467,8 @@ flagcxResult_t flagcxLaunchStaticCollectiveKernel(
              : nullptr;
   uint64_t *abortFlag =
       (hasIpc ? ipcWords : redWords) + flagcxFifoIdxTerminate;
+  uint64_t *blocksDone =
+      (hasIpc ? ipcWords : redWords) + flagcxFifoIdxConsumed;
 
   flagcxDevMem input;
   flagcxDevMem output;
@@ -1337,6 +1485,7 @@ flagcxResult_t flagcxLaunchStaticCollectiveKernel(
       static_cast<uint64_t>(numIpcParentFlags);
   uint64_t numRedBlocks64 = static_cast<uint64_t>(nRedBlocks);
   uint64_t numIpcBlocks64 = static_cast<uint64_t>(nIpcBlocks);
+  flagcxStaticIpcControl control = *ipcControl;
   void *args[] = {&redTriggers,
                   &numRedTriggers64,
                   &ipcTriggers,
@@ -1348,7 +1497,9 @@ flagcxResult_t flagcxLaunchStaticCollectiveKernel(
                   &numIpcParentFlags64,
                   &numRedBlocks64,
                   &numIpcBlocks64,
+                  &blocksDone,
                   &abortFlag,
+                  &control,
                   &avgDivisor};
   const size_t nblocks = nRedBlocks + nIpcBlocks;
   cudaError_t launchResult = cudaLaunchCooperativeKernel(
@@ -1364,20 +1515,22 @@ flagcxResult_t flagcxLaunchStaticCollectiveKernel(
 }
 
 flagcxResult_t flagcxLaunchStaticIpcRecoveryKernel(
-    void *ipcFifoDeviceBuffer, size_t numIpcTriggers,
-    flagcxDevMem_t readyMem, flagcxStream_t stream) {
-  if (ipcFifoDeviceBuffer == nullptr || numIpcTriggers == 0 ||
-      readyMem == nullptr || stream == nullptr) {
+    flagcxDevMem_t readyMem, const flagcxStaticIpcControl *ipcControl,
+    flagcxStream_t stream) {
+  if (readyMem == nullptr || ipcControl == nullptr || stream == nullptr ||
+      !flagcxIpcControlEpochValid(ipcControl->epoch) ||
+      ipcControl->localRanks == 0 ||
+      ipcControl->localRank >= ipcControl->localRanks ||
+      ipcControl->abortSlot != 0 || ipcControl->doneBase != 1 ||
+      ipcControl->readyDataOffset !=
+          uint64_t(1) + static_cast<uint64_t>(ipcControl->localRanks)) {
     return flagcxInvalidArgument;
   }
 
 #if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
-  uint64_t *ipcWords = static_cast<uint64_t *>(ipcFifoDeviceBuffer);
-  flagcxIpcTrigger *ipcTriggers =
-      reinterpret_cast<flagcxIpcTrigger *>(ipcWords + flagcxFifoIdxData);
-  uint64_t numIpcTriggers64 = static_cast<uint64_t>(numIpcTriggers);
   flagcxDevMem ready(*readyMem);
-  void *args[] = {&ipcTriggers, &numIpcTriggers64, &ready};
+  flagcxStaticIpcControl control = *ipcControl;
+  void *args[] = {&ready, &control};
   cudaError_t launchResult = cudaLaunchKernel(
       reinterpret_cast<const void *>(flagcxStaticIpcRecoveryKernel), dim3(1),
       dim3(1), args, 0, *(FLAGCX_DEVICE_STREAM_PTR)stream);
