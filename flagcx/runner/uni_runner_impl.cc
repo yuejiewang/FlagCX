@@ -4057,7 +4057,7 @@ static flagcxResult_t prepareStaticRedExecution(
   if (runnerState->dagPlan.numRedNodes == 0) {
     return resolveUniRunnerStaticExecutorSchedule(
         &runnerState->dagPlan,
-        static_cast<size_t>(runnerState->uniRunnerNRedBlocks), 0, 0,
+        static_cast<size_t>(runnerState->uniRunnerNRedBlocks), 0, 0, 0,
         schedule);
   }
 
@@ -4067,7 +4067,7 @@ static flagcxResult_t prepareStaticRedExecution(
       maxExecutorBlocks));
   FLAGCXCHECK(resolveUniRunnerStaticExecutorSchedule(
       &runnerState->dagPlan,
-      static_cast<size_t>(runnerState->uniRunnerNRedBlocks), 0,
+      static_cast<size_t>(runnerState->uniRunnerNRedBlocks), 0, 0,
       *maxExecutorBlocks, schedule));
 #else
   return flagcxNotSupported;

@@ -28,7 +28,7 @@ TEST(UniRunnerStaticSchedule, LeavesHostOnlyDagWithoutExecutorBlocks) {
   uniRunnerStaticExecutorSchedule schedule;
 
   EXPECT_EQ(flagcxSuccess, resolveUniRunnerStaticExecutorSchedule(
-                               &plan, 0, 0, 0, &schedule));
+                               &plan, 0, 0, 0, 0, &schedule));
   EXPECT_EQ(0u, schedule.numRedTasks);
   EXPECT_EQ(0u, schedule.numIpcTasks);
   EXPECT_EQ(0u, schedule.numRedBlocks);
@@ -44,7 +44,8 @@ TEST(UniRunnerStaticSchedule, CapsBlocksByTasksWithoutEmptyExecutors) {
       uniRunnerDagExecutionPlan plan = makePlan(3, numTasks, 0);
       uniRunnerStaticExecutorSchedule schedule;
       ASSERT_EQ(flagcxSuccess, resolveUniRunnerStaticExecutorSchedule(
-                                   &plan, requested, 0, 2048, &schedule));
+                                   &plan, requested, 0, 0, 2048,
+                                   &schedule));
       EXPECT_EQ(numTasks, schedule.numRedTasks);
       EXPECT_EQ(std::min(numTasks, requested), schedule.numRedBlocks);
       EXPECT_EQ(0u, schedule.numIpcBlocks);
@@ -101,36 +102,67 @@ TEST(UniRunnerStaticSchedule, SupportsMoreBlocksThanTasks) {
   }
 }
 
+TEST(UniRunnerStaticSchedule,
+     CapsIpcBlocksByChunkParallelismRatherThanLogicalTriggers) {
+  uniRunnerDagExecutionPlan plan = makePlan(0, 0, 1);
+  uniRunnerStaticExecutorSchedule schedule;
+
+  ASSERT_EQ(flagcxSuccess, resolveUniRunnerStaticExecutorSchedule(
+                               &plan, 0, 8, 8, 8, &schedule));
+  EXPECT_EQ(1u, schedule.numIpcTasks);
+  EXPECT_EQ(8u, schedule.numIpcBlocks);
+
+  plan = makePlan(0, 0, 100);
+  ASSERT_EQ(flagcxSuccess, resolveUniRunnerStaticExecutorSchedule(
+                               &plan, 0, 16, 2, 16, &schedule));
+  EXPECT_EQ(100u, schedule.numIpcTasks);
+  EXPECT_EQ(2u, schedule.numIpcBlocks);
+
+  const size_t numChunks = 17;
+  const size_t numBlocks = 4;
+  std::array<size_t, numBlocks> blockCounts = {};
+  for (size_t chunk = 0; chunk < numChunks; ++chunk) {
+    size_t blockIdx = 0;
+    size_t blockChunkOrdinal = 0;
+    ASSERT_EQ(flagcxSuccess, getUniRunnerStaticTaskAssignment(
+                                 chunk, numChunks, numBlocks, &blockIdx,
+                                 &blockChunkOrdinal));
+    EXPECT_EQ(chunk % numBlocks, blockIdx);
+    EXPECT_EQ(blockCounts[blockIdx]++, blockChunkOrdinal);
+  }
+  EXPECT_EQ((std::array<size_t, numBlocks>{5, 4, 4, 4}), blockCounts);
+}
+
 TEST(UniRunnerStaticSchedule, ClampsMixedExecutorsWithinResidencyBudget) {
   uniRunnerDagExecutionPlan plan = makePlan(4, 10, 10);
   uniRunnerStaticExecutorSchedule schedule;
 
   ASSERT_EQ(flagcxSuccess, resolveUniRunnerStaticExecutorSchedule(
-                               &plan, 10, 10, 5, &schedule));
+                               &plan, 10, 10, 10, 5, &schedule));
   EXPECT_EQ(10u, schedule.numRedTasks);
   EXPECT_EQ(10u, schedule.numIpcTasks);
   EXPECT_EQ(3u, schedule.numRedBlocks);
   EXPECT_EQ(2u, schedule.numIpcBlocks);
 
   ASSERT_EQ(flagcxSuccess, resolveUniRunnerStaticExecutorSchedule(
-                               &plan, 2, 3, 5, &schedule));
+                               &plan, 2, 3, 10, 5, &schedule));
   EXPECT_EQ(2u, schedule.numRedBlocks);
   EXPECT_EQ(3u, schedule.numIpcBlocks);
 
   plan = makePlan(0, 2, 100);
   ASSERT_EQ(flagcxSuccess, resolveUniRunnerStaticExecutorSchedule(
-                               &plan, 2, 100, 4, &schedule));
+                               &plan, 2, 100, 100, 4, &schedule));
   EXPECT_EQ(2u, schedule.numRedBlocks);
   EXPECT_EQ(2u, schedule.numIpcBlocks);
 
   plan = makePlan(0, 100, 2);
   ASSERT_EQ(flagcxSuccess, resolveUniRunnerStaticExecutorSchedule(
-                               &plan, 100, 2, 4, &schedule));
+                               &plan, 100, 2, 2, 4, &schedule));
   EXPECT_EQ(2u, schedule.numRedBlocks);
   EXPECT_EQ(2u, schedule.numIpcBlocks);
 
   ASSERT_EQ(flagcxSuccess, resolveUniRunnerStaticExecutorSchedule(
-                               &plan, 100, 2, 2, &schedule));
+                               &plan, 100, 2, 2, 2, &schedule));
   EXPECT_EQ(1u, schedule.numRedBlocks);
   EXPECT_EQ(1u, schedule.numIpcBlocks);
 }
@@ -139,14 +171,24 @@ TEST(UniRunnerStaticSchedule, RejectsZeroBlocksAndInsufficientBudget) {
   uniRunnerStaticExecutorSchedule schedule;
   uniRunnerDagExecutionPlan redPlan = makePlan(1, 2, 0);
   EXPECT_EQ(flagcxInvalidArgument, resolveUniRunnerStaticExecutorSchedule(
-                                          &redPlan, 0, 0, 4, &schedule));
+                                          &redPlan, 0, 0, 0, 4,
+                                          &schedule));
   EXPECT_EQ(0u, schedule.numRedTasks);
 
   uniRunnerDagExecutionPlan mixedPlan = makePlan(1, 2, 2);
   EXPECT_EQ(flagcxInvalidArgument, resolveUniRunnerStaticExecutorSchedule(
-                                          &mixedPlan, 1, 1, 1, &schedule));
+                                          &mixedPlan, 1, 1, 2, 1,
+                                          &schedule));
   EXPECT_EQ(0u, schedule.numRedBlocks);
   EXPECT_EQ(0u, schedule.numIpcBlocks);
+
+  EXPECT_EQ(flagcxInvalidArgument, resolveUniRunnerStaticExecutorSchedule(
+                                          &mixedPlan, 1, 1, 0, 4,
+                                          &schedule));
+  uniRunnerDagExecutionPlan redOnlyPlan = makePlan(0, 2, 0);
+  EXPECT_EQ(flagcxInvalidArgument, resolveUniRunnerStaticExecutorSchedule(
+                                          &redOnlyPlan, 1, 0, 1, 4,
+                                          &schedule));
 }
 
 TEST(UniRunnerStaticSchedule, RejectsMalformedPlansAndNullOutputs) {
@@ -154,30 +196,30 @@ TEST(UniRunnerStaticSchedule, RejectsMalformedPlansAndNullOutputs) {
   uniRunnerDagExecutionPlan plan = makePlan(1, 1, 0);
 
   EXPECT_EQ(flagcxInvalidArgument, resolveUniRunnerStaticExecutorSchedule(
-                                          nullptr, 1, 0, 1, &schedule));
+                                          nullptr, 1, 0, 0, 1, &schedule));
   EXPECT_EQ(flagcxInvalidArgument, resolveUniRunnerStaticExecutorSchedule(
-                                          &plan, 1, 0, 1, nullptr));
+                                          &plan, 1, 0, 0, 1, nullptr));
 
   plan.topoOrder = nullptr;
   EXPECT_EQ(flagcxInvalidArgument, resolveUniRunnerStaticExecutorSchedule(
-                                          &plan, 1, 0, 1, &schedule));
+                                          &plan, 1, 0, 0, 1, &schedule));
 
   plan = makePlan(1, 1, 0);
   plan.numHostNodes = std::numeric_limits<size_t>::max();
   EXPECT_EQ(flagcxInvalidArgument, resolveUniRunnerStaticExecutorSchedule(
-                                          &plan, 1, 0, 1, &schedule));
+                                          &plan, 1, 0, 0, 1, &schedule));
 
   plan = {};
   int unexpectedOrder = 0;
   plan.topoOrder = &unexpectedOrder;
   EXPECT_EQ(flagcxInvalidArgument, resolveUniRunnerStaticExecutorSchedule(
-                                          &plan, 0, 0, 0, &schedule));
+                                          &plan, 0, 0, 0, 0, &schedule));
 
   plan.numNodes =
       static_cast<size_t>(std::numeric_limits<int>::max()) + 1;
   plan.numRedNodes = plan.numNodes;
   EXPECT_EQ(flagcxInvalidArgument, resolveUniRunnerStaticExecutorSchedule(
-                                          &plan, 1, 0, 1, &schedule));
+                                          &plan, 1, 0, 0, 1, &schedule));
 }
 
 TEST(UniRunnerStaticSchedule, RejectsInvalidTaskAssignments) {

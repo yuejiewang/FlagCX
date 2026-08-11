@@ -252,7 +252,8 @@ flagcxResult_t compileUniRunnerDagExecutionPlan(
 
 flagcxResult_t resolveUniRunnerStaticExecutorSchedule(
     const uniRunnerDagExecutionPlan *plan, size_t requestedRedBlocks,
-    size_t requestedIpcBlocks, size_t maxExecutorBlocks,
+    size_t requestedIpcBlocks, size_t maxIpcParallelism,
+    size_t maxExecutorBlocks,
     uniRunnerStaticExecutorSchedule *schedule) {
   if (schedule == NULL) {
     return flagcxInvalidArgument;
@@ -271,6 +272,11 @@ flagcxResult_t resolveUniRunnerStaticExecutorSchedule(
 
   schedule->numRedTasks = plan->numRedNodes;
   schedule->numIpcTasks = plan->numIpcNodes;
+  if ((plan->numIpcNodes == 0 && maxIpcParallelism != 0) ||
+      (plan->numIpcNodes != 0 && maxIpcParallelism == 0)) {
+    *schedule = {};
+    return flagcxInvalidArgument;
+  }
   if (plan->numRedNodes == 0 && plan->numIpcNodes == 0) {
     return flagcxSuccess;
   }
@@ -283,7 +289,7 @@ flagcxResult_t resolveUniRunnerStaticExecutorSchedule(
   const size_t desiredRedBlocks =
       std::min(requestedRedBlocks, plan->numRedNodes);
   const size_t desiredIpcBlocks =
-      std::min(requestedIpcBlocks, plan->numIpcNodes);
+      std::min(requestedIpcBlocks, maxIpcParallelism);
   const size_t activeExecutorTypes =
       static_cast<size_t>(desiredRedBlocks != 0) +
       static_cast<size_t>(desiredIpcBlocks != 0);
