@@ -37,10 +37,28 @@ typedef enum {
   uniRunnerDagAlgoIpcAR = 8
 } uniRunnerDagAlgoType;
 
+// Normalized algorithm parameters that affect DAG construction. Runtime-only
+// executor settings (for example NTHREADS/NREDBLOCKS/NIPCBLOCKS) deliberately
+// do not belong here because they do not change the cached DAG template.
+typedef enum {
+  uniRunnerDagBufferModeOutOfPlace = 0,
+  uniRunnerDagBufferModeInPlace = 1
+} uniRunnerDagBufferMode;
+
+struct uniRunnerDagAlgorithmConfig {
+  uint64_t numSlices = 0;
+  uint64_t numRedSlices = 0;
+  uint64_t groupSize = 0;
+  uint64_t topologyHash = 0;
+  uniRunnerDagBufferMode bufferMode = uniRunnerDagBufferModeOutOfPlace;
+};
+
 // Cache key describing a reusable uniRunner DAG template.
 struct uniRunnerDagCacheKey {
-  int formatVersion;
+  // algoType is the strongly typed algorithm name. algoHash distinguishes
+  // normalized builder configurations of the same named algorithm.
   uniRunnerDagAlgoType algoType;
+  uint64_t algoHash;
   flagcxCommOp_t commOp;
   size_t count;
   flagcxDataType_t datatype;
@@ -216,6 +234,9 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
                                          flagcxRedOp_t op, int root,
                                          flagcxComm_t comm);
 size_t getUniRunnerDagPatternHash(const uniRunnerDagCacheKey &key);
+uint64_t getUniRunnerDagAlgorithmHash(
+    uniRunnerDagAlgoType algoType,
+    const uniRunnerDagAlgorithmConfig &algorithmConfig);
 flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream);
 
 // Validate executor launch parameters before allocating per-invocation

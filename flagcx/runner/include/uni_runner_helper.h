@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <utility>
@@ -14,7 +15,7 @@
 
 using Json = nlohmann::json;
 
-inline constexpr int kUniRunnerDagCacheFormatVersion = 2;
+inline constexpr int kUniRunnerDagCacheFormatVersion = 3;
 
 inline bool uniRunnerDagDataTypeValueValid(int value) {
   return value >= 0 && value < flagcxNumTypes;
@@ -331,8 +332,10 @@ inline bool uniRunnerDagBufferRefFromJson(const Json &j,
 
 inline Json uniRunnerDagCacheKeyToJson(const uniRunnerDagCacheKey &key) {
   return Json{
-      {"format_version", key.formatVersion},
-      {"algo", uniRunnerDagAlgoTypeToString(key.algoType)},
+      {"algo_name", uniRunnerDagAlgoTypeToString(key.algoType)},
+      // Persist uint64_t as decimal text so external JSON tooling cannot lose
+      // precision by routing the value through an IEEE-754 number.
+      {"algo_hash", std::to_string(key.algoHash)},
       {"comm_op", uniRunnerCommOpToString(key.commOp)},
       {"count", key.count},
       {"datatype", static_cast<int>(key.datatype)},
@@ -343,27 +346,57 @@ inline Json uniRunnerDagCacheKeyToJson(const uniRunnerDagCacheKey &key) {
   };
 }
 
+inline bool uniRunnerDagUint64FromJsonString(const Json &j, const char *field,
+                                             uint64_t *value) {
+  if (value == nullptr || !j.contains(field) || !j.at(field).is_string()) {
+    return false;
+  }
+  try {
+    const std::string encoded = j.at(field).get<std::string>();
+    if (encoded.empty() ||
+        encoded.find_first_not_of("0123456789") != std::string::npos) {
+      return false;
+    }
+    size_t consumed = 0;
+    const unsigned long long parsed = std::stoull(encoded, &consumed, 10);
+    if (consumed != encoded.size()) {
+      return false;
+    }
+    *value = static_cast<uint64_t>(parsed);
+  } catch (...) {
+    return false;
+  }
+  return true;
+}
+
 inline bool uniRunnerDagCacheKeyFromJson(const Json &j,
                                          uniRunnerDagCacheKey *key) {
-  std::string algoName = j.at("algo").get<std::string>();
-  std::string commOpName = j.at("comm_op").get<std::string>();
-  if (!uniRunnerDagAlgoTypeFromString(algoName, &key->algoType) ||
-      !uniRunnerCommOpFromString(commOpName, &key->commOp)) {
+  if (key == nullptr || !j.is_object()) {
     return false;
   }
-  key->formatVersion = j.at("format_version").get<int>();
-  key->count = j.at("count").get<size_t>();
-  const int datatype = j.at("datatype").get<int>();
-  const int redOp = j.at("red_op").get<int>();
-  if (!uniRunnerDagDataTypeValueValid(datatype) ||
-      !uniRunnerDagRedOpValueValid(redOp, true)) {
+  try {
+    const std::string algoName = j.at("algo_name").get<std::string>();
+    const std::string commOpName = j.at("comm_op").get<std::string>();
+    if (!uniRunnerDagAlgoTypeFromString(algoName, &key->algoType) ||
+        !uniRunnerCommOpFromString(commOpName, &key->commOp) ||
+        !uniRunnerDagUint64FromJsonString(j, "algo_hash", &key->algoHash)) {
+      return false;
+    }
+    key->count = j.at("count").get<size_t>();
+    const int datatype = j.at("datatype").get<int>();
+    const int redOp = j.at("red_op").get<int>();
+    if (!uniRunnerDagDataTypeValueValid(datatype) ||
+        !uniRunnerDagRedOpValueValid(redOp, true)) {
+      return false;
+    }
+    key->datatype = static_cast<flagcxDataType_t>(datatype);
+    key->redOp = static_cast<flagcxRedOp_t>(redOp);
+    key->rank = j.at("rank").get<int>();
+    key->nranks = j.at("nranks").get<int>();
+    key->root = j.at("root").get<int>();
+  } catch (...) {
     return false;
   }
-  key->datatype = static_cast<flagcxDataType_t>(datatype);
-  key->redOp = static_cast<flagcxRedOp_t>(redOp);
-  key->rank = j.at("rank").get<int>();
-  key->nranks = j.at("nranks").get<int>();
-  key->root = j.at("root").get<int>();
   return true;
 }
 
@@ -411,6 +444,7 @@ uniRunnerDagTemplateToJson(const uniRunnerDagTemplate &dagTemplate) {
   }
 
   return Json{
+      {"format_version", kUniRunnerDagCacheFormatVersion},
       {"hash", std::to_string(hashValue)},
       {"key", uniRunnerDagCacheKeyToJson(dagTemplate.key)},
       {"dag", Json{{"num_nodes", dagTemplate.nodes.size()}, {"nodes", nodes}}},
@@ -419,84 +453,99 @@ uniRunnerDagTemplateToJson(const uniRunnerDagTemplate &dagTemplate) {
 
 inline bool uniRunnerDagTemplateFromJson(const Json &j,
                                          uniRunnerDagTemplate *dagTemplate) {
-  if (!uniRunnerDagCacheKeyFromJson(j.at("key"), &dagTemplate->key)) {
+  if (dagTemplate == nullptr) {
     return false;
   }
-  if (dagTemplate->key.formatVersion != kUniRunnerDagCacheFormatVersion) {
-    return false;
-  }
-  size_t computedHash = getUniRunnerDagPatternHash(dagTemplate->key);
-  if (j.contains("hash")) {
-    size_t encodedHash =
-        static_cast<size_t>(std::stoull(j.at("hash").get<std::string>()));
-    if (encodedHash != computedHash) {
+  try {
+    if (!j.is_object() || !j.contains("format_version") ||
+        !j.at("format_version").is_number_integer() ||
+        j.at("format_version").get<int>() !=
+            kUniRunnerDagCacheFormatVersion) {
       return false;
     }
-  }
-  dagTemplate->hashValue = computedHash;
-  dagTemplate->nodes.clear();
-
-  const Json &nodes = j.at("dag").at("nodes");
-  for (const Json &nodeJson : nodes) {
-    uniRunnerDagNodeDesc node;
-    std::string nodeType = nodeJson.at("node_type").get<std::string>();
-    if (!uniRunnerDagNodeTypeFromString(nodeType, &node.nodeType)) {
+    if (!uniRunnerDagCacheKeyFromJson(j.at("key"), &dagTemplate->key)) {
       return false;
     }
-    node.nodeIdx = nodeJson.at("node_idx").get<int>();
-    node.parents = nodeJson.at("parents").get<std::vector<int>>();
-    node.children = nodeJson.at("children").get<std::vector<int>>();
+    size_t computedHash = getUniRunnerDagPatternHash(dagTemplate->key);
+    if (j.contains("hash")) {
+      uint64_t encodedHashValue = 0;
+      if (!uniRunnerDagUint64FromJsonString(j, "hash", &encodedHashValue) ||
+          encodedHashValue > std::numeric_limits<size_t>::max()) {
+        return false;
+      }
+      const size_t encodedHash = static_cast<size_t>(encodedHashValue);
+      if (encodedHash != computedHash) {
+        return false;
+      }
+    }
+    dagTemplate->hashValue = computedHash;
+    dagTemplate->nodes.clear();
 
-    if (node.nodeType == uniRunnerDagNodeTypeP2p) {
-      for (const Json &opJson : nodeJson.at("p2p_ops")) {
-        uniRunnerDagP2pOpDesc op;
-        std::string primType = opJson.at("type").get<std::string>();
-        if (!uniRunnerDevicePrimFromString(primType, &op.type) ||
-            !uniRunnerDagBufferRefFromJson(opJson.at("buffer"), &op.buffer)) {
+    const Json &nodes = j.at("dag").at("nodes");
+    for (const Json &nodeJson : nodes) {
+      uniRunnerDagNodeDesc node;
+      std::string nodeType = nodeJson.at("node_type").get<std::string>();
+      if (!uniRunnerDagNodeTypeFromString(nodeType, &node.nodeType)) {
+        return false;
+      }
+      node.nodeIdx = nodeJson.at("node_idx").get<int>();
+      node.parents = nodeJson.at("parents").get<std::vector<int>>();
+      node.children = nodeJson.at("children").get<std::vector<int>>();
+
+      if (node.nodeType == uniRunnerDagNodeTypeP2p) {
+        for (const Json &opJson : nodeJson.at("p2p_ops")) {
+          uniRunnerDagP2pOpDesc op;
+          std::string primType = opJson.at("type").get<std::string>();
+          if (!uniRunnerDevicePrimFromString(primType, &op.type) ||
+              !uniRunnerDagBufferRefFromJson(opJson.at("buffer"),
+                                             &op.buffer)) {
+            return false;
+          }
+          op.peerRank = opJson.at("peer_rank").get<int>();
+          op.count = opJson.at("count").get<size_t>();
+          const int datatype = opJson.at("datatype").get<int>();
+          if (!uniRunnerDagDataTypeValueValid(datatype)) {
+            return false;
+          }
+          op.datatype = static_cast<flagcxDataType_t>(datatype);
+          node.p2pOps.push_back(op);
+        }
+      } else if (node.nodeType == uniRunnerDagNodeTypeRed) {
+        const Json &redJson = nodeJson.at("red");
+        if (!uniRunnerDagBufferRefFromJson(redJson.at("input1"),
+                                           &node.red.input1) ||
+            !uniRunnerDagBufferRefFromJson(redJson.at("input2"),
+                                           &node.red.input2) ||
+            !uniRunnerDagBufferRefFromJson(redJson.at("output"),
+                                           &node.red.output)) {
           return false;
         }
-        op.peerRank = opJson.at("peer_rank").get<int>();
-        op.count = opJson.at("count").get<size_t>();
-        const int datatype = opJson.at("datatype").get<int>();
+        node.red.count = redJson.at("count").get<size_t>();
+        const int datatype = redJson.at("datatype").get<int>();
+        const int redOp = redJson.at("red_op").get<int>();
+        if (!uniRunnerDagDataTypeValueValid(datatype) ||
+            !uniRunnerDagRedOpValueValid(redOp, false)) {
+          return false;
+        }
+        node.red.datatype = static_cast<flagcxDataType_t>(datatype);
+        node.red.redOp = static_cast<flagcxRedOp_t>(redOp);
+      } else if (node.nodeType == uniRunnerDagNodeTypeCpy) {
+        const Json &cpyJson = nodeJson.at("cpy");
+        if (!uniRunnerDagBufferRefFromJson(cpyJson.at("src"), &node.cpy.src) ||
+            !uniRunnerDagBufferRefFromJson(cpyJson.at("dst"), &node.cpy.dst)) {
+          return false;
+        }
+        node.cpy.count = cpyJson.at("count").get<size_t>();
+        const int datatype = cpyJson.at("datatype").get<int>();
         if (!uniRunnerDagDataTypeValueValid(datatype)) {
           return false;
         }
-        op.datatype = static_cast<flagcxDataType_t>(datatype);
-        node.p2pOps.push_back(op);
+        node.cpy.datatype = static_cast<flagcxDataType_t>(datatype);
       }
-    } else if (node.nodeType == uniRunnerDagNodeTypeRed) {
-      const Json &redJson = nodeJson.at("red");
-      if (!uniRunnerDagBufferRefFromJson(redJson.at("input1"),
-                                         &node.red.input1) ||
-          !uniRunnerDagBufferRefFromJson(redJson.at("input2"),
-                                         &node.red.input2) ||
-          !uniRunnerDagBufferRefFromJson(redJson.at("output"),
-                                         &node.red.output)) {
-        return false;
-      }
-      node.red.count = redJson.at("count").get<size_t>();
-      const int datatype = redJson.at("datatype").get<int>();
-      const int redOp = redJson.at("red_op").get<int>();
-      if (!uniRunnerDagDataTypeValueValid(datatype) ||
-          !uniRunnerDagRedOpValueValid(redOp, false)) {
-        return false;
-      }
-      node.red.datatype = static_cast<flagcxDataType_t>(datatype);
-      node.red.redOp = static_cast<flagcxRedOp_t>(redOp);
-    } else if (node.nodeType == uniRunnerDagNodeTypeCpy) {
-      const Json &cpyJson = nodeJson.at("cpy");
-      if (!uniRunnerDagBufferRefFromJson(cpyJson.at("src"), &node.cpy.src) ||
-          !uniRunnerDagBufferRefFromJson(cpyJson.at("dst"), &node.cpy.dst)) {
-        return false;
-      }
-      node.cpy.count = cpyJson.at("count").get<size_t>();
-      const int datatype = cpyJson.at("datatype").get<int>();
-      if (!uniRunnerDagDataTypeValueValid(datatype)) {
-        return false;
-      }
-      node.cpy.datatype = static_cast<flagcxDataType_t>(datatype);
+      dagTemplate->nodes.push_back(node);
     }
-    dagTemplate->nodes.push_back(node);
+  } catch (...) {
+    return false;
   }
   return true;
 }
@@ -527,21 +576,30 @@ inline Json uniRunnerSerializeDagCacheFile(
 
 inline bool uniRunnerDeserializeDagCacheFile(
     const Json &root, std::vector<uniRunnerDagTemplate> *dagTemplates) {
-  if (root.contains("format_version") &&
-      root["format_version"].get<int>() != kUniRunnerDagCacheFormatVersion) {
+  if (dagTemplates == nullptr) {
     return false;
   }
-  if (!root.contains("entries") || !root["entries"].is_array()) {
-    return false;
-  }
-
-  dagTemplates->clear();
-  for (const Json &entryJson : root["entries"]) {
-    uniRunnerDagTemplate dagTemplate;
-    if (!uniRunnerDeserializeDagTemplate(entryJson, &dagTemplate)) {
+  try {
+    if (!root.is_object() || !root.contains("format_version") ||
+        !root.at("format_version").is_number_integer() ||
+        root.at("format_version").get<int>() !=
+            kUniRunnerDagCacheFormatVersion) {
       return false;
     }
-    dagTemplates->push_back(std::move(dagTemplate));
+    if (!root.contains("entries") || !root["entries"].is_array()) {
+      return false;
+    }
+
+    dagTemplates->clear();
+    for (const Json &entryJson : root["entries"]) {
+      uniRunnerDagTemplate dagTemplate;
+      if (!uniRunnerDeserializeDagTemplate(entryJson, &dagTemplate)) {
+        return false;
+      }
+      dagTemplates->push_back(std::move(dagTemplate));
+    }
+  } catch (...) {
+    return false;
   }
   return true;
 }

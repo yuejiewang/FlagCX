@@ -134,6 +134,9 @@ flagcxResult_t checkedUniRunnerTypeBytes(size_t count, size_t multiplier,
 namespace {
 
 constexpr char kUniRunnerDagCachePathEnv[] = "FLAGCX_UNIRUNNER_DAG_CACHE_PATH";
+constexpr uint64_t kUniRunnerDagAlgorithmHashSchemaVersion = 1;
+constexpr uint64_t kUniRunnerDagFnvOffsetBasis = 14695981039346656037ull;
+constexpr uint64_t kUniRunnerDagFnvPrime = 1099511628211ull;
 
 struct uniRunnerDagRuntimeBindings {
   const void *inputBase = NULL;
@@ -166,10 +169,44 @@ static size_t hashCombine(size_t seed, size_t value) {
   return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2));
 }
 
+static uint64_t hashAlgorithmUint64(uint64_t hashValue, uint64_t value) {
+  // Hash fixed-width integers byte-by-byte so algoHash is stable across host
+  // word sizes and standard-library implementations.
+  for (unsigned int byte = 0; byte < sizeof(value); ++byte) {
+    hashValue ^= value & 0xffu;
+    hashValue *= kUniRunnerDagFnvPrime;
+    value >>= 8;
+  }
+  return hashValue;
+}
+
+static bool bufferMatchesElementOffset(const void *candidate, const void *base,
+                                       size_t count, int rank,
+                                       size_t typeSize) {
+  if (candidate == NULL || base == NULL || rank < 0 || typeSize == 0) {
+    return false;
+  }
+  const size_t rankValue = static_cast<size_t>(rank);
+  const size_t maxSize = std::numeric_limits<size_t>::max();
+  if (rankValue != 0 && count > maxSize / rankValue) {
+    return false;
+  }
+  const size_t elementOffset = count * rankValue;
+  if (elementOffset > maxSize / typeSize) {
+    return false;
+  }
+  const size_t byteOffset = elementOffset * typeSize;
+  const uintptr_t baseAddress = reinterpret_cast<uintptr_t>(base);
+  if (baseAddress > std::numeric_limits<uintptr_t>::max() - byteOffset) {
+    return false;
+  }
+  return reinterpret_cast<uintptr_t>(candidate) == baseAddress + byteOffset;
+}
+
 static bool uniRunnerDagCacheKeysEqual(const uniRunnerDagCacheKey &lhs,
                                        const uniRunnerDagCacheKey &rhs) {
-  return lhs.formatVersion == rhs.formatVersion &&
-         lhs.algoType == rhs.algoType && lhs.commOp == rhs.commOp &&
+  return lhs.algoType == rhs.algoType && lhs.algoHash == rhs.algoHash &&
+         lhs.commOp == rhs.commOp &&
          lhs.count == rhs.count && lhs.datatype == rhs.datatype &&
          lhs.redOp == rhs.redOp && lhs.rank == rhs.rank &&
          lhs.nranks == rhs.nranks && lhs.root == rhs.root;
@@ -415,12 +452,13 @@ resolveEffectiveUniRunnerRedSlices(const flagcxUniRunnerState *runnerState,
 }
 
 static uniRunnerDagCacheKey makeUniRunnerDagCacheKey(
-    uniRunnerDagAlgoType algoType, flagcxCommOp_t commOp, size_t count,
-    flagcxDataType_t datatype, flagcxRedOp_t redOp, int root,
-    flagcxComm_t comm) {
+    uniRunnerDagAlgoType algoType,
+    const uniRunnerDagAlgorithmConfig &algorithmConfig,
+    flagcxCommOp_t commOp, size_t count, flagcxDataType_t datatype,
+    flagcxRedOp_t redOp, int root, flagcxComm_t comm) {
   uniRunnerDagCacheKey key{};
-  key.formatVersion = kUniRunnerDagCacheFormatVersion;
   key.algoType = algoType;
+  key.algoHash = getUniRunnerDagAlgorithmHash(algoType, algorithmConfig);
   key.commOp = commOp;
   key.count = count;
   key.datatype = datatype;
@@ -469,10 +507,63 @@ static flagcxResult_t cacheUniRunnerDagTemplate(
 
 } // namespace
 
+uint64_t getUniRunnerDagAlgorithmHash(
+    uniRunnerDagAlgoType algoType,
+    const uniRunnerDagAlgorithmConfig &algorithmConfig) {
+  uint64_t hashValue = kUniRunnerDagFnvOffsetBasis;
+  hashValue =
+      hashAlgorithmUint64(hashValue, kUniRunnerDagAlgorithmHashSchemaVersion);
+  hashValue = hashAlgorithmUint64(hashValue, static_cast<uint64_t>(algoType));
+  switch (algoType) {
+    case uniRunnerDagAlgoLocRed:
+    case uniRunnerDagAlgoRingAG:
+    case uniRunnerDagAlgoRingAR:
+      hashValue = hashAlgorithmUint64(hashValue, algorithmConfig.numSlices);
+      hashValue = hashAlgorithmUint64(
+          hashValue, static_cast<uint64_t>(algorithmConfig.bufferMode));
+      break;
+    case uniRunnerDagAlgoGroupedAG:
+      hashValue = hashAlgorithmUint64(hashValue, algorithmConfig.groupSize);
+      hashValue = hashAlgorithmUint64(
+          hashValue, static_cast<uint64_t>(algorithmConfig.bufferMode));
+      break;
+    case uniRunnerDagAlgoSlicedAR:
+    case uniRunnerDagAlgoRingRS:
+    case uniRunnerDagAlgoTreeRed:
+      hashValue = hashAlgorithmUint64(hashValue, algorithmConfig.numSlices);
+      hashValue =
+          hashAlgorithmUint64(hashValue, algorithmConfig.numRedSlices);
+      hashValue = hashAlgorithmUint64(
+          hashValue, static_cast<uint64_t>(algorithmConfig.bufferMode));
+      break;
+    case uniRunnerDagAlgoIpcAR:
+      hashValue = hashAlgorithmUint64(hashValue, algorithmConfig.numSlices);
+      hashValue =
+          hashAlgorithmUint64(hashValue, algorithmConfig.numRedSlices);
+      hashValue = hashAlgorithmUint64(hashValue, algorithmConfig.topologyHash);
+      hashValue = hashAlgorithmUint64(
+          hashValue, static_cast<uint64_t>(algorithmConfig.bufferMode));
+      break;
+    case uniRunnerDagAlgoDummy:
+    default:
+      break;
+  }
+  return hashValue;
+}
+
 size_t getUniRunnerDagPatternHash(const uniRunnerDagCacheKey &key) {
   size_t hashValue = 0;
-  hashValue = hashCombine(hashValue, static_cast<size_t>(key.formatVersion));
+  // Cache format is serialization metadata rather than a collective semantic
+  // key field. Salt the persisted pattern hash so incompatible formats never
+  // share a cache filename.
+  hashValue = hashCombine(
+      hashValue, static_cast<size_t>(kUniRunnerDagCacheFormatVersion));
   hashValue = hashCombine(hashValue, static_cast<size_t>(key.algoType));
+  hashValue = hashCombine(
+      hashValue,
+      static_cast<size_t>(static_cast<uint32_t>(key.algoHash & 0xffffffffu)));
+  hashValue = hashCombine(
+      hashValue, static_cast<size_t>(static_cast<uint32_t>(key.algoHash >> 32)));
   hashValue = hashCombine(hashValue, static_cast<size_t>(key.commOp));
   hashValue = hashCombine(hashValue, key.count);
   hashValue = hashCombine(hashValue, static_cast<size_t>(key.datatype));
@@ -2864,15 +2955,20 @@ static flagcxResult_t tryLoadCachedUniRunnerDag(
         return loadRes;
       }
       TRACE(FLAGCX_UNIRUNNER,
-            "uniRunner DAG cache miss, algo=%s commOp=%s hash=%lu",
+            "uniRunner DAG cache miss, algo_name=%s algo_hash=%llu "
+            "commOp=%s pattern_hash=%lu",
             uniRunnerDagAlgoTypeToString(key.algoType),
+            static_cast<unsigned long long>(key.algoHash),
             uniRunnerCommOpToString(key.commOp), hashValue);
       return flagcxSuccess;
     }
   }
 
-  TRACE(FLAGCX_UNIRUNNER, "uniRunner DAG cache hit, algo=%s commOp=%s hash=%lu",
+  TRACE(FLAGCX_UNIRUNNER,
+        "uniRunner DAG cache hit, algo_name=%s algo_hash=%llu commOp=%s "
+        "pattern_hash=%lu",
         uniRunnerDagAlgoTypeToString(key.algoType),
+        static_cast<unsigned long long>(key.algoHash),
         uniRunnerCommOpToString(key.commOp), hashValue);
   FLAGCXCHECK(
       materializeUniRunnerDagTemplate(runnerState, *dagTemplate, bindings));
@@ -2966,9 +3062,14 @@ flagcxResult_t initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
   bindings.inputBytes = count * typeSize;
   bindings.outputBytes = count * typeSize;
 
+  uniRunnerDagAlgorithmConfig algorithmConfig{};
+  algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
+  algorithmConfig.bufferMode =
+      sendbuff == recvbuff ? uniRunnerDagBufferModeInPlace
+                           : uniRunnerDagBufferModeOutOfPlace;
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
-      uniRunnerDagAlgoLocRed, flagcxCommOpAllReduce, count, datatype, op, -1,
-      comm);
+      uniRunnerDagAlgoLocRed, algorithmConfig, flagcxCommOpAllReduce, count,
+      datatype, op, -1, comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateLocRed(runnerState, sendbuff, recvbuff, count,
                                      datatype, op, comm);
@@ -2988,9 +3089,17 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
   bindings.inputBytes = count * typeSize;
   bindings.outputBytes = count * comm->nranks * typeSize;
 
+  uniRunnerDagAlgorithmConfig algorithmConfig{};
+  algorithmConfig.groupSize = static_cast<uint64_t>(groupSize);
+  algorithmConfig.bufferMode =
+      bufferMatchesElementOffset(sendbuff, recvbuff, count, comm->rank,
+                                 typeSize)
+          ? uniRunnerDagBufferModeInPlace
+          : uniRunnerDagBufferModeOutOfPlace;
   uniRunnerDagCacheKey key =
-      makeUniRunnerDagCacheKey(uniRunnerDagAlgoGroupedAG, flagcxCommOpAllGather,
-                               count, datatype, flagcxRedNoOp, -1, comm);
+      makeUniRunnerDagCacheKey(uniRunnerDagAlgoGroupedAG, algorithmConfig,
+                               flagcxCommOpAllGather, count, datatype,
+                               flagcxRedNoOp, -1, comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateGroupedAG(runnerState, sendbuff, recvbuff, count,
                                         datatype, comm, groupSize);
@@ -3009,9 +3118,14 @@ flagcxResult_t initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
   bindings.inputBytes = count * typeSize;
   bindings.outputBytes = count * typeSize;
 
+  uniRunnerDagAlgorithmConfig algorithmConfig{};
+  algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
+  algorithmConfig.bufferMode =
+      sendbuff == recvbuff ? uniRunnerDagBufferModeInPlace
+                           : uniRunnerDagBufferModeOutOfPlace;
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
-      uniRunnerDagAlgoRingAG, flagcxCommOpAllReduce, count, datatype,
-      flagcxRedNoOp, -1, comm);
+      uniRunnerDagAlgoRingAG, algorithmConfig, flagcxCommOpAllReduce, count,
+      datatype, flagcxRedNoOp, -1, comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateRingAG(runnerState, sendbuff, recvbuff, count,
                                      datatype, op, comm);
@@ -3030,9 +3144,14 @@ flagcxResult_t initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
   bindings.inputBytes = count * typeSize;
   bindings.outputBytes = count * typeSize;
 
+  uniRunnerDagAlgorithmConfig algorithmConfig{};
+  algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
+  algorithmConfig.bufferMode =
+      sendbuff == recvbuff ? uniRunnerDagBufferModeInPlace
+                           : uniRunnerDagBufferModeOutOfPlace;
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
-      uniRunnerDagAlgoRingAR, flagcxCommOpAllReduce, count, datatype, op, -1,
-      comm);
+      uniRunnerDagAlgoRingAR, algorithmConfig, flagcxCommOpAllReduce, count,
+      datatype, op, -1, comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateRingAR(runnerState, sendbuff, recvbuff, count,
                                      datatype, op, comm);
@@ -3055,9 +3174,15 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   bindings.inputBytes = count * typeSize;
   bindings.outputBytes = count * typeSize;
 
+  uniRunnerDagAlgorithmConfig algorithmConfig{};
+  algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
+  algorithmConfig.numRedSlices = runnerState->uniRunnerNRedSlices;
+  algorithmConfig.bufferMode =
+      sendbuff == recvbuff ? uniRunnerDagBufferModeInPlace
+                           : uniRunnerDagBufferModeOutOfPlace;
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
-      uniRunnerDagAlgoSlicedAR, flagcxCommOpAllReduce, count, datatype, op, -1,
-      comm);
+      uniRunnerDagAlgoSlicedAR, algorithmConfig, flagcxCommOpAllReduce, count,
+      datatype, op, -1, comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff, count,
                                        datatype, op, comm);
@@ -3109,9 +3234,17 @@ flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
   bindings.outputBytes = count * typeSize;
   bindings.scratchBytes = count * comm->nranks * typeSize;
 
+  uniRunnerDagAlgorithmConfig algorithmConfig{};
+  algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
+  algorithmConfig.numRedSlices = runnerState->uniRunnerNRedSlices;
+  algorithmConfig.bufferMode =
+      bufferMatchesElementOffset(recvbuff, sendbuff, count, comm->rank,
+                                 typeSize)
+          ? uniRunnerDagBufferModeInPlace
+          : uniRunnerDagBufferModeOutOfPlace;
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
-      uniRunnerDagAlgoRingRS, flagcxCommOpReduceScatter, count, datatype, op,
-      -1, comm);
+      uniRunnerDagAlgoRingRS, algorithmConfig, flagcxCommOpReduceScatter,
+      count, datatype, op, -1, comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateRingRS(runnerState, sendbuff, recvbuff,
                                      scratchbuff, count, datatype, op, comm);
@@ -3137,9 +3270,15 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
   bindings.outputBytes = count * typeSize;
   bindings.scratchBytes = 2 * count * typeSize;
 
+  uniRunnerDagAlgorithmConfig algorithmConfig{};
+  algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
+  algorithmConfig.numRedSlices = runnerState->uniRunnerNRedSlices;
+  algorithmConfig.bufferMode =
+      sendbuff == recvbuff ? uniRunnerDagBufferModeInPlace
+                           : uniRunnerDagBufferModeOutOfPlace;
   uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
-      uniRunnerDagAlgoTreeRed, flagcxCommOpReduce, count, datatype, op, root,
-      comm);
+      uniRunnerDagAlgoTreeRed, algorithmConfig, flagcxCommOpReduce, count,
+      datatype, op, root, comm);
   return initUniRunnerStateCached(runnerState, key, bindings, [&]() {
     return buildUniRunnerStateTreeRed(runnerState, sendbuff, recvbuff,
                                       scratchbuff, count, datatype, op, root,
