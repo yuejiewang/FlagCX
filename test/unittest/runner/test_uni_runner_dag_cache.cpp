@@ -23,6 +23,24 @@ uniRunnerDagCacheKey makeCacheKey(uint64_t algoHash) {
   return key;
 }
 
+uniRunnerDagTemplate makeIpcDagTemplate() {
+  uniRunnerDagTemplate dagTemplate;
+  dagTemplate.key = makeCacheKey(0x123456789abcdef0ull);
+  dagTemplate.key.algoType = uniRunnerDagAlgoIpcAR;
+
+  uniRunnerDagNodeDesc node;
+  node.nodeType = uniRunnerDagNodeTypeIpc;
+  node.nodeIdx = 0;
+  node.ipc.srcOffsetBytes = 128;
+  node.ipc.dstOffsetBytes = 256;
+  node.ipc.bytes = 4096;
+  node.ipc.srcBufferType = flagcxIpcBufferOutput;
+  node.ipc.peerLocalRank = 7;
+  node.ipc.readySlot = 3;
+  dagTemplate.nodes.push_back(node);
+  return dagTemplate;
+}
+
 } // namespace
 
 TEST(UniRunnerDagCache, AlgorithmHashIsStableAndCoversBuilderInputs) {
@@ -156,6 +174,116 @@ TEST(UniRunnerDagCache, JsonRoundTripPreservesFullWidthAlgorithmHash) {
   EXPECT_EQ(original.key.nranks, decoded.key.nranks);
   EXPECT_EQ(original.key.root, decoded.key.root);
   EXPECT_EQ(getUniRunnerDagPatternHash(original.key), decoded.hashValue);
+}
+
+TEST(UniRunnerDagCache, IpcDescriptorJsonRoundTripContainsOnlyStructure) {
+  const uniRunnerDagTemplate original = makeIpcDagTemplate();
+  const Json json = uniRunnerSerializeDagTemplate(original);
+  ASSERT_EQ(4, json.at("format_version").get<int>());
+  ASSERT_EQ(1u, json.at("dag").at("nodes").size());
+
+  const Json &nodeJson = json.at("dag").at("nodes").at(0);
+  ASSERT_TRUE(nodeJson.contains("ipc"));
+  const Json &ipcJson = nodeJson.at("ipc");
+  const std::set<std::string> expectedFields = {
+      "src_offset_bytes", "dst_offset_bytes", "bytes",
+      "src_buffer_type",  "peer_local_rank", "ready_slot"};
+  std::set<std::string> actualFields;
+  for (auto it = ipcJson.begin(); it != ipcJson.end(); ++it) {
+    actualFields.insert(it.key());
+  }
+  EXPECT_EQ(expectedFields, actualFields);
+  EXPECT_EQ("output", ipcJson.at("src_buffer_type").get<std::string>());
+
+  for (const char *runtimeField :
+       {"parent_flags_offset", "trigger_idx", "chunk_size", "epoch",
+        "num_chunks", "completed_chunks", "next_chunk", "state",
+        "flag_in", "flag_out", "src_ptr", "dst_ptr", "dev_mem",
+        "window"}) {
+    EXPECT_FALSE(ipcJson.contains(runtimeField));
+    EXPECT_FALSE(nodeJson.contains(runtimeField));
+  }
+
+  uniRunnerDagTemplate decoded;
+  ASSERT_TRUE(uniRunnerDeserializeDagTemplate(json, &decoded));
+  ASSERT_EQ(1u, decoded.nodes.size());
+  const uniRunnerDagIpcOpDesc &ipc = decoded.nodes[0].ipc;
+  EXPECT_EQ(original.nodes[0].ipc.srcOffsetBytes, ipc.srcOffsetBytes);
+  EXPECT_EQ(original.nodes[0].ipc.dstOffsetBytes, ipc.dstOffsetBytes);
+  EXPECT_EQ(original.nodes[0].ipc.bytes, ipc.bytes);
+  EXPECT_EQ(original.nodes[0].ipc.srcBufferType, ipc.srcBufferType);
+  EXPECT_EQ(original.nodes[0].ipc.peerLocalRank, ipc.peerLocalRank);
+  EXPECT_EQ(original.nodes[0].ipc.readySlot, ipc.readySlot);
+}
+
+TEST(UniRunnerDagCache, RejectsMalformedIpcDescriptorFields) {
+  const uniRunnerDagTemplate original = makeIpcDagTemplate();
+  const Json valid = uniRunnerSerializeDagTemplate(original);
+  uniRunnerDagTemplate decoded;
+
+  for (const char *requiredField :
+       {"src_offset_bytes", "dst_offset_bytes", "bytes",
+        "src_buffer_type", "peer_local_rank", "ready_slot"}) {
+    Json json = valid;
+    json["dag"]["nodes"][0]["ipc"].erase(requiredField);
+    EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded))
+        << requiredField;
+  }
+
+  Json json = valid;
+  json["dag"]["nodes"][0]["ipc"]["epoch"] = 1;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  json = valid;
+  json["dag"]["nodes"][0]["trigger_idx"] = 0;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  json = valid;
+  json["dag"]["nodes"][0]["ipc"]["src_buffer_type"] = "scratch";
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  json = valid;
+  json["dag"]["nodes"][0]["ipc"]["src_buffer_type"] = 0;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  for (const char *sizeField :
+       {"src_offset_bytes", "dst_offset_bytes", "bytes"}) {
+    json = valid;
+    json["dag"]["nodes"][0]["ipc"][sizeField] = -1;
+    EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded)) << sizeField;
+
+    json = valid;
+    json["dag"]["nodes"][0]["ipc"][sizeField] = "1";
+    EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded)) << sizeField;
+  }
+}
+
+TEST(UniRunnerDagCache, RejectsIpcPeerAndReadySlotOverflow) {
+  const uniRunnerDagTemplate original = makeIpcDagTemplate();
+  const Json valid = uniRunnerSerializeDagTemplate(original);
+  uniRunnerDagTemplate decoded;
+
+  Json json = valid;
+  json["dag"]["nodes"][0]["ipc"]["peer_local_rank"] = -1;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  json = valid;
+  json["dag"]["nodes"][0]["ipc"]["peer_local_rank"] =
+      static_cast<uint64_t>(std::numeric_limits<int>::max()) + 1;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  json = valid;
+  json["dag"]["nodes"][0]["ipc"]["ready_slot"] = -1;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  json = valid;
+  json["dag"]["nodes"][0]["ipc"]["ready_slot"] =
+      static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  json = valid;
+  json["format_version"] = 3;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
 }
 
 TEST(UniRunnerDagCache, RejectsOldOrMalformedAlgorithmIdentity) {

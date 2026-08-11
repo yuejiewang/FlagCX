@@ -15,7 +15,7 @@
 
 using Json = nlohmann::json;
 
-inline constexpr int kUniRunnerDagCacheFormatVersion = 3;
+inline constexpr int kUniRunnerDagCacheFormatVersion = 4;
 
 inline bool uniRunnerDagDataTypeValueValid(int value) {
   return value >= 0 && value < flagcxNumTypes;
@@ -63,6 +63,18 @@ struct uniRunnerDagCpyOpDesc {
   flagcxDataType_t datatype = flagcxInt8;
 };
 
+// Cacheable IPC DAG structure. Invocation-local execution state (for example
+// DevMem/Window handles, parent flag offsets, trigger indices, epochs, chunk
+// counters, and trigger state) is deliberately rebound after materialization.
+struct uniRunnerDagIpcOpDesc {
+  size_t srcOffsetBytes = 0;
+  size_t dstOffsetBytes = 0;
+  size_t bytes = 0;
+  flagcxIpcBufferType srcBufferType = flagcxIpcBufferInput;
+  int peerLocalRank = -1;
+  uint32_t readySlot = 0;
+};
+
 struct uniRunnerDagNodeDesc {
   uniRunnerDagNodeType nodeType = uniRunnerDagNodeTypeP2p;
   int nodeIdx = 0;
@@ -71,6 +83,7 @@ struct uniRunnerDagNodeDesc {
   std::vector<uniRunnerDagP2pOpDesc> p2pOps;
   uniRunnerDagRedOpDesc red;
   uniRunnerDagCpyOpDesc cpy;
+  uniRunnerDagIpcOpDesc ipc;
 };
 
 struct uniRunnerDagTemplate {
@@ -256,6 +269,34 @@ inline bool uniRunnerDagBufferTypeFromString(const std::string &text,
   return true;
 }
 
+inline const char *
+uniRunnerDagIpcBufferTypeToString(flagcxIpcBufferType bufferType) {
+  switch (bufferType) {
+    case flagcxIpcBufferInput:
+      return "input";
+    case flagcxIpcBufferOutput:
+      return "output";
+    default:
+      return "unknown";
+  }
+}
+
+inline bool
+uniRunnerDagIpcBufferTypeFromString(const std::string &text,
+                                    flagcxIpcBufferType *bufferType) {
+  if (bufferType == nullptr) {
+    return false;
+  }
+  if (text == "input") {
+    *bufferType = flagcxIpcBufferInput;
+  } else if (text == "output") {
+    *bufferType = flagcxIpcBufferOutput;
+  } else {
+    return false;
+  }
+  return true;
+}
+
 inline const char *uniRunnerDevicePrimToString(flagcxDevicePrim prim) {
   switch (prim) {
     case flagcxDevicePrimSend:
@@ -398,6 +439,71 @@ inline bool uniRunnerDagSizeFromJson(const Json &j, size_t *value) {
   return false;
 }
 
+inline bool uniRunnerDagNonNegativeIntFromJson(const Json &j, int *value) {
+  if (value == nullptr) {
+    return false;
+  }
+  size_t decoded = 0;
+  if (!uniRunnerDagSizeFromJson(j, &decoded) ||
+      decoded > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+  *value = static_cast<int>(decoded);
+  return true;
+}
+
+inline bool uniRunnerDagUint32FromJson(const Json &j, uint32_t *value) {
+  if (value == nullptr) {
+    return false;
+  }
+  size_t decoded = 0;
+  if (!uniRunnerDagSizeFromJson(j, &decoded) ||
+      decoded > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    return false;
+  }
+  *value = static_cast<uint32_t>(decoded);
+  return true;
+}
+
+inline Json
+uniRunnerDagIpcOpDescToJson(const uniRunnerDagIpcOpDesc &ipc) {
+  return Json{
+      {"src_offset_bytes", ipc.srcOffsetBytes},
+      {"dst_offset_bytes", ipc.dstOffsetBytes},
+      {"bytes", ipc.bytes},
+      {"src_buffer_type",
+       uniRunnerDagIpcBufferTypeToString(ipc.srcBufferType)},
+      {"peer_local_rank", ipc.peerLocalRank},
+      {"ready_slot", ipc.readySlot},
+  };
+}
+
+inline bool uniRunnerDagIpcOpDescFromJson(const Json &j,
+                                          uniRunnerDagIpcOpDesc *ipc) {
+  if (ipc == nullptr || !j.is_object() || j.size() != 6 ||
+      !j.contains("src_offset_bytes") || !j.contains("dst_offset_bytes") ||
+      !j.contains("bytes") || !j.contains("src_buffer_type") ||
+      !j.contains("peer_local_rank") || !j.contains("ready_slot")) {
+    return false;
+  }
+  try {
+    const std::string srcBufferType =
+        j.at("src_buffer_type").get<std::string>();
+    return uniRunnerDagSizeFromJson(j.at("src_offset_bytes"),
+                                    &ipc->srcOffsetBytes) &&
+           uniRunnerDagSizeFromJson(j.at("dst_offset_bytes"),
+                                    &ipc->dstOffsetBytes) &&
+           uniRunnerDagSizeFromJson(j.at("bytes"), &ipc->bytes) &&
+           uniRunnerDagIpcBufferTypeFromString(srcBufferType,
+                                               &ipc->srcBufferType) &&
+           uniRunnerDagNonNegativeIntFromJson(j.at("peer_local_rank"),
+                                               &ipc->peerLocalRank) &&
+           uniRunnerDagUint32FromJson(j.at("ready_slot"), &ipc->readySlot);
+  } catch (...) {
+    return false;
+  }
+}
+
 inline bool uniRunnerDagCacheKeyFromJson(const Json &j,
                                          uniRunnerDagCacheKey *key) {
   if (key == nullptr || !j.is_object()) {
@@ -470,6 +576,8 @@ uniRunnerDagTemplateToJson(const uniRunnerDagTemplate &dagTemplate) {
           {"count", node.cpy.count},
           {"datatype", static_cast<int>(node.cpy.datatype)},
       };
+    } else if (node.nodeType == uniRunnerDagNodeTypeIpc) {
+      nodeJson["ipc"] = uniRunnerDagIpcOpDescToJson(node.ipc);
     }
     nodes.push_back(nodeJson);
   }
@@ -621,6 +729,17 @@ inline bool uniRunnerDagTemplateFromJson(const Json &j,
           return false;
         }
         node.cpy.datatype = static_cast<flagcxDataType_t>(datatype);
+      } else if (node.nodeType == uniRunnerDagNodeTypeIpc) {
+        // IPC nodes have exactly the four common DAG fields plus their six-field
+        // structural payload. Rejecting extras prevents runtime trigger state
+        // from silently becoming part of the persistent cache schema.
+        if (nodeJson.size() != 5 || !nodeJson.contains("node_idx") ||
+            !nodeJson.contains("node_type") ||
+            !nodeJson.contains("parents") ||
+            !nodeJson.contains("children") || !nodeJson.contains("ipc") ||
+            !uniRunnerDagIpcOpDescFromJson(nodeJson.at("ipc"), &node.ipc)) {
+          return false;
+        }
       }
       dagTemplate->nodes.push_back(node);
     }
