@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <set>
@@ -42,6 +43,30 @@ uniRunnerDagTemplate makeIpcDagTemplate() {
 }
 
 } // namespace
+
+TEST(UniRunnerDagCache, BindingRangeRequiresCompleteAccess) {
+  std::array<unsigned char, 32> storage{};
+  int64_t offsetBytes = -1;
+
+  EXPECT_TRUE(uniRunnerDagBindingRangeContains(
+      storage.data() + 8, storage.data(), 16, 8, &offsetBytes));
+  EXPECT_EQ(8, offsetBytes);
+  EXPECT_FALSE(uniRunnerDagBindingRangeContains(
+      storage.data() + 8, storage.data(), 16, 9, &offsetBytes));
+
+  // Adjacent input/output allocations may have exactly this address layout.
+  // A non-empty output access must not be captured as one-past the input.
+  EXPECT_FALSE(uniRunnerDagBindingRangeContains(
+      storage.data() + 16, storage.data(), 16, 1, &offsetBytes));
+  EXPECT_TRUE(uniRunnerDagBindingRangeContains(
+      storage.data() + 16, storage.data() + 16, 16, 1, &offsetBytes));
+  EXPECT_EQ(0, offsetBytes);
+
+  // Preserve one-past-end representation for a genuinely empty slice.
+  EXPECT_TRUE(uniRunnerDagBindingRangeContains(
+      storage.data() + 16, storage.data(), 16, 0, &offsetBytes));
+  EXPECT_EQ(16, offsetBytes);
+}
 
 TEST(UniRunnerDagCache, AlgorithmHashIsStableAndCoversBuilderInputs) {
   uniRunnerDagAlgorithmConfig config{};

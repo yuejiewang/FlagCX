@@ -39,6 +39,27 @@ struct uniRunnerDagBufferRef {
   int64_t offsetBytes = 0;
 };
 
+inline bool uniRunnerDagBindingRangeContains(const void *ptr, const void *base,
+                                             size_t bytes,
+                                             size_t accessBytes,
+                                             int64_t *offsetBytes) {
+  if (ptr == nullptr || base == nullptr || offsetBytes == nullptr) {
+    return false;
+  }
+  const uintptr_t ptrAddr = reinterpret_cast<uintptr_t>(ptr);
+  const uintptr_t baseAddr = reinterpret_cast<uintptr_t>(base);
+  if (ptrAddr < baseAddr) {
+    return false;
+  }
+  const uintptr_t delta = ptrAddr - baseAddr;
+  if (delta > bytes || accessBytes > bytes - static_cast<size_t>(delta) ||
+      delta > static_cast<uintptr_t>(std::numeric_limits<int64_t>::max())) {
+    return false;
+  }
+  *offsetBytes = static_cast<int64_t>(delta);
+  return true;
+}
+
 struct uniRunnerDagP2pOpDesc {
   uniRunnerDagBufferRef buffer;
   size_t count = 0;

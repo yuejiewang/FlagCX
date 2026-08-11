@@ -407,49 +407,33 @@ static flagcxResult_t loadUniRunnerDagFileIntoCache(const std::string &path) {
   return flagcxSuccess;
 }
 
-static bool matchBindingRange(const void *ptr, const void *base, size_t bytes,
-                              int64_t *offsetBytes) {
-  if (ptr == NULL || base == NULL) {
-    return false;
-  }
-  uintptr_t ptrAddr = reinterpret_cast<uintptr_t>(ptr);
-  uintptr_t baseAddr = reinterpret_cast<uintptr_t>(base);
-  if (ptrAddr < baseAddr) {
-    return false;
-  }
-  uintptr_t delta = ptrAddr - baseAddr;
-  if (delta > bytes ||
-      delta > static_cast<uintptr_t>(std::numeric_limits<int64_t>::max())) {
-    return false;
-  }
-  *offsetBytes = static_cast<int64_t>(delta);
-  return true;
-}
-
 static flagcxResult_t
 captureBufferRef(const void *ptr, const uniRunnerDagRuntimeBindings &bindings,
-                 uniRunnerDagBufferRef *ref) {
+                 size_t accessBytes, uniRunnerDagBufferRef *ref) {
   if (ptr == NULL) {
     ref->bufferType = uniRunnerDagBufferTypeNone;
     ref->offsetBytes = 0;
-    return flagcxSuccess;
+    return accessBytes == 0 ? flagcxSuccess : flagcxInvalidArgument;
   }
 
   int64_t offsetBytes = 0;
-  if (matchBindingRange(ptr, bindings.inputBase, bindings.inputBytes,
-                        &offsetBytes)) {
+  if (uniRunnerDagBindingRangeContains(ptr, bindings.inputBase,
+                                       bindings.inputBytes, accessBytes,
+                                       &offsetBytes)) {
     ref->bufferType = uniRunnerDagBufferTypeInput;
     ref->offsetBytes = offsetBytes;
     return flagcxSuccess;
   }
-  if (matchBindingRange(ptr, bindings.outputBase, bindings.outputBytes,
-                        &offsetBytes)) {
+  if (uniRunnerDagBindingRangeContains(ptr, bindings.outputBase,
+                                       bindings.outputBytes, accessBytes,
+                                       &offsetBytes)) {
     ref->bufferType = uniRunnerDagBufferTypeOutput;
     ref->offsetBytes = offsetBytes;
     return flagcxSuccess;
   }
-  if (matchBindingRange(ptr, bindings.scratchBase, bindings.scratchBytes,
-                        &offsetBytes)) {
+  if (uniRunnerDagBindingRangeContains(ptr, bindings.scratchBase,
+                                       bindings.scratchBytes, accessBytes,
+                                       &offsetBytes)) {
     ref->bufferType = uniRunnerDagBufferTypeScratch;
     ref->offsetBytes = offsetBytes;
     return flagcxSuccess;
@@ -3089,24 +3073,36 @@ static flagcxResult_t captureUniRunnerDagTemplateFromState(
         opDesc.peerRank = op->peerRank;
         opDesc.datatype = op->datatype;
         opDesc.type = op->type;
-        FLAGCXCHECK(captureBufferRef(op->addr, bindings, &opDesc.buffer));
+        size_t opBytes = 0;
+        FLAGCXCHECK(checkedUniRunnerTypeBytes(op->count, 1, op->datatype,
+                                              &opBytes));
+        FLAGCXCHECK(
+            captureBufferRef(op->addr, bindings, opBytes, &opDesc.buffer));
         nodeDesc.p2pOps.push_back(opDesc);
       }
     } else if (node->nodeType == uniRunnerDagNodeTypeRed) {
+      size_t opBytes = 0;
+      FLAGCXCHECK(checkedUniRunnerTypeBytes(node->nodeData.red.count, 1,
+                                            node->nodeData.red.datatype,
+                                            &opBytes));
       FLAGCXCHECK(captureBufferRef(node->nodeData.red.input1, bindings,
-                                   &nodeDesc.red.input1));
+                                   opBytes, &nodeDesc.red.input1));
       FLAGCXCHECK(captureBufferRef(node->nodeData.red.input2, bindings,
-                                   &nodeDesc.red.input2));
+                                   opBytes, &nodeDesc.red.input2));
       FLAGCXCHECK(captureBufferRef(node->nodeData.red.output, bindings,
-                                   &nodeDesc.red.output));
+                                   opBytes, &nodeDesc.red.output));
       nodeDesc.red.count = node->nodeData.red.count;
       nodeDesc.red.datatype = node->nodeData.red.datatype;
       nodeDesc.red.redOp = node->nodeData.red.redOp;
     } else if (node->nodeType == uniRunnerDagNodeTypeCpy) {
+      size_t opBytes = 0;
+      FLAGCXCHECK(checkedUniRunnerTypeBytes(node->nodeData.cpy.count, 1,
+                                            node->nodeData.cpy.datatype,
+                                            &opBytes));
       FLAGCXCHECK(captureBufferRef(node->nodeData.cpy.src, bindings,
-                                   &nodeDesc.cpy.src));
+                                   opBytes, &nodeDesc.cpy.src));
       FLAGCXCHECK(captureBufferRef(node->nodeData.cpy.dst, bindings,
-                                   &nodeDesc.cpy.dst));
+                                   opBytes, &nodeDesc.cpy.dst));
       nodeDesc.cpy.count = node->nodeData.cpy.count;
       nodeDesc.cpy.datatype = node->nodeData.cpy.datatype;
     } else if (node->nodeType == uniRunnerDagNodeTypeIpc) {
