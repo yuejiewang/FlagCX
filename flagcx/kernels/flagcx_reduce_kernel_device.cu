@@ -712,6 +712,19 @@ FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticIpcRemoteAbort(
                                control.localRanks);
 }
 
+FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticIpcAbortCompletion(
+    const flagcxDevMem &readyMem, const uint64_t *abortFlag,
+    const flagcxStaticIpcControl &control) {
+  // All stores below are system-scope atomics through DeviceAPI::Atomic. This
+  // transition is deliberately idempotent: a rank may learn about the same
+  // abort through its local flag, the shared abort slot, and a peer done slot.
+  requestStaticAbort(abortFlag);
+  publishStaticIpcRemoteAbort(readyMem, control);
+  publishStaticIpcControlValue(
+      readyMem, control.doneBase + control.localRank,
+      control.epoch | flagcxIpcControlAbortBit, control.localRanks);
+}
+
 FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticIpcAbort(
     flagcxIpcTrigger *triggers, uint64_t numTriggers,
     uint64_t firstOrdinal, uint64_t stride) {
@@ -1004,14 +1017,12 @@ FLAGCX_DEVICE_INLINE_DECORATOR void finishStaticCollectiveExecution(
     bool aborted =
         isStaticIpcAbortRequested(abortFlag, readyMem, control);
     if (aborted) {
-      publishStaticIpcRemoteAbort(readyMem, control);
+      publishStaticIpcAbortCompletion(readyMem, abortFlag, control);
+    } else {
+      publishStaticIpcControlValue(
+          readyMem, control.doneBase + control.localRank, control.epoch,
+          control.localRanks);
     }
-
-    uint64_t doneValue =
-        control.epoch | (aborted ? flagcxIpcControlAbortBit : uint64_t(0));
-    publishStaticIpcControlValue(
-        readyMem, control.doneBase + control.localRank, doneValue,
-        control.localRanks);
 
     for (uint32_t peer = 0; peer < control.localRanks; ++peer) {
       uint64_t *localDone = getStaticIpcReadyPointer(
@@ -1020,27 +1031,24 @@ FLAGCX_DEVICE_INLINE_DECORATOR void finishStaticCollectiveExecution(
       while (true) {
         const uint64_t observed = DeviceAPI::Atomic::load(
             localDone, flagcxDeviceMemoryOrderAcquire);
-        if (flagcxIpcControlEpochReached(observed, control.epoch)) {
-          if ((observed & flagcxIpcControlAbortBit) != 0) {
-            aborted = true;
-          }
-          break;
-        }
-        if (isStaticIpcAbortRequested(abortFlag, readyMem, control)) {
+        const bool epochReached =
+            flagcxIpcControlEpochReached(observed, control.epoch);
+        const bool peerAborted =
+            epochReached && (observed & flagcxIpcControlAbortBit) != 0;
+        if (!aborted &&
+            (peerAborted ||
+             isStaticIpcAbortRequested(abortFlag, readyMem, control))) {
           aborted = true;
+          // Do not wait for the remaining peers before propagating a late
+          // abort. One of them may still be executing (or waiting on a DAG
+          // dependency) and needs this rank's abort publication to quiesce.
+          publishStaticIpcAbortCompletion(readyMem, abortFlag, control);
+        }
+        if (epochReached) {
+          break;
         }
         DeviceAPI::Intrin::spinBackoff(backoff++);
       }
-    }
-
-    if (aborted) {
-      requestStaticAbort(abortFlag);
-      publishStaticIpcRemoteAbort(readyMem, control);
-      // A remote abort can arrive after this rank first published a normal
-      // done value. Upgrade it so every peer reports the same failed epoch.
-      publishStaticIpcControlValue(
-          readyMem, control.doneBase + control.localRank,
-          control.epoch | flagcxIpcControlAbortBit, control.localRanks);
     }
   }
   FLAGCX_DEVICE_SYNC_THREADS();
