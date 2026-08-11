@@ -251,6 +251,10 @@ flagcxResult_t validateUniRunnerReduceArgs(size_t count,
 flagcxResult_t checkedUniRunnerTypeBytes(size_t count, size_t multiplier,
                                          flagcxDataType_t datatype,
                                          size_t *bytes);
+flagcxResult_t checkedUniRunnerDagNodeCount(size_t outerCount,
+                                            size_t nodesPerOuter,
+                                            size_t extraNodes,
+                                            int *nodeCount);
 
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm);
 flagcxResult_t

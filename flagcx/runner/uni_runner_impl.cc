@@ -62,12 +62,40 @@ static flagcxResult_t loadUniRunnerLaunchConfig(uint64_t *nthreads,
   return flagcxSuccess;
 }
 
+static flagcxResult_t loadUniRunnerDagBuilderConfig(uint64_t *nSlices,
+                                                    uint64_t *nRedSlices,
+                                                    uint64_t *redSliceSize) {
+  const int64_t rawNSlices = flagcxParamUniRunnerNSlices();
+  const int64_t rawNRedSlices = flagcxParamUniRunnerNRedSlices();
+  const int64_t rawRedSliceSize = flagcxParamUniRunnerRedSliceSize();
+  const int64_t maxBuilderCount = std::numeric_limits<int>::max();
+  if (nSlices == NULL || nRedSlices == NULL || redSliceSize == NULL) {
+    return flagcxInvalidArgument;
+  }
+  if (rawNSlices <= 0 || rawNSlices > maxBuilderCount ||
+      rawNRedSlices < 0 || rawNRedSlices > maxBuilderCount ||
+      rawRedSliceSize < 0) {
+    WARN("UniRunner requires 0 < NSLICES <= INT_MAX, "
+         "0 <= NREDSLICES <= INT_MAX and REDSLICESIZE >= 0");
+    return flagcxInvalidArgument;
+  }
+  *nSlices = static_cast<uint64_t>(rawNSlices);
+  *nRedSlices = static_cast<uint64_t>(rawNRedSlices);
+  *redSliceSize = static_cast<uint64_t>(rawRedSliceSize);
+  return flagcxSuccess;
+}
+
 flagcxResult_t validateUniRunnerLaunchConfig(flagcxCommOp_t commOp) {
   uint64_t nthreads = 0;
   uint64_t nRedBlocks = 0;
   uint64_t nIpcBlocks = 0;
   FLAGCXCHECK(
       loadUniRunnerLaunchConfig(&nthreads, &nRedBlocks, &nIpcBlocks));
+  uint64_t nSlices = 0;
+  uint64_t nRedSlices = 0;
+  uint64_t redSliceSize = 0;
+  FLAGCXCHECK(loadUniRunnerDagBuilderConfig(&nSlices, &nRedSlices,
+                                            &redSliceSize));
 
   if (nRedBlocks == 0 &&
       (commOp == flagcxCommOpReduce || commOp == flagcxCommOpAllReduce ||
@@ -128,6 +156,23 @@ flagcxResult_t checkedUniRunnerTypeBytes(size_t count, size_t multiplier,
     return flagcxInvalidArgument;
   }
   *bytes = elements * typeSize;
+  return flagcxSuccess;
+}
+
+flagcxResult_t checkedUniRunnerDagNodeCount(size_t outerCount,
+                                            size_t nodesPerOuter,
+                                            size_t extraNodes,
+                                            int *nodeCount) {
+  if (nodeCount == NULL ||
+      extraNodes > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return flagcxInvalidArgument;
+  }
+  const size_t maxProduct =
+      static_cast<size_t>(std::numeric_limits<int>::max()) - extraNodes;
+  if (outerCount != 0 && nodesPerOuter > maxProduct / outerCount) {
+    return flagcxInvalidArgument;
+  }
+  *nodeCount = static_cast<int>(outerCount * nodesPerOuter + extraNodes);
   return flagcxSuccess;
 }
 
@@ -201,6 +246,12 @@ static bool bufferMatchesElementOffset(const void *candidate, const void *base,
     return false;
   }
   return reinterpret_cast<uintptr_t>(candidate) == baseAddress + byteOffset;
+}
+
+static int positiveModulo(int64_t value, int modulus) {
+  assert(modulus > 0);
+  const int64_t remainder = value % static_cast<int64_t>(modulus);
+  return static_cast<int>(remainder < 0 ? remainder + modulus : remainder);
 }
 
 static bool uniRunnerDagCacheKeysEqual(const uniRunnerDagCacheKey &lhs,
@@ -360,7 +411,8 @@ static bool matchBindingRange(const void *ptr, const void *base, size_t bytes,
     return false;
   }
   uintptr_t delta = ptrAddr - baseAddr;
-  if (delta > bytes) {
+  if (delta > bytes ||
+      delta > static_cast<uintptr_t>(std::numeric_limits<int64_t>::max())) {
     return false;
   }
   *offsetBytes = static_cast<int64_t>(delta);
@@ -400,13 +452,14 @@ captureBufferRef(const void *ptr, const uniRunnerDagRuntimeBindings &bindings,
 
 static flagcxResult_t
 resolveBufferRef(const uniRunnerDagBufferRef &ref,
-                 const uniRunnerDagRuntimeBindings &bindings, void **ptr) {
+                 const uniRunnerDagRuntimeBindings &bindings,
+                 size_t accessBytes, void **ptr) {
   const char *base = NULL;
   size_t bytes = 0;
   switch (ref.bufferType) {
     case uniRunnerDagBufferTypeNone:
       *ptr = NULL;
-      return flagcxSuccess;
+      return accessBytes == 0 ? flagcxSuccess : flagcxInvalidArgument;
     case uniRunnerDagBufferTypeInput:
       base = static_cast<const char *>(bindings.inputBase);
       bytes = bindings.inputBytes;
@@ -424,11 +477,17 @@ resolveBufferRef(const uniRunnerDagBufferRef &ref,
   }
 
   if (base == NULL || ref.offsetBytes < 0 ||
-      static_cast<size_t>(ref.offsetBytes) > bytes) {
+      static_cast<size_t>(ref.offsetBytes) > bytes ||
+      accessBytes > bytes - static_cast<size_t>(ref.offsetBytes)) {
     return flagcxInvalidArgument;
   }
 
-  *ptr = const_cast<char *>(base) + ref.offsetBytes;
+  const uintptr_t baseAddress = reinterpret_cast<uintptr_t>(base);
+  const uintptr_t offset = static_cast<uintptr_t>(ref.offsetBytes);
+  if (baseAddress > std::numeric_limits<uintptr_t>::max() - offset) {
+    return flagcxInvalidArgument;
+  }
+  *ptr = reinterpret_cast<void *>(baseAddress + offset);
   return flagcxSuccess;
 }
 
@@ -443,12 +502,37 @@ resolveEffectiveUniRunnerRedSlices(const flagcxUniRunnerState *runnerState,
     return 1;
   }
 
-  size_t divisor = static_cast<size_t>(nranks) * runnerState->uniRunnerNSlices *
-                   runnerState->uniRunnerRedSliceSize;
-  if (divisor == 0) {
+  const size_t maxSize = std::numeric_limits<size_t>::max();
+  size_t divisor = static_cast<size_t>(nranks);
+  const size_t nSlices = static_cast<size_t>(runnerState->uniRunnerNSlices);
+  const size_t redSliceSize =
+      static_cast<size_t>(runnerState->uniRunnerRedSliceSize);
+  // If the mathematical divisor exceeds SIZE_MAX, it is necessarily larger
+  // than count and the positive-count ceil division is exactly one.
+  if (divisor > maxSize / nSlices) {
     return 1;
   }
-  return std::max<size_t>(1, (count + divisor - 1) / divisor);
+  divisor *= nSlices;
+  if (divisor > maxSize / redSliceSize) {
+    return 1;
+  }
+  divisor *= redSliceSize;
+  return std::max<size_t>(1, count / divisor + (count % divisor != 0));
+}
+
+static flagcxResult_t setEffectiveUniRunnerRedSlices(
+    flagcxUniRunnerState *runnerState, size_t count, int nranks) {
+  if (runnerState == NULL || nranks <= 0) {
+    return flagcxInvalidArgument;
+  }
+  const size_t resolved =
+      resolveEffectiveUniRunnerRedSlices(runnerState, count, nranks);
+  if (resolved >
+      static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return flagcxInvalidArgument;
+  }
+  runnerState->uniRunnerNRedSlices = static_cast<uint64_t>(resolved);
+  return flagcxSuccess;
 }
 
 static uniRunnerDagCacheKey makeUniRunnerDagCacheKey(
@@ -570,17 +654,19 @@ size_t getUniRunnerDagPatternHash(const uniRunnerDagCacheKey &key) {
   hashValue = hashCombine(hashValue, static_cast<size_t>(key.redOp));
   hashValue = hashCombine(hashValue, static_cast<size_t>(key.rank));
   hashValue = hashCombine(hashValue, static_cast<size_t>(key.nranks));
-  hashValue = hashCombine(hashValue, static_cast<size_t>(key.root + 1));
+  hashValue = hashCombine(
+      hashValue,
+      static_cast<size_t>(static_cast<int64_t>(key.root) + int64_t{1}));
   return hashValue;
 }
 
 static flagcxResult_t allocDagNodeDeps(uniRunnerDagNode *node) {
   node->pendingParents = 0;
   if (node->numParents > 0) {
-    FLAGCXCHECK(flagcxCalloc(&node->parents, node->numParents * sizeof(int)));
+    FLAGCXCHECK(flagcxCalloc(&node->parents, node->numParents));
   }
   if (node->numChildren > 0) {
-    FLAGCXCHECK(flagcxCalloc(&node->children, node->numChildren * sizeof(int)));
+    FLAGCXCHECK(flagcxCalloc(&node->children, node->numChildren));
   }
   return flagcxSuccess;
 }
@@ -598,9 +684,18 @@ static flagcxResult_t setDagNodeParent(uniRunnerDagNode *node, int parentSlot,
 
 // Validate that DAG construction filled every declared parent slot.
 static flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState) {
-  if (runnerState == NULL || runnerState->dagNodes == NULL ||
-      runnerState->numDagNodes == 0) {
-    return flagcxSuccess;
+  if (runnerState == NULL) {
+    return flagcxInvalidArgument;
+  }
+  if (runnerState->numDagNodes < 0) {
+    return flagcxInternalError;
+  }
+  if (runnerState->numDagNodes == 0) {
+    return runnerState->dagNodes == NULL ? flagcxSuccess
+                                         : flagcxInternalError;
+  }
+  if (runnerState->dagNodes == NULL) {
+    return flagcxInternalError;
   }
 
   const int numDagNodes = runnerState->numDagNodes;
@@ -609,6 +704,9 @@ static flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState) {
 
   for (int i = 0; i < numDagNodes; i++) {
     uniRunnerDagNode *node = &dagNodes[i];
+    if (node->nodeIdx != i) {
+      return flagcxInternalError;
+    }
     if (node->pendingParents != node->numParents) {
       return flagcxInternalError;
     }
@@ -663,46 +761,55 @@ static flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState) {
       default:
         return flagcxInternalError;
     }
+    if (static_cast<size_t>(node->numParents) >
+        std::numeric_limits<size_t>::max() - numEdges) {
+      return flagcxInvalidArgument;
+    }
     numEdges += static_cast<size_t>(node->numParents);
   }
 
-  std::unordered_set<uint64_t> dagEdges;
-  dagEdges.reserve(numEdges);
+  try {
+    std::unordered_set<uint64_t> dagEdges;
+    dagEdges.reserve(numEdges);
 
-  for (int i = 0; i < numDagNodes; i++) {
-    uniRunnerDagNode *node = &dagNodes[i];
-    for (int p = 0; p < node->numParents; p++) {
-      int parentIdx = node->parents[p];
-      if (parentIdx < 0 || parentIdx >= numDagNodes || parentIdx == i) {
-        return flagcxInternalError;
-      }
-      uint64_t edge =
-          (static_cast<uint64_t>(static_cast<uint32_t>(parentIdx)) << 32) |
-          static_cast<uint32_t>(i);
-      if (!dagEdges.emplace(edge).second) {
-        return flagcxInternalError;
+    for (int i = 0; i < numDagNodes; i++) {
+      uniRunnerDagNode *node = &dagNodes[i];
+      for (int p = 0; p < node->numParents; p++) {
+        int parentIdx = node->parents[p];
+        if (parentIdx < 0 || parentIdx >= numDagNodes || parentIdx == i) {
+          return flagcxInternalError;
+        }
+        uint64_t edge =
+            (static_cast<uint64_t>(static_cast<uint32_t>(parentIdx)) << 32) |
+            static_cast<uint32_t>(i);
+        if (!dagEdges.emplace(edge).second) {
+          return flagcxInternalError;
+        }
       }
     }
-  }
 
-  for (int i = 0; i < numDagNodes; i++) {
-    uniRunnerDagNode *node = &dagNodes[i];
-    for (int c = 0; c < node->numChildren; c++) {
-      int childIdx = node->children[c];
-      if (childIdx < 0 || childIdx >= numDagNodes || childIdx == i) {
-        return flagcxInternalError;
+    for (int i = 0; i < numDagNodes; i++) {
+      uniRunnerDagNode *node = &dagNodes[i];
+      for (int c = 0; c < node->numChildren; c++) {
+        int childIdx = node->children[c];
+        if (childIdx < 0 || childIdx >= numDagNodes || childIdx == i) {
+          return flagcxInternalError;
+        }
+        uint64_t edge =
+            (static_cast<uint64_t>(static_cast<uint32_t>(i)) << 32) |
+            static_cast<uint32_t>(childIdx);
+        std::unordered_set<uint64_t>::iterator it = dagEdges.find(edge);
+        if (it == dagEdges.end()) {
+          return flagcxInternalError;
+        }
+        dagEdges.erase(it);
       }
-      uint64_t edge = (static_cast<uint64_t>(static_cast<uint32_t>(i)) << 32) |
-                      static_cast<uint32_t>(childIdx);
-      std::unordered_set<uint64_t>::iterator it = dagEdges.find(edge);
-      if (it == dagEdges.end()) {
-        return flagcxInternalError;
-      }
-      dagEdges.erase(it);
     }
-  }
 
-  return dagEdges.empty() ? flagcxSuccess : flagcxInternalError;
+    return dagEdges.empty() ? flagcxSuccess : flagcxInternalError;
+  } catch (...) {
+    return flagcxSystemError;
+  }
 }
 
 static inline void *getDagNodeFlag(flagcxUniRunnerState *runnerState,
@@ -731,6 +838,10 @@ resizeStreamFlagAddressQueue(flagcxUniRunnerState *runnerState,
   if (newCapacity <= runnerState->streamFlagsCapacity) {
     return flagcxSuccess;
   }
+  if (newCapacity >
+      std::numeric_limits<size_t>::max() / sizeof(*runnerState->streamFlags)) {
+    return flagcxInvalidArgument;
+  }
 
   if (runnerState->streamFlagsCapacity == 0) {
     if (runnerState->streamFlags != NULL) {
@@ -750,21 +861,42 @@ static flagcxResult_t
 ensureStreamFlagQueueCapacity(flagcxUniRunnerState *runnerState,
                               size_t requiredFlags) {
   if (requiredFlags > runnerState->streamFlagsCapacity) {
+    const size_t maxSize = std::numeric_limits<size_t>::max();
+    const size_t maxCapacity =
+        std::min(maxSize / sizeof(*runnerState->streamFlags),
+                 maxSize / sizeof(uint64_t));
+    if (requiredFlags > maxCapacity) {
+      return flagcxInvalidArgument;
+    }
     size_t newCapacity = runnerState->streamFlagsCapacity == 0
                              ? 1
                              : runnerState->streamFlagsCapacity;
     while (newCapacity < requiredFlags) {
+      if (newCapacity > maxCapacity / 2) {
+        newCapacity = requiredFlags;
+        break;
+      }
       newCapacity *= 2;
     }
 
-    FLAGCXCHECK(resizeStreamFlagAddressQueue(runnerState, newCapacity));
-
     void *newPool = NULL;
-    FLAGCXCHECK(deviceAdaptor->deviceMalloc(
-        &newPool, newCapacity * sizeof(uint64_t), flagcxMemDevice, NULL));
+    flagcxResult_t res = deviceAdaptor->deviceMalloc(
+        &newPool, newCapacity * sizeof(uint64_t), flagcxMemDevice, NULL);
+    if (res != flagcxSuccess) {
+      return res;
+    }
+    res = resizeStreamFlagAddressQueue(runnerState, newCapacity);
+    if (res != flagcxSuccess) {
+      (void)deviceAdaptor->deviceFree(newPool, flagcxMemDevice, NULL);
+      return res;
+    }
     if (runnerState->streamFlagsPool != NULL) {
-      FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->streamFlagsPool,
-                                            flagcxMemDevice, NULL));
+      res = deviceAdaptor->deviceFree(runnerState->streamFlagsPool,
+                                      flagcxMemDevice, NULL);
+      if (res != flagcxSuccess) {
+        (void)deviceAdaptor->deviceFree(newPool, flagcxMemDevice, NULL);
+        return res;
+      }
     }
 
     runnerState->streamFlagsPool = newPool;
@@ -862,8 +994,7 @@ buildUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
   const int numNodes = numSlices;
 
   runnerState->numDagNodes = numNodes;
-  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
-                           numNodes * sizeof(struct uniRunnerDagNode)));
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, numNodes));
   if (runnerState->dagNodes == NULL) {
     return flagcxSystemError;
   }
@@ -935,8 +1066,7 @@ static flagcxResult_t buildUniRunnerStateGroupedAG(
   } else if (nranks == 1) {
     // For single rank, do local cpy if out-of-place, otherwise no-op
     if (count > 0 && sendbuff != recvbuff) {
-      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
-                               sizeof(struct uniRunnerDagNode)));
+      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, 1));
       if (runnerState->dagNodes == NULL) {
         return flagcxSystemError;
       }
@@ -964,11 +1094,11 @@ static flagcxResult_t buildUniRunnerStateGroupedAG(
 
   size_t typeSize = getFlagcxDataTypeSize(datatype);
   size_t groupChunkCount = count * groupSize;
-  const int numNodes = nGroups + 1;
+  int numNodes = 0;
+  FLAGCXCHECK(checkedUniRunnerDagNodeCount(1, nGroups, 1, &numNodes));
 
   runnerState->numDagNodes = numNodes;
-  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
-                           numNodes * sizeof(struct uniRunnerDagNode)));
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, numNodes));
   if (runnerState->dagNodes == NULL) {
     return flagcxSystemError;
   }
@@ -979,19 +1109,23 @@ static flagcxResult_t buildUniRunnerStateGroupedAG(
     int nodeIdx = step;
     bool isLastStep = (step == nGroups - 1);
     int numIntraPeers = groupSize - 1;
-    int numOps = isLastStep ? 2 * numIntraPeers : 2 * numIntraPeers + 2;
+    int numOps = 0;
+    FLAGCXCHECK(checkedUniRunnerDagNodeCount(
+        2, numIntraPeers, isLastStep ? 0 : 2, &numOps));
 
     runnerState->dagNodes[nodeIdx].nodeIdx = nodeIdx;
     runnerState->dagNodes[nodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
     runnerState->dagNodes[nodeIdx].nodeData.p2p.numOps = numOps;
     if (numOps > 0) {
-      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes[nodeIdx].nodeData.p2p.ops,
-                               numOps * sizeof(struct uniRunnerP2pOpData)));
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[nodeIdx].nodeData.p2p.ops, numOps));
     }
 
     for (int i = 0; i < numIntraPeers; i++) {
-      int locSendPeer = (locRank + i + 1) % groupSize;
-      int locRecvPeer = (locRank - i - 1 + groupSize) % groupSize;
+      int locSendPeer = positiveModulo(
+          static_cast<int64_t>(locRank) + i + 1, groupSize);
+      int locRecvPeer = positiveModulo(
+          static_cast<int64_t>(locRank) - i - 1, groupSize);
 
       // Send
       runnerState->dagNodes[nodeIdx].nodeData.p2p.ops[2 * i].type =
@@ -1027,8 +1161,10 @@ static flagcxResult_t buildUniRunnerStateGroupedAG(
     }
 
     if (!isLastStep) {
-      size_t sendGroupIdx = (groupIdx + step + 1) % nGroups;
-      size_t recvGroupIdx = (groupIdx - step - 1 + nGroups) % nGroups;
+      size_t sendGroupIdx = positiveModulo(
+          static_cast<int64_t>(groupIdx) + step + 1, nGroups);
+      size_t recvGroupIdx = positiveModulo(
+          static_cast<int64_t>(groupIdx) - step - 1, nGroups);
       size_t sendPeer = sendGroupIdx * groupSize + locRank;
       size_t recvPeer = recvGroupIdx * groupSize + locRank;
       size_t recvOffset = recvPeer * count * typeSize;
@@ -1137,8 +1273,7 @@ buildUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
   } else if (nranks == 1) {
     // For single rank, do local cpy if out-of-place, otherwise no-op
     if (count > 0 && sendbuff != recvbuff) {
-      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
-                               sizeof(struct uniRunnerDagNode)));
+      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, 1));
       if (runnerState->dagNodes == NULL) {
         return flagcxSystemError;
       }
@@ -1163,8 +1298,8 @@ buildUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
         "rank %d initUniRunnerStateP2p called, count=%lu, numSlices=%d",
         comm->rank, count, numSlices);
 
-  int nextRank = (rank + 1) % nranks;
-  int prevRank = (rank - 1 + nranks) % nranks;
+  int nextRank = positiveModulo(static_cast<int64_t>(rank) + 1, nranks);
+  int prevRank = positiveModulo(static_cast<int64_t>(rank) - 1, nranks);
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
   // Pipeline configuration - handle uneven distribution
@@ -1174,12 +1309,13 @@ buildUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
   // Nodes per slice chain:
   // All-Gather: P2P * (nranks - 1)
   const int nodesPerSlice = nranks - 1;
-  const int numNodes = numSlices * nodesPerSlice;
-
-  runnerState->numDagNodes = numNodes + 1;
-  FLAGCXCHECK(
-      flagcxCalloc(&runnerState->dagNodes,
-                   runnerState->numDagNodes * sizeof(struct uniRunnerDagNode)));
+  int numNodes = 0;
+  FLAGCXCHECK(checkedUniRunnerDagNodeCount(numSlices, nodesPerSlice, 0,
+                                           &numNodes));
+  FLAGCXCHECK(checkedUniRunnerDagNodeCount(numSlices, nodesPerSlice, 1,
+                                           &runnerState->numDagNodes));
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                           runnerState->numDagNodes));
   if (runnerState->dagNodes == NULL) {
     return flagcxSystemError;
   }
@@ -1198,12 +1334,13 @@ buildUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[p2pNodeIdx].nodeIdx = p2pNodeIdx;
       runnerState->dagNodes[p2pNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.numOps = 2;
-      FLAGCXCHECK(
-          flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
-                       2 * sizeof(struct uniRunnerP2pOpData)));
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops, 2));
 
-      int txChunk = (rank - i + nranks) % nranks;
-      int rxChunk = (rank - i - 1 + nranks) % nranks;
+      int txChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i, nranks);
+      int rxChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i - 1, nranks);
 
       // Calculate slice count with uneven distribution (last slice gets
       // remainder)
@@ -1337,8 +1474,7 @@ buildUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
   } else if (nranks == 1) {
     // For single rank, do local cpy if out-of-place, otherwise no-op
     if (count > 0 && sendbuff != recvbuff) {
-      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
-                               sizeof(struct uniRunnerDagNode)));
+      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, 1));
       if (runnerState->dagNodes == NULL) {
         return flagcxSystemError;
       }
@@ -1363,8 +1499,8 @@ buildUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
         "rank %d initUniRunnerStateRingAR called, count=%lu, numSlices=%d",
         comm->rank, count, numSlices);
 
-  int nextRank = (rank + 1) % nranks;
-  int prevRank = (rank - 1 + nranks) % nranks;
+  int nextRank = positiveModulo(static_cast<int64_t>(rank) + 1, nranks);
+  int prevRank = positiveModulo(static_cast<int64_t>(rank) - 1, nranks);
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
   // Pipeline configuration - handle uneven distribution
@@ -1374,12 +1510,15 @@ buildUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
   // Nodes per slice chain:
   // Scatter-Reduce: (P2P + Reduce) * (nranks - 1)
   // All-Gather: P2P * (nranks - 1)
-  const int nodesPerSlice = 3 * (nranks - 1);
-  const int numNodes = numSlices * nodesPerSlice;
+  int nodesPerSlice = 0;
+  FLAGCXCHECK(
+      checkedUniRunnerDagNodeCount(3, nranks - 1, 0, &nodesPerSlice));
+  int numNodes = 0;
+  FLAGCXCHECK(checkedUniRunnerDagNodeCount(numSlices, nodesPerSlice, 0,
+                                           &numNodes));
 
   runnerState->numDagNodes = numNodes;
-  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
-                           numNodes * sizeof(struct uniRunnerDagNode)));
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, numNodes));
   if (runnerState->dagNodes == NULL) {
     return flagcxSystemError;
   }
@@ -1402,12 +1541,13 @@ buildUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[p2pNodeIdx].nodeIdx = p2pNodeIdx;
       runnerState->dagNodes[p2pNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.numOps = 2;
-      FLAGCXCHECK(
-          flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
-                       2 * sizeof(struct uniRunnerP2pOpData)));
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops, 2));
 
-      int txChunk = (rank - i + nranks) % nranks;
-      int rxChunk = (rank - i - 1 + nranks) % nranks;
+      int txChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i, nranks);
+      int rxChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i - 1, nranks);
 
       // Calculate slice count with uneven distribution (last slice gets
       // remainder)
@@ -1544,12 +1684,13 @@ buildUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[p2pNodeIdx].nodeIdx = p2pNodeIdx;
       runnerState->dagNodes[p2pNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.numOps = 2;
-      FLAGCXCHECK(
-          flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
-                       2 * sizeof(struct uniRunnerP2pOpData)));
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops, 2));
 
-      int txChunk = (rank - i + 1 + nranks) % nranks;
-      int rxChunk = (rank - i + nranks) % nranks;
+      int txChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i + 1, nranks);
+      int rxChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i, nranks);
 
       // Calculate slice count with uneven distribution (last slice gets
       // remainder)
@@ -1679,8 +1820,7 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   } else if (nranks == 1) {
     // For single rank, do local cpy if out-of-place, otherwise no-op
     if (count > 0 && sendbuff != recvbuff) {
-      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
-                               sizeof(struct uniRunnerDagNode)));
+      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, 1));
       if (runnerState->dagNodes == NULL) {
         return flagcxSystemError;
       }
@@ -1702,13 +1842,8 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   }
 
   if (runnerState->uniRunnerNRedSlices == 0) {
-    if (count <= 0 || runnerState->uniRunnerRedSliceSize == 0) {
-      runnerState->uniRunnerNRedSlices = 1;
-    } else {
-      runnerState->uniRunnerNRedSlices =
-          ceil((float)count / comm->nranks / runnerState->uniRunnerNSlices /
-               runnerState->uniRunnerRedSliceSize);
-    }
+    FLAGCXCHECK(
+        setEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks));
     TRACE(FLAGCX_UNIRUNNER, "uniRunnerNRedSlices auto set to %lu",
           runnerState->uniRunnerNRedSlices);
   }
@@ -1720,8 +1855,8 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
         "numRedSlices=%d",
         comm->rank, count, numSlices, numRedSlices);
 
-  int nextRank = (rank + 1) % nranks;
-  int prevRank = (rank - 1 + nranks) % nranks;
+  int nextRank = positiveModulo(static_cast<int64_t>(rank) + 1, nranks);
+  int prevRank = positiveModulo(static_cast<int64_t>(rank) - 1, nranks);
   size_t typeSize = getFlagcxDataTypeSize(datatype);
 
   // Pipeline configuration - handle uneven distribution
@@ -1731,13 +1866,19 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   // Nodes per slice chain:
   // Scatter-Reduce: (P2P + Reduce * numRedSlices) * (nranks - 1)
   // All-Gather: P2P * (nranks - 1)
-  const int nodesPerSlice = (numRedSlices + 2) * (nranks - 1);
-  const int numNodes = numSlices * nodesPerSlice;
+  int nodesPerStep = 0;
+  FLAGCXCHECK(
+      checkedUniRunnerDagNodeCount(1, numRedSlices, 2, &nodesPerStep));
+  int nodesPerSlice = 0;
+  FLAGCXCHECK(checkedUniRunnerDagNodeCount(nodesPerStep, nranks - 1, 0,
+                                           &nodesPerSlice));
+  int numNodes = 0;
+  FLAGCXCHECK(checkedUniRunnerDagNodeCount(numSlices, nodesPerSlice, 0,
+                                           &numNodes));
 
   runnerState->numDagNodes = numNodes;
-  FLAGCXCHECK(
-      flagcxCalloc(&runnerState->dagNodes,
-                   runnerState->numDagNodes * sizeof(struct uniRunnerDagNode)));
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                           runnerState->numDagNodes));
   if (runnerState->dagNodes == NULL) {
     return flagcxSystemError;
   }
@@ -1760,12 +1901,13 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[p2pNodeIdx].nodeIdx = p2pNodeIdx;
       runnerState->dagNodes[p2pNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.numOps = 2;
-      FLAGCXCHECK(
-          flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
-                       2 * sizeof(struct uniRunnerP2pOpData)));
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops, 2));
 
-      int txChunk = (rank - i + nranks) % nranks;
-      int rxChunk = (rank - i - 1 + nranks) % nranks;
+      int txChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i, nranks);
+      int rxChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i - 1, nranks);
 
       // Calculate slice count with uneven distribution (last slice gets
       // remainder)
@@ -1924,12 +2066,13 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
       runnerState->dagNodes[p2pNodeIdx].nodeIdx = p2pNodeIdx;
       runnerState->dagNodes[p2pNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.numOps = 2;
-      FLAGCXCHECK(
-          flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
-                       2 * sizeof(struct uniRunnerP2pOpData)));
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops, 2));
 
-      int txChunk = (rank - i + 1 + nranks) % nranks;
-      int rxChunk = (rank - i + nranks) % nranks;
+      int txChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i + 1, nranks);
+      int rxChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i, nranks);
 
       // Calculate slice count with uneven distribution (last slice gets
       // remainder)
@@ -2086,7 +2229,8 @@ static flagcxResult_t buildUniRunnerStateIpcAR(
   FLAGCXCHECK(buildUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff,
                                           count, datatype, op, comm));
 
-  const size_t totalBytes = count * getFlagcxDataTypeSize(datatype);
+  size_t totalBytes = 0;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(count, 1, datatype, &totalBytes));
   uint32_t readySlot = 0;
   for (int nodeIdx = 0; nodeIdx < runnerState->numDagNodes; ++nodeIdx) {
     uniRunnerDagNode *node = &runnerState->dagNodes[nodeIdx];
@@ -2136,9 +2280,13 @@ static flagcxResult_t buildUniRunnerStateIpcAR(
     // local recv op refers to the chunk arriving from prevRank, while this
     // send op writes its own source chunk to nextRank at srcOffset.
     ipc.dstOffsetBytes = srcOffset;
-    ipc.bytes = sendOp->count * getFlagcxDataTypeSize(sendOp->datatype);
+    FLAGCXCHECK(checkedUniRunnerTypeBytes(sendOp->count, 1, sendOp->datatype,
+                                          &ipc.bytes));
     ipc.srcBufferType = srcBufferType;
     ipc.peerLocalRank = peerLocalRank;
+    if (readySlot == std::numeric_limits<uint32_t>::max()) {
+      return flagcxInvalidArgument;
+    }
     ipc.readySlot = readySlot++;
     ipc.parentFlagsOffset = 0;
     ipc.triggerIdx = -1;
@@ -2183,8 +2331,7 @@ static flagcxResult_t buildUniRunnerStateRingRS(
   } else if (nranks == 1) {
     // For single rank, do local cpy if out-of-place, otherwise no-op
     if (count > 0 && sendbuff != recvbuff) {
-      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
-                               sizeof(struct uniRunnerDagNode)));
+      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, 1));
       if (runnerState->dagNodes == NULL) {
         return flagcxSystemError;
       }
@@ -2206,13 +2353,8 @@ static flagcxResult_t buildUniRunnerStateRingRS(
   }
 
   if (runnerState->uniRunnerNRedSlices == 0) {
-    if (count <= 0 || runnerState->uniRunnerRedSliceSize == 0) {
-      runnerState->uniRunnerNRedSlices = 1;
-    } else {
-      runnerState->uniRunnerNRedSlices =
-          ceil((float)count / comm->nranks / runnerState->uniRunnerNSlices /
-               runnerState->uniRunnerRedSliceSize);
-    }
+    FLAGCXCHECK(
+        setEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks));
     TRACE(FLAGCX_UNIRUNNER, "uniRunnerNRedSlices auto set to %lu",
           runnerState->uniRunnerNRedSlices);
   }
@@ -2224,20 +2366,26 @@ static flagcxResult_t buildUniRunnerStateRingRS(
         "numRedSlices=%d",
         comm->rank, count, numSlices, numRedSlices);
 
-  int nextRank = (rank + 1) % nranks;
-  int prevRank = (rank - 1 + nranks) % nranks;
+  int nextRank = positiveModulo(static_cast<int64_t>(rank) + 1, nranks);
+  int prevRank = positiveModulo(static_cast<int64_t>(rank) - 1, nranks);
   size_t typeSize = getFlagcxDataTypeSize(datatype);
   size_t baseRankChunkCount = count;
 
   // Nodes per slice chain:
   // (P2P + Reduce * numRedSlices) * (nranks - 1)
-  const int nodesPerSlice = (numRedSlices + 1) * (nranks - 1);
-  const int numNodes = numSlices * nodesPerSlice;
+  int nodesPerStep = 0;
+  FLAGCXCHECK(
+      checkedUniRunnerDagNodeCount(1, numRedSlices, 1, &nodesPerStep));
+  int nodesPerSlice = 0;
+  FLAGCXCHECK(checkedUniRunnerDagNodeCount(nodesPerStep, nranks - 1, 0,
+                                           &nodesPerSlice));
+  int numNodes = 0;
+  FLAGCXCHECK(checkedUniRunnerDagNodeCount(numSlices, nodesPerSlice, 0,
+                                           &numNodes));
 
   runnerState->numDagNodes = numNodes;
-  FLAGCXCHECK(
-      flagcxCalloc(&runnerState->dagNodes,
-                   runnerState->numDagNodes * sizeof(struct uniRunnerDagNode)));
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                           runnerState->numDagNodes));
   if (runnerState->dagNodes == NULL) {
     return flagcxSystemError;
   }
@@ -2256,12 +2404,13 @@ static flagcxResult_t buildUniRunnerStateRingRS(
       runnerState->dagNodes[p2pNodeIdx].nodeIdx = p2pNodeIdx;
       runnerState->dagNodes[p2pNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
       runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.numOps = 2;
-      FLAGCXCHECK(
-          flagcxCalloc(&runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops,
-                       2 * sizeof(struct uniRunnerP2pOpData)));
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[p2pNodeIdx].nodeData.p2p.ops, 2));
 
-      int txChunk = (rank - i - 1 + nranks) % nranks;
-      int rxChunk = (rank - i - 2 + nranks) % nranks;
+      int txChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i - 1, nranks);
+      int rxChunk =
+          positiveModulo(static_cast<int64_t>(rank) - i - 2, nranks);
 
       size_t txRankChunkCount = baseRankChunkCount;
       size_t rxRankChunkCount = baseRankChunkCount;
@@ -2454,15 +2603,17 @@ static flagcxResult_t buildUniRunnerStateTreeRed(
     flagcxRedOp_t op, int root, flagcxComm_t comm) {
   int rank = comm->rank;
   int nranks = comm->nranks;
-  int algoRank = (rank - root + nranks) % nranks; // Rotate ranks so root is 0
 
-  if (nranks < 1) {
+  if (nranks < 1 || rank < 0 || rank >= nranks || root < 0 ||
+      root >= nranks) {
     return flagcxInvalidArgument;
-  } else if (nranks == 1) {
+  }
+  int algoRank = positiveModulo(static_cast<int64_t>(rank) - root,
+                                nranks); // Rotate ranks so root is 0
+  if (nranks == 1) {
     // For single rank, do local cpy if out-of-place, otherwise no-op
     if (count > 0 && sendbuff != recvbuff) {
-      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
-                               sizeof(struct uniRunnerDagNode)));
+      FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, 1));
       if (runnerState->dagNodes == NULL) {
         return flagcxSystemError;
       }
@@ -2484,13 +2635,8 @@ static flagcxResult_t buildUniRunnerStateTreeRed(
   }
 
   if (runnerState->uniRunnerNRedSlices == 0) {
-    if (count <= 0 || runnerState->uniRunnerRedSliceSize == 0) {
-      runnerState->uniRunnerNRedSlices = 1;
-    } else {
-      runnerState->uniRunnerNRedSlices =
-          ceil((float)count / comm->nranks / runnerState->uniRunnerNSlices /
-               runnerState->uniRunnerRedSliceSize);
-    }
+    FLAGCXCHECK(
+        setEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks));
     TRACE(FLAGCX_UNIRUNNER, "uniRunnerNRedSlices auto set to %lu",
           runnerState->uniRunnerNRedSlices);
   }
@@ -2513,10 +2659,17 @@ static flagcxResult_t buildUniRunnerStateTreeRed(
           rank, algoRank, recvNodesPerSlice, __builtin_ctz(algoRank));
   }
   const int sendNodesPerSlice = algoRank ? 1 : 0;
-  const int redNodesPerSlice = recvNodesPerSlice * numRedSlices;
-  const int nodesPerSlice =
-      sendNodesPerSlice + recvNodesPerSlice + redNodesPerSlice;
-  const int numNodes = nodesPerSlice * numSlices;
+  int redNodesPerSlice = 0;
+  FLAGCXCHECK(checkedUniRunnerDagNodeCount(
+      recvNodesPerSlice, numRedSlices, 0, &redNodesPerSlice));
+  int nodesPerSlice = 0;
+  FLAGCXCHECK(checkedUniRunnerDagNodeCount(
+      1, redNodesPerSlice,
+      static_cast<size_t>(sendNodesPerSlice) + recvNodesPerSlice,
+      &nodesPerSlice));
+  int numNodes = 0;
+  FLAGCXCHECK(checkedUniRunnerDagNodeCount(numSlices, nodesPerSlice, 0,
+                                           &numNodes));
 
   TRACE(FLAGCX_UNIRUNNER,
         "rank %d (algoRank %d) initUniRunnerStateTreeReduce called, count=%lu, "
@@ -2525,9 +2678,8 @@ static flagcxResult_t buildUniRunnerStateTreeRed(
         sendNodesPerSlice);
 
   runnerState->numDagNodes = numNodes;
-  FLAGCXCHECK(
-      flagcxCalloc(&runnerState->dagNodes,
-                   runnerState->numDagNodes * sizeof(struct uniRunnerDagNode)));
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                           runnerState->numDagNodes));
   if (runnerState->dagNodes == NULL) {
     return flagcxSystemError;
   }
@@ -2559,13 +2711,13 @@ static flagcxResult_t buildUniRunnerStateTreeRed(
       runnerState->dagNodes[recvNodeIdx].nodeIdx = recvNodeIdx;
       runnerState->dagNodes[recvNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
       runnerState->dagNodes[recvNodeIdx].nodeData.p2p.numOps = 1;
-      FLAGCXCHECK(
-          flagcxCalloc(&runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops,
-                       runnerState->dagNodes[recvNodeIdx].nodeData.p2p.numOps *
-                           sizeof(struct uniRunnerP2pOpData)));
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops,
+          runnerState->dagNodes[recvNodeIdx].nodeData.p2p.numOps));
 
       // Recv Node
-      int peer = (rank + (1 << i)) % nranks;
+      int peer = positiveModulo(
+          static_cast<int64_t>(rank) + (int64_t{1} << i), nranks);
       runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimRecv;
       runnerState->dagNodes[recvNodeIdx].nodeData.p2p.ops[0].peerRank = peer;
@@ -2688,12 +2840,14 @@ static flagcxResult_t buildUniRunnerStateTreeRed(
       runnerState->dagNodes[sendNodeIdx].nodeIdx = sendNodeIdx;
       runnerState->dagNodes[sendNodeIdx].nodeType = uniRunnerDagNodeTypeP2p;
       runnerState->dagNodes[sendNodeIdx].nodeData.p2p.numOps = 1;
-      FLAGCXCHECK(
-          flagcxCalloc(&runnerState->dagNodes[sendNodeIdx].nodeData.p2p.ops,
-                       runnerState->dagNodes[sendNodeIdx].nodeData.p2p.numOps *
-                           sizeof(struct uniRunnerP2pOpData)));
+      FLAGCXCHECK(flagcxCalloc(
+          &runnerState->dagNodes[sendNodeIdx].nodeData.p2p.ops,
+          runnerState->dagNodes[sendNodeIdx].nodeData.p2p.numOps));
 
-      int peer = (rank - (1 << (__builtin_ctz(algoRank))) + nranks) % nranks;
+      int peer = positiveModulo(
+          static_cast<int64_t>(rank) -
+              (int64_t{1} << __builtin_ctz(algoRank)),
+          nranks);
 
       runnerState->dagNodes[sendNodeIdx].nodeData.p2p.ops[0].type =
           flagcxDevicePrimSend;
@@ -2855,6 +3009,18 @@ static flagcxResult_t
 materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
                                 const uniRunnerDagTemplate &dagTemplate,
                                 const uniRunnerDagRuntimeBindings &bindings) {
+  const size_t maxInt =
+      static_cast<size_t>(std::numeric_limits<int>::max());
+  if (dagTemplate.nodes.size() > maxInt) {
+    return flagcxInvalidArgument;
+  }
+  for (const uniRunnerDagNodeDesc &node : dagTemplate.nodes) {
+    if (node.parents.size() > maxInt || node.children.size() > maxInt ||
+        node.p2pOps.size() > maxInt) {
+      return flagcxInvalidArgument;
+    }
+  }
+
   resetDagSchedulerRuntimeState(runnerState);
   runnerState->numDagNodes = static_cast<int>(dagTemplate.nodes.size());
   if (runnerState->numDagNodes == 0) {
@@ -2862,9 +3028,8 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
     return flagcxSuccess;
   }
 
-  FLAGCXCHECK(
-      flagcxCalloc(&runnerState->dagNodes,
-                   runnerState->numDagNodes * sizeof(struct uniRunnerDagNode)));
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes,
+                           runnerState->numDagNodes));
   if (runnerState->dagNodes == NULL) {
     return flagcxSystemError;
   }
@@ -2888,9 +3053,8 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
     if (dst->nodeType == uniRunnerDagNodeTypeP2p) {
       dst->nodeData.p2p.numOps = static_cast<int>(src.p2pOps.size());
       if (dst->nodeData.p2p.numOps > 0) {
-        FLAGCXCHECK(flagcxCalloc(&dst->nodeData.p2p.ops,
-                                 dst->nodeData.p2p.numOps *
-                                     sizeof(struct uniRunnerP2pOpData)));
+        FLAGCXCHECK(
+            flagcxCalloc(&dst->nodeData.p2p.ops, dst->nodeData.p2p.numOps));
       }
       for (int opIdx = 0; opIdx < dst->nodeData.p2p.numOps; opIdx++) {
         const uniRunnerDagP2pOpDesc &srcOp = src.p2pOps[opIdx];
@@ -2899,15 +3063,22 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
         dstOp->peerRank = srcOp.peerRank;
         dstOp->datatype = srcOp.datatype;
         dstOp->type = srcOp.type;
-        FLAGCXCHECK(resolveBufferRef(srcOp.buffer, bindings, &dstOp->addr));
+        size_t opBytes = 0;
+        FLAGCXCHECK(checkedUniRunnerTypeBytes(srcOp.count, 1, srcOp.datatype,
+                                              &opBytes));
+        FLAGCXCHECK(
+            resolveBufferRef(srcOp.buffer, bindings, opBytes, &dstOp->addr));
       }
     } else if (dst->nodeType == uniRunnerDagNodeTypeRed) {
       dst->nodeData.red.triggerIdx = -1;
-      FLAGCXCHECK(resolveBufferRef(src.red.input1, bindings,
+      size_t opBytes = 0;
+      FLAGCXCHECK(checkedUniRunnerTypeBytes(src.red.count, 1,
+                                            src.red.datatype, &opBytes));
+      FLAGCXCHECK(resolveBufferRef(src.red.input1, bindings, opBytes,
                                    &dst->nodeData.red.input1));
-      FLAGCXCHECK(resolveBufferRef(src.red.input2, bindings,
+      FLAGCXCHECK(resolveBufferRef(src.red.input2, bindings, opBytes,
                                    &dst->nodeData.red.input2));
-      FLAGCXCHECK(resolveBufferRef(src.red.output, bindings,
+      FLAGCXCHECK(resolveBufferRef(src.red.output, bindings, opBytes,
                                    &dst->nodeData.red.output));
       dst->nodeData.red.count = src.red.count;
       // The reduce kernel uses nthreads as its per-trigger loop stride, so it
@@ -2918,10 +3089,13 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
       dst->nodeData.red.datatype = src.red.datatype;
       dst->nodeData.red.redOp = src.red.redOp;
     } else if (dst->nodeType == uniRunnerDagNodeTypeCpy) {
-      FLAGCXCHECK(
-          resolveBufferRef(src.cpy.src, bindings, &dst->nodeData.cpy.src));
-      FLAGCXCHECK(
-          resolveBufferRef(src.cpy.dst, bindings, &dst->nodeData.cpy.dst));
+      size_t opBytes = 0;
+      FLAGCXCHECK(checkedUniRunnerTypeBytes(src.cpy.count, 1,
+                                            src.cpy.datatype, &opBytes));
+      FLAGCXCHECK(resolveBufferRef(src.cpy.src, bindings, opBytes,
+                                   &dst->nodeData.cpy.src));
+      FLAGCXCHECK(resolveBufferRef(src.cpy.dst, bindings, opBytes,
+                                   &dst->nodeData.cpy.dst));
       dst->nodeData.cpy.count = src.cpy.count;
       dst->nodeData.cpy.datatype = src.cpy.datatype;
     } else {
@@ -3055,12 +3229,12 @@ flagcxResult_t initUniRunnerStateLocRed(flagcxUniRunnerState *runnerState,
                                         size_t count, flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm) {
   setUniRunnerAvgDivisor(runnerState, op, 2);
-  size_t typeSize = getFlagcxDataTypeSize(datatype);
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
   bindings.outputBase = recvbuff;
-  bindings.inputBytes = count * typeSize;
-  bindings.outputBytes = count * typeSize;
+  FLAGCXCHECK(
+      checkedUniRunnerTypeBytes(count, 1, datatype, &bindings.inputBytes));
+  bindings.outputBytes = bindings.inputBytes;
 
   uniRunnerDagAlgorithmConfig algorithmConfig{};
   algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
@@ -3082,12 +3256,15 @@ flagcxResult_t initUniRunnerStateGroupedAG(flagcxUniRunnerState *runnerState,
                                            flagcxDataType_t datatype,
                                            flagcxComm_t comm, int groupSize) {
   runnerState->avgDivisor = 1;
-  size_t typeSize = getFlagcxDataTypeSize(datatype);
+  const size_t typeSize = getFlagcxDataTypeSize(datatype);
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
   bindings.outputBase = recvbuff;
-  bindings.inputBytes = count * typeSize;
-  bindings.outputBytes = count * comm->nranks * typeSize;
+  FLAGCXCHECK(
+      checkedUniRunnerTypeBytes(count, 1, datatype, &bindings.inputBytes));
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(
+      count, static_cast<size_t>(comm->nranks), datatype,
+      &bindings.outputBytes));
 
   uniRunnerDagAlgorithmConfig algorithmConfig{};
   algorithmConfig.groupSize = static_cast<uint64_t>(groupSize);
@@ -3111,12 +3288,12 @@ flagcxResult_t initUniRunnerStateRingAG(flagcxUniRunnerState *runnerState,
                                         size_t count, flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm) {
   runnerState->avgDivisor = 1;
-  size_t typeSize = getFlagcxDataTypeSize(datatype);
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
   bindings.outputBase = recvbuff;
-  bindings.inputBytes = count * typeSize;
-  bindings.outputBytes = count * typeSize;
+  FLAGCXCHECK(
+      checkedUniRunnerTypeBytes(count, 1, datatype, &bindings.inputBytes));
+  bindings.outputBytes = bindings.inputBytes;
 
   uniRunnerDagAlgorithmConfig algorithmConfig{};
   algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
@@ -3137,12 +3314,12 @@ flagcxResult_t initUniRunnerStateRingAR(flagcxUniRunnerState *runnerState,
                                         size_t count, flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm) {
   setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
-  size_t typeSize = getFlagcxDataTypeSize(datatype);
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
   bindings.outputBase = recvbuff;
-  bindings.inputBytes = count * typeSize;
-  bindings.outputBytes = count * typeSize;
+  FLAGCXCHECK(
+      checkedUniRunnerTypeBytes(count, 1, datatype, &bindings.inputBytes));
+  bindings.outputBytes = bindings.inputBytes;
 
   uniRunnerDagAlgorithmConfig algorithmConfig{};
   algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
@@ -3164,15 +3341,15 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
                                           flagcxDataType_t datatype,
                                           flagcxRedOp_t op, flagcxComm_t comm) {
   setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
-  size_t typeSize = getFlagcxDataTypeSize(datatype);
-  runnerState->uniRunnerNRedSlices =
-      resolveEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
+  FLAGCXCHECK(
+      setEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks));
 
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
   bindings.outputBase = recvbuff;
-  bindings.inputBytes = count * typeSize;
-  bindings.outputBytes = count * typeSize;
+  FLAGCXCHECK(
+      checkedUniRunnerTypeBytes(count, 1, datatype, &bindings.inputBytes));
+  bindings.outputBytes = bindings.inputBytes;
 
   uniRunnerDagAlgorithmConfig algorithmConfig{};
   algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
@@ -3200,8 +3377,10 @@ flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
     WARN("UniRunner IPCCHUNKSIZE must be a positive multiple of 16 bytes");
     return flagcxInvalidArgument;
   }
-  runnerState->uniRunnerNRedSlices =
-      resolveEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
+  FLAGCXCHECK(
+      setEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks));
+  size_t bytes = 0;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(count, 1, datatype, &bytes));
   // IPC nodes carry runtime Window/DevMem bindings and therefore intentionally
   // bypass the static JSON DAG cache. The underlying SlicedAR topology remains
   // unchanged and all existing cached algorithms are preserved.
@@ -3209,7 +3388,6 @@ flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
                                        datatype, op, comm));
   if (runnerState->ipcReadySlots == 0)
     return flagcxSuccess;
-  size_t bytes = count * getFlagcxDataTypeSize(datatype);
   FLAGCXCHECK(ensureUniRunnerIpcDataViews(runnerState, comm, sendbuff,
                                           recvbuff, bytes));
   return ensureUniRunnerIpcReadyStorage(runnerState, comm,
@@ -3222,17 +3400,20 @@ flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         flagcxDataType_t datatype,
                                         flagcxRedOp_t op, flagcxComm_t comm) {
   setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
-  size_t typeSize = getFlagcxDataTypeSize(datatype);
-  runnerState->uniRunnerNRedSlices =
-      resolveEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
+  const size_t typeSize = getFlagcxDataTypeSize(datatype);
+  FLAGCXCHECK(
+      setEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks));
 
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
   bindings.outputBase = recvbuff;
   bindings.scratchBase = scratchbuff;
-  bindings.inputBytes = count * comm->nranks * typeSize;
-  bindings.outputBytes = count * typeSize;
-  bindings.scratchBytes = count * comm->nranks * typeSize;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(
+      count, static_cast<size_t>(comm->nranks), datatype,
+      &bindings.inputBytes));
+  FLAGCXCHECK(
+      checkedUniRunnerTypeBytes(count, 1, datatype, &bindings.outputBytes));
+  bindings.scratchBytes = bindings.inputBytes;
 
   uniRunnerDagAlgorithmConfig algorithmConfig{};
   algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
@@ -3258,17 +3439,18 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
                                          flagcxRedOp_t op, int root,
                                          flagcxComm_t comm) {
   setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
-  size_t typeSize = getFlagcxDataTypeSize(datatype);
-  runnerState->uniRunnerNRedSlices =
-      resolveEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks);
+  FLAGCXCHECK(
+      setEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks));
 
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
   bindings.outputBase = recvbuff;
   bindings.scratchBase = scratchbuff;
-  bindings.inputBytes = count * typeSize;
-  bindings.outputBytes = count * typeSize;
-  bindings.scratchBytes = 2 * count * typeSize;
+  FLAGCXCHECK(
+      checkedUniRunnerTypeBytes(count, 1, datatype, &bindings.inputBytes));
+  bindings.outputBytes = bindings.inputBytes;
+  FLAGCXCHECK(
+      checkedUniRunnerTypeBytes(count, 2, datatype, &bindings.scratchBytes));
 
   uniRunnerDagAlgorithmConfig algorithmConfig{};
   algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
@@ -3362,10 +3544,13 @@ static flagcxResult_t launchP2pOps(flagcxUniRunnerState *runnerState,
     }
 
     // Launch copy
+    size_t copyBytes = 0;
+    FLAGCXCHECK(checkedUniRunnerTypeBytes(
+        current->nodeData.cpy.count, 1, current->nodeData.cpy.datatype,
+        &copyBytes));
     FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
         current->nodeData.cpy.dst, current->nodeData.cpy.src,
-        current->nodeData.cpy.count *
-            getFlagcxDataTypeSize(current->nodeData.cpy.datatype),
+        copyBytes,
         flagcxMemcpyDeviceToDevice, runnerState->cpyStream, NULL));
 
     // Write flag to stream
@@ -3492,6 +3677,10 @@ static flagcxResult_t ensureUniRunnerIpcReadyStorage(
     size_t requiredSlots) {
   if (requiredSlots == 0)
     return flagcxSuccess;
+  if (requiredSlots >
+      std::numeric_limits<size_t>::max() / sizeof(uint64_t)) {
+    return flagcxInvalidArgument;
+  }
   if (runnerState->ipcReadyMem != NULL &&
       runnerState->ipcReadyCapacity >= requiredSlots) {
     return flagcxSuccess;
@@ -3549,7 +3738,30 @@ static flagcxResult_t prepareUniRunnerIpcParentFlags(
     runnerState->ipcParentFlagsCount = 0;
   }
 
+  size_t numParentFlags = 0;
+  for (int nodeIdx = 0; nodeIdx < runnerState->numDagNodes; ++nodeIdx) {
+    const uniRunnerDagNode *node = &runnerState->dagNodes[nodeIdx];
+    if (node->nodeType != uniRunnerDagNodeTypeIpc)
+      continue;
+    if (node->numParents < 0 ||
+        static_cast<size_t>(node->numParents) >
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max()) -
+                numParentFlags) {
+      return flagcxInvalidArgument;
+    }
+    numParentFlags += static_cast<size_t>(node->numParents);
+  }
+  if (numParentFlags >
+      std::numeric_limits<size_t>::max() / sizeof(uint64_t)) {
+    return flagcxInvalidArgument;
+  }
+
   std::vector<uint64_t> parentFlags;
+  try {
+    parentFlags.reserve(numParentFlags);
+  } catch (...) {
+    return flagcxSystemError;
+  }
   for (int nodeIdx = 0; nodeIdx < runnerState->numDagNodes; ++nodeIdx) {
     uniRunnerDagNode *node = &runnerState->dagNodes[nodeIdx];
     if (node->nodeType != uniRunnerDagNodeTypeIpc)
@@ -3658,13 +3870,13 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->streamFlagsSize = 0;
   runnerState->ipcReadySlots = 0;
 
-  runnerState->uniRunnerNSlices = flagcxParamUniRunnerNSlices();
+  FLAGCXCHECK(loadUniRunnerDagBuilderConfig(
+      &runnerState->uniRunnerNSlices, &runnerState->uniRunnerNRedSlices,
+      &runnerState->uniRunnerRedSliceSize));
   FLAGCXCHECK(loadUniRunnerLaunchConfig(
       &runnerState->uniRunnerNThreads, &runnerState->uniRunnerNRedBlocks,
       &runnerState->uniRunnerNIpcBlocks));
   runnerState->uniRunnerIpcChunkSize = flagcxParamUniRunnerIpcChunkSize();
-  runnerState->uniRunnerNRedSlices = flagcxParamUniRunnerNRedSlices();
-  runnerState->uniRunnerRedSliceSize = flagcxParamUniRunnerRedSliceSize();
   runnerState->avgDivisor = 1;
   // Set device context
   FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));

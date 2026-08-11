@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <string>
 
@@ -209,4 +210,76 @@ TEST(UniRunnerDagCache, MalformedDocumentsReturnFalseWithoutThrowing) {
   json["format_version"] = 18446744073709551615ull;
   EXPECT_NO_THROW(
       EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded)));
+}
+
+TEST(UniRunnerDagCache, RejectsUnsafeDagArraySizes) {
+  uniRunnerDagTemplate original;
+  original.key = makeCacheKey(0xfedcba9876543210ull);
+  Json json = uniRunnerSerializeDagTemplate(original);
+  uniRunnerDagTemplate decoded;
+
+  json["dag"]["num_nodes"] = 1;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  json = uniRunnerSerializeDagTemplate(original);
+  json["dag"]["num_nodes"] =
+      static_cast<uint64_t>(std::numeric_limits<int>::max()) + 1;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  json = uniRunnerSerializeDagTemplate(original);
+  json["dag"]["num_nodes"] = -1;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  json = uniRunnerSerializeDagTemplate(original);
+  json["dag"]["nodes"] = Json::object();
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+
+  json = uniRunnerSerializeDagTemplate(original);
+  json["key"]["count"] = -1;
+  EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded));
+}
+
+TEST(UniRunnerDagSizing, CheckedNodeCountRejectsIntOverflow) {
+  int nodeCount = -1;
+  const size_t maxInt =
+      static_cast<size_t>(std::numeric_limits<int>::max());
+
+  EXPECT_EQ(flagcxSuccess,
+            checkedUniRunnerDagNodeCount(0, maxInt, 0, &nodeCount));
+  EXPECT_EQ(0, nodeCount);
+  EXPECT_EQ(flagcxSuccess,
+            checkedUniRunnerDagNodeCount(1, maxInt, 0, &nodeCount));
+  EXPECT_EQ(std::numeric_limits<int>::max(), nodeCount);
+  EXPECT_EQ(flagcxSuccess,
+            checkedUniRunnerDagNodeCount(maxInt - 1, 1, 1, &nodeCount));
+  EXPECT_EQ(std::numeric_limits<int>::max(), nodeCount);
+
+  EXPECT_EQ(flagcxInvalidArgument,
+            checkedUniRunnerDagNodeCount(2, maxInt, 0, &nodeCount));
+  EXPECT_EQ(flagcxInvalidArgument,
+            checkedUniRunnerDagNodeCount(1, maxInt, 1, &nodeCount));
+  EXPECT_EQ(flagcxInvalidArgument,
+            checkedUniRunnerDagNodeCount(1, 0, maxInt + 1, &nodeCount));
+  EXPECT_EQ(flagcxInvalidArgument,
+            checkedUniRunnerDagNodeCount(1, 1, 0, nullptr));
+}
+
+TEST(UniRunnerDagSizing, CheckedTypeBytesRejectsSizeOverflow) {
+  size_t bytes = 0;
+  EXPECT_EQ(flagcxSuccess,
+            checkedUniRunnerTypeBytes(1024, 8, flagcxInt8, &bytes));
+  EXPECT_EQ(8192u, bytes);
+  EXPECT_EQ(flagcxInvalidArgument,
+            checkedUniRunnerTypeBytes(std::numeric_limits<size_t>::max(), 2,
+                                      flagcxInt8, &bytes));
+  EXPECT_EQ(flagcxInvalidArgument,
+            checkedUniRunnerTypeBytes(std::numeric_limits<size_t>::max(), 1,
+                                      flagcxFloat32, &bytes));
+  EXPECT_EQ(flagcxInvalidArgument,
+            checkedUniRunnerTypeBytes(1, 1, flagcxFloat32, nullptr));
+
+  size_t decodedSize = 0;
+  EXPECT_FALSE(uniRunnerDagSizeFromJson(Json(-1), &decodedSize));
+  EXPECT_TRUE(uniRunnerDagSizeFromJson(Json(0), &decodedSize));
+  EXPECT_EQ(0u, decodedSize);
 }
