@@ -22,6 +22,8 @@
 #define FLAG_IN_IDX 12
 #define FLAG_OUT_IDX 13
 #define STATIC_ABORT_IDX 14
+#define STATIC_IPC_ABORT_IDX 0
+#define STATIC_IPC_STATE_IDX 1
 
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxStreamFlagState
 loadStreamFlagState(uint64_t flagAddr) {
@@ -515,7 +517,7 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runReduceExecutor(void *fifoBuffer,
 }
 
 FLAGCX_DEVICE_INLINE_DECORATOR bool
-isStaticReduceAbortRequested(const uint64_t *abortFlag) {
+isStaticAbortRequested(const uint64_t *abortFlag) {
   return DeviceAPI::Atomic::load(
              const_cast<uint64_t *>(abortFlag),
              flagcxDeviceMemoryOrderAcquire) != 0;
@@ -536,17 +538,16 @@ FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticReduceAbort(
   FLAGCX_DEVICE_SYNC_THREADS();
 }
 
-FLAGCX_GLOBAL_DECORATOR void flagcxStaticReduceKernel(
+FLAGCX_DEVICE_INLINE_DECORATOR void runStaticReduceExecutor(
     flagcxReduceTrigger *triggers, uint64_t numTriggers,
-    const uint64_t *abortFlag, uint64_t avgDivisor) {
-  FLAGCX_SHARED uint64_t shm[16];
+    const uint64_t *abortFlag, uint64_t avgDivisor, uint64_t firstOrdinal,
+    uint64_t stride, uint64_t *shm) {
   const int tid = FLAGCX_THREAD_IDX_X;
-  const uint64_t stride = static_cast<uint64_t>(FLAGCX_GRID_DIM_X);
 
-  for (uint64_t ordinal = static_cast<uint64_t>(FLAGCX_BLOCK_IDX_X);
-       ordinal < numTriggers; ordinal += stride) {
+  for (uint64_t ordinal = firstOrdinal; ordinal < numTriggers;
+       ordinal += stride) {
     if (tid == 0) {
-      shm[STATIC_ABORT_IDX] = isStaticReduceAbortRequested(abortFlag) ? 1 : 0;
+      shm[STATIC_ABORT_IDX] = isStaticAbortRequested(abortFlag) ? 1 : 0;
       if (shm[STATIC_ABORT_IDX] == 0) {
         flagcxReduceTrigger *trigger = &triggers[ordinal];
         shm[FST_IDX] = trigger->getInput1();
@@ -583,7 +584,7 @@ FLAGCX_GLOBAL_DECORATOR void flagcxStaticReduceKernel(
       int backoff = 0;
       while (flagIn != 0 &&
              !isStreamFlagStateDone(loadStreamFlagState(flagIn))) {
-        if (isStaticReduceAbortRequested(abortFlag)) {
+        if (isStaticAbortRequested(abortFlag)) {
           shm[STATIC_ABORT_IDX] = 1;
           break;
         }
@@ -609,6 +610,16 @@ FLAGCX_GLOBAL_DECORATOR void flagcxStaticReduceKernel(
     }
     FLAGCX_DEVICE_SYNC_THREADS();
   }
+}
+
+FLAGCX_GLOBAL_DECORATOR void flagcxStaticReduceKernel(
+    flagcxReduceTrigger *triggers, uint64_t numTriggers,
+    const uint64_t *abortFlag, uint64_t avgDivisor) {
+  FLAGCX_SHARED uint64_t shm[16];
+  runStaticReduceExecutor(
+      triggers, numTriggers, abortFlag, avgDivisor,
+      static_cast<uint64_t>(FLAGCX_BLOCK_IDX_X),
+      static_cast<uint64_t>(FLAGCX_GRID_DIM_X), shm);
 }
 
 struct alignas(16) flagcxIpcVector128 {
@@ -653,6 +664,256 @@ copyIpcBytes(void *dst, const void *src, size_t bytes) {
   for (size_t i = vectorBytes + FLAGCX_THREAD_IDX_X; i < bytes;
        i += FLAGCX_BLOCK_DIM_X) {
     dstBytes[i] = srcBytes[i];
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticIpcAbort(
+    flagcxIpcTrigger *triggers, uint64_t numTriggers,
+    const flagcxDevMem &readyMem, uint64_t firstOrdinal,
+    uint64_t stride) {
+  if (FLAGCX_THREAD_IDX_X == 0) {
+    for (uint64_t ordinal = firstOrdinal; ordinal < numTriggers;
+         ordinal += stride) {
+      flagcxIpcTrigger *trigger = &triggers[ordinal];
+      // A peer may be blocked on any logical IPC node that this rank will no
+      // longer execute. Publish every owned epoch before recycling local
+      // state, so a one-sided abort cannot strand the remote static kernel.
+      uint64_t *remoteReady =
+          static_cast<uint64_t *>(flagcxGetIntraPointer(
+              readyMem, trigger->readySlot * sizeof(uint64_t),
+              static_cast<int>(trigger->peerLocalRank)));
+      DeviceAPI::Atomic::store(remoteReady, trigger->epoch,
+                               flagcxDeviceMemoryOrderRelease);
+      if (trigger->flagOut != 0) {
+        // This cleanup is deliberately idempotent. Future triggers can still
+        // be Idle when abort is observed, but their submitted stream waits
+        // must be released just like Pending triggers.
+        DeviceAPI::Atomic::store(
+            reinterpret_cast<uint64_t *>(trigger->flagOut),
+            static_cast<uint64_t>(flagcxStreamFlagDone),
+            flagcxDeviceMemoryOrderRelease);
+      }
+      DeviceAPI::Atomic::store(
+          &trigger->state,
+          static_cast<uint32_t>(flagcxReduceTriggerAvailable),
+          flagcxDeviceMemoryOrderRelease);
+    }
+  }
+  FLAGCX_DEVICE_SYNC_THREADS();
+}
+
+// Static IPC keeps a flat logical-trigger array in topological order. Every
+// IPC block advances that array in lockstep, while chunk c is permanently
+// assigned to local IPC block c % numIpcBlocks. The per-trigger state and
+// completedChunks fields form software phase gates; no grid barrier or
+// dynamic chunk claim is needed.
+FLAGCX_DEVICE_INLINE_DECORATOR void runStaticIpcExecutor(
+    flagcxIpcTrigger *triggers, uint64_t numTriggers,
+    const flagcxDevMem &inputMem, const flagcxDevMem &outputMem,
+    const flagcxDevMem &readyMem, const uint64_t *parentFlags,
+    uint64_t localBlockIdx, uint64_t numIpcBlocks,
+    const uint64_t *abortFlag, uint64_t *shm) {
+  for (uint64_t ordinal = 0; ordinal < numTriggers; ++ordinal) {
+    flagcxIpcTrigger *trigger = &triggers[ordinal];
+    const bool leader = ordinal % numIpcBlocks == localBlockIdx;
+
+    if (FLAGCX_THREAD_IDX_X == 0) {
+      shm[STATIC_IPC_ABORT_IDX] = isStaticAbortRequested(abortFlag) ? 1 : 0;
+      shm[STATIC_IPC_STATE_IDX] = DeviceAPI::Atomic::load(
+          &trigger->state, flagcxDeviceMemoryOrderAcquire);
+      if (shm[STATIC_IPC_ABORT_IDX] == 0 && leader &&
+          shm[STATIC_IPC_STATE_IDX] == flagcxReduceTriggerEnqueued) {
+        if (trigger->flagOut != 0 &&
+            loadStreamFlagState(trigger->flagOut) == flagcxStreamFlagIdle) {
+          DeviceAPI::Atomic::store(
+              reinterpret_cast<uint64_t *>(trigger->flagOut),
+              static_cast<uint64_t>(flagcxStreamFlagPend),
+              flagcxDeviceMemoryOrderRelease);
+        }
+
+        for (uint32_t parent = 0; parent < trigger->numParentFlags;
+             ++parent) {
+          const uint64_t flagAddr =
+              parentFlags[trigger->parentFlagsOffset + parent];
+          int backoff = 0;
+          while (!isStreamFlagStateDone(loadStreamFlagState(flagAddr))) {
+            if (isStaticAbortRequested(abortFlag)) {
+              shm[STATIC_IPC_ABORT_IDX] = 1;
+              break;
+            }
+            DeviceAPI::Intrin::spinBackoff(backoff++);
+          }
+          if (shm[STATIC_IPC_ABORT_IDX] != 0) {
+            break;
+          }
+        }
+        if (shm[STATIC_IPC_ABORT_IDX] == 0) {
+          DeviceAPI::Atomic::store(
+              &trigger->state,
+              static_cast<uint32_t>(flagcxReduceTriggerInprogress),
+              flagcxDeviceMemoryOrderRelease);
+          shm[STATIC_IPC_STATE_IDX] = flagcxReduceTriggerInprogress;
+        }
+      }
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+    if (shm[STATIC_IPC_ABORT_IDX] != 0) {
+      publishStaticIpcAbort(triggers, numTriggers, readyMem,
+                            localBlockIdx, numIpcBlocks);
+      return;
+    }
+
+    if (!leader) {
+      if (FLAGCX_THREAD_IDX_X == 0) {
+        int backoff = 0;
+        while (shm[STATIC_IPC_STATE_IDX] ==
+               flagcxReduceTriggerEnqueued) {
+          if (isStaticAbortRequested(abortFlag)) {
+            shm[STATIC_IPC_ABORT_IDX] = 1;
+            break;
+          }
+          shm[STATIC_IPC_STATE_IDX] = DeviceAPI::Atomic::load(
+              &trigger->state, flagcxDeviceMemoryOrderAcquire);
+          DeviceAPI::Intrin::spinBackoff(backoff++);
+        }
+      }
+      FLAGCX_DEVICE_SYNC_THREADS();
+      if (shm[STATIC_IPC_ABORT_IDX] != 0) {
+        publishStaticIpcAbort(triggers, numTriggers, readyMem,
+                              localBlockIdx, numIpcBlocks);
+        return;
+      }
+    }
+
+    // A zero-work block can observe Available if the leader completes this
+    // trigger before it observes the intermediate Inprogress state.
+    if (shm[STATIC_IPC_STATE_IDX] == flagcxReduceTriggerAvailable) {
+      continue;
+    }
+
+    uint32_t localCompletedChunks = 0;
+    for (uint64_t chunk = localBlockIdx; chunk < trigger->numChunks;
+         chunk += numIpcBlocks) {
+      if (FLAGCX_THREAD_IDX_X == 0) {
+        shm[STATIC_IPC_ABORT_IDX] =
+            isStaticAbortRequested(abortFlag) ? 1 : 0;
+      }
+      FLAGCX_DEVICE_SYNC_THREADS();
+      if (shm[STATIC_IPC_ABORT_IDX] != 0) {
+        break;
+      }
+
+      const uint64_t chunkOffset = chunk * trigger->chunkSize;
+      uint64_t chunkBytes = trigger->bytes - chunkOffset;
+      if (chunkBytes > trigger->chunkSize) {
+        chunkBytes = trigger->chunkSize;
+      }
+      const flagcxDevMem &srcMem =
+          trigger->srcBufferType == flagcxIpcBufferInput ? inputMem
+                                                          : outputMem;
+      const void *src = flagcxGetLocalPointer(
+          srcMem, trigger->srcOffsetBytes + chunkOffset);
+      void *remoteDst = flagcxGetIntraPointer(
+          outputMem, trigger->dstOffsetBytes + chunkOffset,
+          static_cast<int>(trigger->peerLocalRank));
+      copyIpcBytes(remoteDst, src, static_cast<size_t>(chunkBytes));
+      FLAGCX_DEVICE_SYNC_THREADS();
+      ++localCompletedChunks;
+    }
+
+    if (shm[STATIC_IPC_ABORT_IDX] != 0) {
+      publishStaticIpcAbort(triggers, numTriggers, readyMem,
+                            localBlockIdx, numIpcBlocks);
+      return;
+    }
+    if (localCompletedChunks != 0) {
+      // Aggregate this block's statically owned chunks with one atomic after
+      // every copy thread has made all of its peer stores system-visible.
+      DeviceAPI::Intrin::threadfenceSystem();
+      FLAGCX_DEVICE_SYNC_THREADS();
+      if (FLAGCX_THREAD_IDX_X == 0) {
+        DeviceAPI::Atomic::fetchAdd(
+            &trigger->completedChunks, localCompletedChunks,
+            flagcxDeviceMemoryOrderAcqRel);
+      }
+      FLAGCX_DEVICE_SYNC_THREADS();
+    }
+
+    if (leader) {
+      if (FLAGCX_THREAD_IDX_X == 0) {
+        int backoff = 0;
+        while (DeviceAPI::Atomic::load(
+                   &trigger->completedChunks,
+                   flagcxDeviceMemoryOrderAcquire) != trigger->numChunks) {
+          if (isStaticAbortRequested(abortFlag)) {
+            shm[STATIC_IPC_ABORT_IDX] = 1;
+            break;
+          }
+          DeviceAPI::Intrin::spinBackoff(backoff++);
+        }
+        if (shm[STATIC_IPC_ABORT_IDX] == 0) {
+          uint64_t *remoteReady =
+              static_cast<uint64_t *>(flagcxGetIntraPointer(
+                  readyMem, trigger->readySlot * sizeof(uint64_t),
+                  static_cast<int>(trigger->peerLocalRank)));
+          DeviceAPI::Atomic::store(remoteReady, trigger->epoch,
+                                   flagcxDeviceMemoryOrderRelease);
+
+          uint64_t *localReady =
+              static_cast<uint64_t *>(flagcxGetLocalPointer(
+                  readyMem, trigger->readySlot * sizeof(uint64_t)));
+          backoff = 0;
+          while (!flagcxIpcEpochReached(
+              DeviceAPI::Atomic::load(localReady,
+                                      flagcxDeviceMemoryOrderAcquire),
+              trigger->epoch)) {
+            if (isStaticAbortRequested(abortFlag)) {
+              shm[STATIC_IPC_ABORT_IDX] = 1;
+              break;
+            }
+            DeviceAPI::Intrin::spinBackoff(backoff++);
+          }
+        }
+        if (shm[STATIC_IPC_ABORT_IDX] == 0) {
+          if (trigger->flagOut != 0) {
+            DeviceAPI::Atomic::store(
+                reinterpret_cast<uint64_t *>(trigger->flagOut),
+                static_cast<uint64_t>(flagcxStreamFlagDone),
+                flagcxDeviceMemoryOrderRelease);
+          }
+          DeviceAPI::Atomic::store(
+              &trigger->state,
+              static_cast<uint32_t>(flagcxReduceTriggerAvailable),
+              flagcxDeviceMemoryOrderRelease);
+        }
+      }
+      FLAGCX_DEVICE_SYNC_THREADS();
+      if (shm[STATIC_IPC_ABORT_IDX] != 0) {
+        publishStaticIpcAbort(triggers, numTriggers, readyMem,
+                              localBlockIdx, numIpcBlocks);
+        return;
+      }
+    } else {
+      if (FLAGCX_THREAD_IDX_X == 0) {
+        int backoff = 0;
+        while (DeviceAPI::Atomic::load(
+                   &trigger->state,
+                   flagcxDeviceMemoryOrderAcquire) !=
+               flagcxReduceTriggerAvailable) {
+          if (isStaticAbortRequested(abortFlag)) {
+            shm[STATIC_IPC_ABORT_IDX] = 1;
+            break;
+          }
+          DeviceAPI::Intrin::spinBackoff(backoff++);
+        }
+      }
+      FLAGCX_DEVICE_SYNC_THREADS();
+      if (shm[STATIC_IPC_ABORT_IDX] != 0) {
+        publishStaticIpcAbort(triggers, numTriggers, readyMem,
+                              localBlockIdx, numIpcBlocks);
+        return;
+      }
+    }
   }
 }
 
@@ -820,6 +1081,26 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(
   }
 }
 
+FLAGCX_GLOBAL_DECORATOR void flagcxStaticCollectiveKernel(
+    flagcxReduceTrigger *redTriggers, uint64_t numRedTriggers,
+    flagcxIpcTrigger *ipcTriggers, uint64_t numIpcTriggers,
+    flagcxDevMem inputMem, flagcxDevMem outputMem, flagcxDevMem readyMem,
+    const uint64_t *ipcParentFlags, uint64_t numRedBlocks,
+    uint64_t numIpcBlocks, const uint64_t *abortFlag,
+    uint64_t avgDivisor) {
+  FLAGCX_SHARED uint64_t shm[16];
+  const uint64_t globalBlock = static_cast<uint64_t>(FLAGCX_BLOCK_IDX_X);
+  if (globalBlock < numRedBlocks) {
+    runStaticReduceExecutor(redTriggers, numRedTriggers, abortFlag,
+                            avgDivisor, globalBlock, numRedBlocks, shm);
+  } else if (globalBlock < numRedBlocks + numIpcBlocks) {
+    runStaticIpcExecutor(ipcTriggers, numIpcTriggers, inputMem, outputMem,
+                         readyMem, ipcParentFlags,
+                         globalBlock - numRedBlocks, numIpcBlocks, abortFlag,
+                         shm);
+  }
+}
+
 flagcxResult_t flagcxLaunchCollectiveKernel(
     void *redFifoBuffer, void *ipcFifoBuffer, flagcxDevMem_t inputMem,
     flagcxDevMem_t outputMem, flagcxDevMem_t readyMem,
@@ -855,8 +1136,9 @@ flagcxResult_t flagcxLaunchCollectiveKernel(
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxGetStaticReduceKernelMaxExecutorBlocks(
-    size_t nthreads, size_t *maxExecutorBlocks) {
+static flagcxResult_t getStaticKernelMaxExecutorBlocks(
+    const void *kernel, const char *kernelName, size_t nthreads,
+    size_t *maxExecutorBlocks) {
   if (maxExecutorBlocks == nullptr) {
     return flagcxInvalidArgument;
   }
@@ -894,8 +1176,8 @@ flagcxResult_t flagcxGetStaticReduceKernelMaxExecutorBlocks(
     return flagcxInvalidArgument;
   }
   if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &activeBlocksPerSm, flagcxStaticReduceKernel,
-          static_cast<int>(nthreads), 0) != cudaSuccess) {
+          &activeBlocksPerSm, kernel, static_cast<int>(nthreads), 0) !=
+      cudaSuccess) {
     return flagcxUnhandledDeviceError;
   }
   if (activeBlocksPerSm < 0) {
@@ -907,14 +1189,28 @@ flagcxResult_t flagcxGetStaticReduceKernelMaxExecutorBlocks(
       static_cast<size_t>(smCount), static_cast<size_t>(activeBlocksPerSm),
       static_cast<size_t>(maxThreadsPerBlock), nthreads, maxExecutorBlocks);
   TRACE(FLAGCX_UNIRUNNER,
-        "static RED residency: device=%d cooperative=%d concurrent=%d "
+        "static %s residency: device=%d cooperative=%d concurrent=%d "
         "sms=%d active_per_sm=%d nthreads=%zu budget=%zu result=%d",
-        device, cooperativeLaunch, concurrentKernels, smCount,
+        kernelName, device, cooperativeLaunch, concurrentKernels, smCount,
         activeBlocksPerSm, nthreads, *maxExecutorBlocks, result);
   return result;
 #else
   return flagcxNotSupported;
 #endif
+}
+
+flagcxResult_t flagcxGetStaticReduceKernelMaxExecutorBlocks(
+    size_t nthreads, size_t *maxExecutorBlocks) {
+  return getStaticKernelMaxExecutorBlocks(
+      reinterpret_cast<const void *>(flagcxStaticReduceKernel), "RED",
+      nthreads, maxExecutorBlocks);
+}
+
+flagcxResult_t flagcxGetStaticCollectiveKernelMaxExecutorBlocks(
+    size_t nthreads, size_t *maxExecutorBlocks) {
+  return getStaticKernelMaxExecutorBlocks(
+      reinterpret_cast<const void *>(flagcxStaticCollectiveKernel),
+      "RED+IPC", nthreads, maxExecutorBlocks);
 }
 
 flagcxResult_t flagcxLaunchStaticReduceKernel(
@@ -944,6 +1240,88 @@ flagcxResult_t flagcxLaunchStaticReduceKernel(
   cudaError_t launchResult = cudaLaunchCooperativeKernel(
       reinterpret_cast<const void *>(flagcxStaticReduceKernel),
       dim3(static_cast<unsigned int>(nRedBlocks)),
+      dim3(static_cast<unsigned int>(nthreads)), args, 0,
+      *(FLAGCX_DEVICE_STREAM_PTR)stream);
+  return launchResult == cudaSuccess ? flagcxSuccess
+                                     : flagcxUnhandledDeviceError;
+#else
+  return flagcxNotSupported;
+#endif
+}
+
+flagcxResult_t flagcxLaunchStaticCollectiveKernel(
+    void *redFifoDeviceBuffer, size_t numRedTriggers,
+    void *ipcFifoDeviceBuffer, size_t numIpcTriggers,
+    flagcxDevMem_t inputMem, flagcxDevMem_t outputMem,
+    flagcxDevMem_t readyMem, const uint64_t *ipcParentFlags,
+    size_t nthreads, size_t nRedBlocks, size_t nIpcBlocks,
+    size_t maxExecutorBlocks, uint64_t avgDivisor, flagcxStream_t stream) {
+  const bool hasRed = numRedTriggers != 0;
+  const bool hasIpc = numIpcTriggers != 0;
+  if (!hasRed && !hasIpc) {
+    return nRedBlocks == 0 && nIpcBlocks == 0 ? flagcxSuccess
+                                              : flagcxInvalidArgument;
+  }
+
+  const size_t maxInt =
+      static_cast<size_t>(std::numeric_limits<int>::max());
+  if (stream == nullptr || nthreads == 0 || avgDivisor == 0 ||
+      (hasRed != (nRedBlocks != 0)) || (hasIpc != (nIpcBlocks != 0)) ||
+      (hasRed && (redFifoDeviceBuffer == nullptr ||
+                  nRedBlocks > numRedTriggers)) ||
+      (hasIpc && (ipcFifoDeviceBuffer == nullptr || inputMem == nullptr ||
+                  outputMem == nullptr || readyMem == nullptr)) ||
+      numRedTriggers > maxInt || numIpcTriggers > maxInt ||
+      nthreads > maxInt || nRedBlocks > maxInt || nIpcBlocks > maxInt ||
+      nRedBlocks > maxInt - nIpcBlocks || maxExecutorBlocks == 0 ||
+      maxExecutorBlocks > maxInt ||
+      nRedBlocks + nIpcBlocks > maxExecutorBlocks) {
+    return flagcxInvalidArgument;
+  }
+
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+  uint64_t *redWords = static_cast<uint64_t *>(redFifoDeviceBuffer);
+  uint64_t *ipcWords = static_cast<uint64_t *>(ipcFifoDeviceBuffer);
+  flagcxReduceTrigger *redTriggers =
+      hasRed ? reinterpret_cast<flagcxReduceTrigger *>(
+                   redWords + flagcxFifoIdxData)
+             : nullptr;
+  flagcxIpcTrigger *ipcTriggers =
+      hasIpc ? reinterpret_cast<flagcxIpcTrigger *>(
+                   ipcWords + flagcxFifoIdxData)
+             : nullptr;
+  uint64_t *abortFlag =
+      (hasIpc ? ipcWords : redWords) + flagcxFifoIdxTerminate;
+
+  flagcxDevMem input;
+  flagcxDevMem output;
+  flagcxDevMem ready;
+  if (hasIpc) {
+    input = flagcxDevMem(*inputMem);
+    output = flagcxDevMem(*outputMem);
+    ready = flagcxDevMem(*readyMem);
+  }
+
+  uint64_t numRedTriggers64 = static_cast<uint64_t>(numRedTriggers);
+  uint64_t numIpcTriggers64 = static_cast<uint64_t>(numIpcTriggers);
+  uint64_t numRedBlocks64 = static_cast<uint64_t>(nRedBlocks);
+  uint64_t numIpcBlocks64 = static_cast<uint64_t>(nIpcBlocks);
+  void *args[] = {&redTriggers,
+                  &numRedTriggers64,
+                  &ipcTriggers,
+                  &numIpcTriggers64,
+                  &input,
+                  &output,
+                  &ready,
+                  &ipcParentFlags,
+                  &numRedBlocks64,
+                  &numIpcBlocks64,
+                  &abortFlag,
+                  &avgDivisor};
+  const size_t nblocks = nRedBlocks + nIpcBlocks;
+  cudaError_t launchResult = cudaLaunchCooperativeKernel(
+      reinterpret_cast<const void *>(flagcxStaticCollectiveKernel),
+      dim3(static_cast<unsigned int>(nblocks)),
       dim3(static_cast<unsigned int>(nthreads)), args, 0,
       *(FLAGCX_DEVICE_STREAM_PTR)stream);
   return launchResult == cudaSuccess ? flagcxSuccess

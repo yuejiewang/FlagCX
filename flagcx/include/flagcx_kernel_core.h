@@ -41,7 +41,8 @@ typedef enum {
 
 // Unified buffer index enumeration for fifo
 // Layout: [capacity][consumed][produced][terminate][data...]
-// Note: flagcxFifoIdxTerminate is only used by flagcxReduceTrigger fifo
+// Dynamic execution uses the RED FIFO terminate word. Static RED+IPC
+// execution uses one selected FIFO terminate word as a common abort flag.
 typedef enum {
   flagcxFifoIdxCapacity = 0,
   flagcxFifoIdxConsumed = 1,
