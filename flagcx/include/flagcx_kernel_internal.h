@@ -51,6 +51,10 @@ typedef struct flagcxFifo *flagcxFifo_t;
 flagcxResult_t flagcxCheckedFifoAllocationSize(size_t capacity,
                                                size_t elementSize,
                                                size_t *bytes);
+flagcxResult_t resolveUniRunnerStaticExecutorResidencyBudget(
+    bool cooperativeLaunch, bool concurrentKernels, size_t smCount,
+    size_t activeBlocksPerSm, size_t maxThreadsPerBlock, size_t nthreads,
+    size_t *maxExecutorBlocks);
 
 FLAGCX_HOST_DECORATOR flagcxResult_t dequeue(void *fifoBuffer,
                                              flagcxDeviceTrigger_t trigger);
@@ -77,6 +81,9 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(
     flagcxDevMem outputMem, flagcxDevMem readyMem,
     const uint64_t *ipcParentFlags, int nRedBlocks, int nIpcBlocks,
     uint64_t avgDivisor);
+FLAGCX_GLOBAL_DECORATOR void flagcxStaticReduceKernel(
+    flagcxReduceTrigger *triggers, uint64_t numTriggers,
+    const uint64_t *abortFlag, uint64_t avgDivisor);
 #endif // COMPILE_KERNEL
 
 flagcxResult_t flagcxLaunchCollectiveKernel(
@@ -84,6 +91,11 @@ flagcxResult_t flagcxLaunchCollectiveKernel(
     flagcxDevMem_t outputMem, flagcxDevMem_t readyMem,
     const uint64_t *ipcParentFlags, size_t nthreads, size_t nRedBlocks,
     size_t nIpcBlocks, uint64_t avgDivisor, flagcxStream_t stream);
+flagcxResult_t flagcxGetStaticReduceKernelMaxExecutorBlocks(
+    size_t nthreads, size_t *maxExecutorBlocks);
+flagcxResult_t flagcxLaunchStaticReduceKernel(
+    void *redFifoDeviceBuffer, size_t numTriggers, size_t nthreads,
+    size_t nRedBlocks, uint64_t avgDivisor, flagcxStream_t stream);
 
 // ==========================================================================
 // Device Communicator — Host-side lifecycle management

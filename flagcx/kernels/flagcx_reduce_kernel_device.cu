@@ -21,6 +21,7 @@
 #define REDOP_IDX 11
 #define FLAG_IN_IDX 12
 #define FLAG_OUT_IDX 13
+#define STATIC_ABORT_IDX 14
 
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxStreamFlagState
 loadStreamFlagState(uint64_t flagAddr) {
@@ -513,6 +514,103 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runReduceExecutor(void *fifoBuffer,
   }
 }
 
+FLAGCX_DEVICE_INLINE_DECORATOR bool
+isStaticReduceAbortRequested(const uint64_t *abortFlag) {
+  return DeviceAPI::Atomic::load(
+             const_cast<uint64_t *>(abortFlag),
+             flagcxDeviceMemoryOrderAcquire) != 0;
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticReduceAbort(
+    flagcxReduceTrigger *triggers, uint64_t firstOrdinal,
+    uint64_t numTriggers, uint64_t stride) {
+  if (FLAGCX_THREAD_IDX_X == 0) {
+    for (uint64_t ordinal = firstOrdinal; ordinal < numTriggers;
+         ordinal += stride) {
+      // No reduction result is valid on this path. Publishing DONE is solely
+      // an error-unwind mechanism that releases already-submitted stream
+      // waits before the original host error is returned.
+      triggers[ordinal].setComplete();
+    }
+  }
+  FLAGCX_DEVICE_SYNC_THREADS();
+}
+
+FLAGCX_GLOBAL_DECORATOR void flagcxStaticReduceKernel(
+    flagcxReduceTrigger *triggers, uint64_t numTriggers,
+    const uint64_t *abortFlag, uint64_t avgDivisor) {
+  FLAGCX_SHARED uint64_t shm[16];
+  const int tid = FLAGCX_THREAD_IDX_X;
+  const uint64_t stride = static_cast<uint64_t>(FLAGCX_GRID_DIM_X);
+
+  for (uint64_t ordinal = static_cast<uint64_t>(FLAGCX_BLOCK_IDX_X);
+       ordinal < numTriggers; ordinal += stride) {
+    if (tid == 0) {
+      shm[STATIC_ABORT_IDX] = isStaticReduceAbortRequested(abortFlag) ? 1 : 0;
+      if (shm[STATIC_ABORT_IDX] == 0) {
+        flagcxReduceTrigger *trigger = &triggers[ordinal];
+        shm[FST_IDX] = trigger->getInput1();
+        shm[SND_IDX] = trigger->getInput2();
+        shm[OUT_IDX] = trigger->getOutput();
+        shm[COUNT_IDX] = trigger->getCount();
+        shm[NTHREADS_IDX] = trigger->getNThreads();
+        shm[DATATYPE_IDX] = trigger->getDatatype();
+        shm[REDOP_IDX] = trigger->getRedop();
+        shm[FLAG_IN_IDX] = trigger->getFlagIn();
+        shm[FLAG_OUT_IDX] = trigger->getFlagOut();
+      }
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+    if (shm[STATIC_ABORT_IDX] != 0) {
+      publishStaticReduceAbort(triggers, ordinal, numTriggers, stride);
+      return;
+    }
+
+    if (tid == 0 && shm[FLAG_OUT_IDX] != 0) {
+      const uint64_t flagOut = shm[FLAG_OUT_IDX];
+      if (loadStreamFlagState(flagOut) == flagcxStreamFlagIdle) {
+        DeviceAPI::Atomic::store(
+            reinterpret_cast<uint64_t *>(flagOut),
+            static_cast<uint64_t>(flagcxStreamFlagPend),
+            flagcxDeviceMemoryOrderRelease);
+      }
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+
+    if (tid == 0) {
+      shm[STATIC_ABORT_IDX] = 0;
+      const uint64_t flagIn = shm[FLAG_IN_IDX];
+      int backoff = 0;
+      while (flagIn != 0 &&
+             !isStreamFlagStateDone(loadStreamFlagState(flagIn))) {
+        if (isStaticReduceAbortRequested(abortFlag)) {
+          shm[STATIC_ABORT_IDX] = 1;
+          break;
+        }
+        DeviceAPI::Intrin::spinBackoff(backoff++);
+      }
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+    if (shm[STATIC_ABORT_IDX] != 0) {
+      publishStaticReduceAbort(triggers, ordinal, numTriggers, stride);
+      return;
+    }
+
+    flagcxReduceKernel(shm[FST_IDX], shm[SND_IDX], shm[OUT_IDX],
+                       shm[COUNT_IDX], shm[NTHREADS_IDX], shm[DATATYPE_IDX],
+                       shm[REDOP_IDX], avgDivisor);
+    FLAGCX_DEVICE_SYNC_THREADS();
+    FLAGCX_DEVICE_THREAD_FENCE();
+    // Every reduction thread must finish its system fence before thread 0
+    // publishes DONE to a consumer on another stream.
+    FLAGCX_DEVICE_SYNC_THREADS();
+    if (tid == 0) {
+      triggers[ordinal].setComplete();
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+  }
+}
+
 struct alignas(16) flagcxIpcVector128 {
   uint64_t x;
   uint64_t y;
@@ -754,4 +852,109 @@ flagcxResult_t flagcxLaunchCollectiveKernel(
       redFifoBuffer, ipcFifoBuffer, input, output, ready, ipcParentFlags,
       static_cast<int>(nRedBlocks), static_cast<int>(nIpcBlocks), avgDivisor);
   return flagcxSuccess;
+}
+
+flagcxResult_t flagcxGetStaticReduceKernelMaxExecutorBlocks(
+    size_t nthreads, size_t *maxExecutorBlocks) {
+  if (maxExecutorBlocks == nullptr) {
+    return flagcxInvalidArgument;
+  }
+  *maxExecutorBlocks = 0;
+  if (nthreads == 0 ||
+      nthreads > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return flagcxInvalidArgument;
+  }
+
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+  int device = -1;
+  int cooperativeLaunch = 0;
+  int concurrentKernels = 0;
+  int smCount = 0;
+  int maxThreadsPerBlock = 0;
+  int activeBlocksPerSm = 0;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&cooperativeLaunch,
+                             cudaDevAttrCooperativeLaunch, device) !=
+          cudaSuccess ||
+      cudaDeviceGetAttribute(&concurrentKernels,
+                             cudaDevAttrConcurrentKernels, device) !=
+          cudaSuccess ||
+      cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount,
+                             device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&maxThreadsPerBlock,
+                             cudaDevAttrMaxThreadsPerBlock, device) !=
+          cudaSuccess) {
+    return flagcxUnhandledDeviceError;
+  }
+  if (smCount < 0 || maxThreadsPerBlock < 0) {
+    return flagcxInternalError;
+  }
+  if (nthreads > static_cast<size_t>(maxThreadsPerBlock)) {
+    return flagcxInvalidArgument;
+  }
+  if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &activeBlocksPerSm, flagcxStaticReduceKernel,
+          static_cast<int>(nthreads), 0) != cudaSuccess) {
+    return flagcxUnhandledDeviceError;
+  }
+  if (activeBlocksPerSm < 0) {
+    return flagcxInternalError;
+  }
+
+  flagcxResult_t result = resolveUniRunnerStaticExecutorResidencyBudget(
+      cooperativeLaunch != 0, concurrentKernels != 0,
+      static_cast<size_t>(smCount), static_cast<size_t>(activeBlocksPerSm),
+      static_cast<size_t>(maxThreadsPerBlock), nthreads, maxExecutorBlocks);
+  TRACE(FLAGCX_UNIRUNNER,
+        "static RED residency: device=%d cooperative=%d concurrent=%d "
+        "sms=%d active_per_sm=%d nthreads=%zu budget=%zu result=%d",
+        device, cooperativeLaunch, concurrentKernels, smCount,
+        activeBlocksPerSm, nthreads, *maxExecutorBlocks, result);
+  return result;
+#else
+  return flagcxNotSupported;
+#endif
+}
+
+flagcxResult_t flagcxLaunchStaticReduceKernel(
+    void *redFifoDeviceBuffer, size_t numTriggers, size_t nthreads,
+    size_t nRedBlocks, uint64_t avgDivisor, flagcxStream_t stream) {
+  if (numTriggers == 0) {
+    return nRedBlocks == 0 ? flagcxSuccess : flagcxInvalidArgument;
+  }
+  const size_t maxInt =
+      static_cast<size_t>(std::numeric_limits<int>::max());
+  if (redFifoDeviceBuffer == nullptr || stream == nullptr || nthreads == 0 ||
+      nRedBlocks == 0 || nRedBlocks > numTriggers || avgDivisor == 0 ||
+      numTriggers > maxInt || nthreads > maxInt || nRedBlocks > maxInt) {
+    return flagcxInvalidArgument;
+  }
+
+  size_t maxExecutorBlocks = 0;
+  flagcxResult_t result = flagcxGetStaticReduceKernelMaxExecutorBlocks(
+      nthreads, &maxExecutorBlocks);
+  if (result != flagcxSuccess) {
+    return result;
+  }
+  if (nRedBlocks > maxExecutorBlocks) {
+    return flagcxInvalidArgument;
+  }
+
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+  uint64_t *words = static_cast<uint64_t *>(redFifoDeviceBuffer);
+  flagcxReduceTrigger *triggers = reinterpret_cast<flagcxReduceTrigger *>(
+      words + flagcxFifoIdxData);
+  uint64_t *abortFlag = words + flagcxFifoIdxTerminate;
+  uint64_t numTriggers64 = static_cast<uint64_t>(numTriggers);
+  void *args[] = {&triggers, &numTriggers64, &abortFlag, &avgDivisor};
+  cudaError_t launchResult = cudaLaunchCooperativeKernel(
+      reinterpret_cast<const void *>(flagcxStaticReduceKernel),
+      dim3(static_cast<unsigned int>(nRedBlocks)),
+      dim3(static_cast<unsigned int>(nthreads)), args, 0,
+      *(FLAGCX_DEVICE_STREAM_PTR)stream);
+  return launchResult == cudaSuccess ? flagcxSuccess
+                                     : flagcxUnhandledDeviceError;
+#else
+  return flagcxNotSupported;
+#endif
 }
