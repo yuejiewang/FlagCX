@@ -1,6 +1,8 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 
+#include <limits>
+
 FLAGCX_PARAM(ReduceFifoCapacity, "REDUCE_FIFO_CAPACITY", FLAGCX_FIFO_CAPACITY);
 FLAGCX_PARAM(IpcFifoCapacity, "IPC_FIFO_CAPACITY", FLAGCX_FIFO_CAPACITY);
 
@@ -90,20 +92,51 @@ enqueue(void *fifoBuffer, uint64_t addr1, uint64_t addr2, uint64_t addr3,
   return flagcxSuccess;
 }
 
+flagcxResult_t flagcxCheckedFifoAllocationSize(size_t capacity,
+                                               size_t elementSize,
+                                               size_t *bytes) {
+  if (bytes == NULL || elementSize == 0 ||
+      capacity > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return flagcxInvalidArgument;
+  }
+  const size_t headerBytes = flagcxFifoIdxData * sizeof(uint64_t);
+  if (capacity >
+      (std::numeric_limits<size_t>::max() - headerBytes) / elementSize) {
+    return flagcxInvalidArgument;
+  }
+  *bytes = headerBytes + capacity * elementSize;
+  return flagcxSuccess;
+}
+
 flagcxResult_t flagcxFifo::flagcxRedFifoInit() {
+  const int64_t configuredCapacity = flagcxParamReduceFifoCapacity();
+  if (configuredCapacity <= 0) {
+    return flagcxInvalidArgument;
+  }
+  return flagcxRedFifoInit(static_cast<size_t>(configuredCapacity));
+}
+
+flagcxResult_t flagcxFifo::flagcxRedFifoInit(size_t numTriggers) {
   TRACE(FLAGCX_INIT, "flagcxRedFifoInit called");
-  uint64_t flagcxReduceFifoCapacity = flagcxParamReduceFifoCapacity();
-  FLAGCXCHECK(deviceAdaptor->deviceMalloc((void **)&buffer,
-                                          flagcxFifoIdxData * sizeof(uint64_t) +
-                                              flagcxReduceFifoCapacity *
-                                                  sizeof(flagcxReduceTrigger),
-                                          flagcxMemHost, NULL));
-  buffer[flagcxFifoIdxCapacity] = flagcxReduceFifoCapacity;
+  if (buffer != NULL || numTriggers == 0) {
+    return flagcxInvalidArgument;
+  }
+  size_t bytes = 0;
+  FLAGCXCHECK(flagcxCheckedFifoAllocationSize(
+      numTriggers, sizeof(flagcxReduceTrigger), &bytes));
+  uint64_t *newBuffer = NULL;
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+      reinterpret_cast<void **>(&newBuffer), bytes, flagcxMemHost, NULL));
+  if (newBuffer == NULL) {
+    return flagcxSystemError;
+  }
+  buffer = newBuffer;
+  buffer[flagcxFifoIdxCapacity] = numTriggers;
   buffer[flagcxFifoIdxConsumed] = 0;
   buffer[flagcxFifoIdxProduced] = 0;
   buffer[flagcxFifoIdxTerminate] = 0;
   memset((void *)(buffer + flagcxFifoIdxData), 0,
-         flagcxReduceFifoCapacity * sizeof(flagcxReduceTrigger));
+         numTriggers * sizeof(flagcxReduceTrigger));
   __sync_synchronize();
   return flagcxSuccess;
 }
@@ -190,7 +223,10 @@ flagcxResult_t flagcxFifo::flagcxIpcFifoInit() {
 
 flagcxResult_t flagcxFifo::flagcxRedFifoDestroy() {
   INFO(FLAGCX_KERNEL, "flagcxRedFifoDestroy called");
-  FLAGCXCHECK(deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL));
+  if (buffer != NULL) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL));
+    buffer = NULL;
+  }
   return flagcxSuccess;
 }
 

@@ -39,6 +39,17 @@ static bool getUniRunnerDagPlanPhase(uniRunnerDagNodeType nodeType,
   }
 }
 
+static bool isValidStaticRedTriggerPayload(const uniRunnerRedNodeData &red) {
+  return static_cast<int>(red.datatype) >= 0 &&
+         static_cast<int>(red.datatype) < flagcxNumTypes &&
+         getFlagcxDataTypeSize(red.datatype) != 0 &&
+         static_cast<int>(red.redOp) >= static_cast<int>(flagcxSum) &&
+         static_cast<int>(red.redOp) < static_cast<int>(flagcxNumRedOps) &&
+         red.count <= flagcxTriggerMask(flagcxReduceTriggerBitsCount) &&
+         red.nthreads != 0 &&
+         red.nthreads <= flagcxTriggerMask(flagcxReduceTriggerBitsNThreads);
+}
+
 } // namespace
 
 void destroyUniRunnerDagExecutionPlan(uniRunnerDagExecutionPlan *plan) {
@@ -301,5 +312,89 @@ flagcxResult_t getUniRunnerStaticTaskAssignment(
   }
   *blockIdx = taskOrdinal % numBlocks;
   *blockTaskOrdinal = taskOrdinal / numBlocks;
+  return flagcxSuccess;
+}
+
+flagcxResult_t populateUniRunnerStaticRedTriggers(
+    uniRunnerDagNode *nodes, size_t numNodes,
+    const uniRunnerDagExecutionPlan *plan, void *const *nodeFlags,
+    size_t numNodeFlags, flagcxReduceTrigger *triggers,
+    size_t triggerCapacity, size_t *numTriggers) {
+  if (numTriggers == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *numTriggers = 0;
+  if (plan == NULL || plan->numNodes != numNodes ||
+      numNodes > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+      ((numNodes == 0) != (plan->topoOrder == NULL)) ||
+      plan->numHostNodes > numNodes ||
+      plan->numRedNodes > numNodes - plan->numHostNodes ||
+      plan->numIpcNodes !=
+          numNodes - plan->numHostNodes - plan->numRedNodes) {
+    return flagcxInvalidArgument;
+  }
+  if (plan->numRedNodes == 0) {
+    return flagcxSuccess;
+  }
+  if (nodes == NULL || nodeFlags == NULL || numNodeFlags < numNodes ||
+      triggers == NULL || triggerCapacity < plan->numRedNodes) {
+    return flagcxInvalidArgument;
+  }
+
+  // Validate every dependency address, payload field, and single-parent RED
+  // constraint before writing any trigger or publishing triggerIdx.
+  size_t redOrdinal = 0;
+  for (size_t topoSlot = 0; topoSlot < numNodes; ++topoSlot) {
+    const int nodeIdx = plan->topoOrder[topoSlot];
+    if (nodeIdx < 0 || static_cast<size_t>(nodeIdx) >= numNodes ||
+        nodes[nodeIdx].nodeIdx != nodeIdx) {
+      return flagcxInternalError;
+    }
+    const uniRunnerDagNode *node = &nodes[nodeIdx];
+    if (node->nodeType != uniRunnerDagNodeTypeRed) {
+      continue;
+    }
+    if (redOrdinal >= plan->numRedNodes || node->numParents < 0 ||
+        node->numParents > 1 || nodeFlags[nodeIdx] == NULL ||
+        !isValidStaticRedTriggerPayload(node->nodeData.red)) {
+      return flagcxInvalidArgument;
+    }
+    if (node->numParents == 1) {
+      if (node->parents == NULL || node->parents[0] < 0 ||
+          static_cast<size_t>(node->parents[0]) >= numNodes ||
+          nodeFlags[node->parents[0]] == NULL) {
+        return flagcxInvalidArgument;
+      }
+    }
+    ++redOrdinal;
+  }
+  if (redOrdinal != plan->numRedNodes) {
+    return flagcxInternalError;
+  }
+
+  redOrdinal = 0;
+  for (size_t topoSlot = 0; topoSlot < numNodes; ++topoSlot) {
+    const int nodeIdx = plan->topoOrder[topoSlot];
+    uniRunnerDagNode *node = &nodes[nodeIdx];
+    if (node->nodeType != uniRunnerDagNodeTypeRed) {
+      continue;
+    }
+    const uint64_t flagIn =
+        node->numParents == 0
+            ? 0
+            : reinterpret_cast<uint64_t>(nodeFlags[node->parents[0]]);
+    const uint64_t flagOut =
+        reinterpret_cast<uint64_t>(nodeFlags[nodeIdx]);
+    triggers[redOrdinal].setValue(
+        reinterpret_cast<uint64_t>(node->nodeData.red.input1),
+        reinterpret_cast<uint64_t>(node->nodeData.red.input2),
+        reinterpret_cast<uint64_t>(node->nodeData.red.output),
+        node->nodeData.red.count, node->nodeData.red.nthreads,
+        node->nodeData.red.datatype, node->nodeData.red.redOp,
+        flagcxReduceTriggerEnqueued, flagIn, flagOut);
+    node->nodeData.red.triggerIdx = static_cast<int>(redOrdinal++);
+  }
+  __sync_synchronize();
+  *numTriggers = redOrdinal;
   return flagcxSuccess;
 }

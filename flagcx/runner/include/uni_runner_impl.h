@@ -294,6 +294,14 @@ flagcxResult_t resolveUniRunnerStaticExecutorSchedule(
 flagcxResult_t getUniRunnerStaticTaskAssignment(
     size_t taskOrdinal, size_t numTasks, size_t numBlocks, size_t *blockIdx,
     size_t *blockTaskOrdinal);
+// plan must be the immutable result of compileUniRunnerDagExecutionPlan for
+// this exact nodes array. Runtime addresses and trigger indices may differ,
+// but node indices, types, and topology must not change after compilation.
+flagcxResult_t populateUniRunnerStaticRedTriggers(
+    uniRunnerDagNode *nodes, size_t numNodes,
+    const uniRunnerDagExecutionPlan *plan, void *const *nodeFlags,
+    size_t numNodeFlags, flagcxReduceTrigger *triggers,
+    size_t triggerCapacity, size_t *numTriggers);
 
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm);
 flagcxResult_t

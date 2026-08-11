@@ -36,16 +36,21 @@ struct flagcxFifo {
   uint64_t *buffer;
 
 public:
-  flagcxFifo() {}
+  flagcxFifo() : buffer(NULL) {}
   ~flagcxFifo() {}
   flagcxResult_t flagcxFifoInit();
   flagcxResult_t flagcxRedFifoInit();
+  flagcxResult_t flagcxRedFifoInit(size_t numTriggers);
   flagcxResult_t flagcxIpcFifoInit();
   flagcxResult_t flagcxFifoDestroy();
   flagcxResult_t flagcxRedFifoDestroy();
   flagcxResult_t flagcxIpcFifoDestroy();
 };
 typedef struct flagcxFifo *flagcxFifo_t;
+
+flagcxResult_t flagcxCheckedFifoAllocationSize(size_t capacity,
+                                               size_t elementSize,
+                                               size_t *bytes);
 
 FLAGCX_HOST_DECORATOR flagcxResult_t dequeue(void *fifoBuffer,
                                              flagcxDeviceTrigger_t trigger);
