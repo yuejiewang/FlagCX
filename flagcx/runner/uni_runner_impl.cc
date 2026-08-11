@@ -2275,16 +2275,18 @@ buildUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
 }
 
 static bool getIpcBufferOffset(const void *ptr, const void *base, size_t bytes,
-                               size_t *offset) {
-  if (ptr == NULL || base == NULL)
+                               size_t accessBytes, size_t *offset) {
+  if (offset == NULL) {
     return false;
-  uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
-  uintptr_t b = reinterpret_cast<uintptr_t>(base);
+  }
   // One-past-end is valid for a zero-count slice; the trigger will carry
   // bytes==0 and only exchange its ready epoch.
-  if (p < b || p - b > bytes)
+  int64_t checkedOffset = 0;
+  if (!uniRunnerDagBindingRangeContains(ptr, base, bytes, accessBytes,
+                                        &checkedOffset)) {
     return false;
-  *offset = static_cast<size_t>(p - b);
+  }
+  *offset = static_cast<size_t>(checkedOffset);
   return true;
 }
 
@@ -2331,14 +2333,22 @@ static flagcxResult_t buildUniRunnerStateIpcAR(
       return flagcxNotSupported;
     }
 
+    size_t sendBytes = 0;
+    FLAGCXCHECK(checkedUniRunnerTypeBytes(sendOp->count, 1,
+                                          sendOp->datatype, &sendBytes));
+    size_t recvBytes = 0;
+    FLAGCXCHECK(checkedUniRunnerTypeBytes(recvOp->count, 1,
+                                          recvOp->datatype, &recvBytes));
+
     size_t srcOffset = 0;
     flagcxIpcBufferType srcBufferType = flagcxIpcBufferInput;
     // Prefer output for aliased buffers: both handles describe the same local
     // storage and output is the destination surface carried around the ring.
-    if (getIpcBufferOffset(sendOp->addr, recvbuff, totalBytes, &srcOffset)) {
+    if (getIpcBufferOffset(sendOp->addr, recvbuff, totalBytes, sendBytes,
+                           &srcOffset)) {
       srcBufferType = flagcxIpcBufferOutput;
     } else if (getIpcBufferOffset(sendOp->addr, sendbuff, totalBytes,
-                                  &srcOffset)) {
+                                  sendBytes, &srcOffset)) {
       srcBufferType = flagcxIpcBufferInput;
     } else {
       return flagcxInvalidArgument;
@@ -2346,7 +2356,7 @@ static flagcxResult_t buildUniRunnerStateIpcAR(
 
     size_t localRecvOffset = 0;
     if (!getIpcBufferOffset(recvOp->addr, recvbuff, totalBytes,
-                            &localRecvOffset)) {
+                            recvBytes, &localRecvOffset)) {
       return flagcxInvalidArgument;
     }
     (void)localRecvOffset;
@@ -2361,11 +2371,7 @@ static flagcxResult_t buildUniRunnerStateIpcAR(
     // local recv op refers to the chunk arriving from prevRank, while this
     // send op writes its own source chunk to nextRank at srcOffset.
     ipc.dstOffsetBytes = srcOffset;
-    FLAGCXCHECK(checkedUniRunnerTypeBytes(sendOp->count, 1, sendOp->datatype,
-                                          &ipc.bytes));
-    size_t recvBytes = 0;
-    FLAGCXCHECK(checkedUniRunnerTypeBytes(recvOp->count, 1, recvOp->datatype,
-                                          &recvBytes));
+    ipc.bytes = sendBytes;
     if (ipc.bytes > totalBytes - srcOffset ||
         recvBytes > totalBytes - localRecvOffset ||
         ipc.bytes > totalBytes - ipc.dstOffsetBytes) {
