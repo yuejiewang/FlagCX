@@ -23,7 +23,10 @@ struct flagcxIpcTableEntry {
   void **devPeerPtrs;  // device array: peer buffer ptrs (for cudaFree)
   int nPeers;          // number of local peers
   void *basePtr;       // own buffer ptr (skip in ipcMemHandleClose loop)
-  bool inUse;          // true while a devMem references this entry
+  size_t size;         // bytes covered by the exported allocation binding
+  size_t refCount;     // live DevMem/DevComm references to this entry
+  uint64_t bindingGeneration; // collective binding identity across ranks
+  bool inUse;          // compatibility mirror of refCount != 0
 };
 
 // Deferred device/host-pinned memory free — collected during cleanup,
@@ -109,6 +112,7 @@ struct flagcxComm {
 
   // IPC peer pointer table — deferred cleanup
   struct flagcxIpcTableEntry ipcTable[FLAGCX_MAX_IPC_ENTRIES];
+  uint64_t ipcTableGeneration;
 
   // Deferred DevComm buffer queue — buffers stashed here during
   // flagcxDevCommDestroy, drained at flagcxCommDestroy.

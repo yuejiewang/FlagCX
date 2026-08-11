@@ -22,6 +22,7 @@
 #include "shmutils.h" // flagcxShmOpen, flagcxShmClose, flagcxShmUnlink
 #include "utils.h"    // flagcxParamSignalHostEnable
 #include <algorithm>  // std::min, std::max
+#include <limits>
 #include <new>
 #include <sched.h> // sched_yield
 
@@ -35,42 +36,193 @@
 // Internally checks globalRegPool for a pre-registered IPC handle to skip
 // ipcMemHandleGet when the buffer was already registered via
 // flagcxCommRegister.
-static int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
+struct flagcxIpcBuildExchange {
+  struct flagcxP2pIpcDesc desc;
+  uint64_t currentGeneration;
+  int status;
+};
 
-  // Find a free slot in the IPC table
-  int slot = -1;
-  for (int k = 0; k < FLAGCX_MAX_IPC_ENTRIES; k++) {
-    if (comm->ipcTable[k].hostPeerPtrs == nullptr &&
-        comm->ipcTable[k].devPeerPtrs == nullptr) {
-      slot = k;
-      break;
+struct flagcxIpcReuseExchange {
+  uint64_t bindingGeneration;
+  uint64_t canReuse;
+  int status;
+};
+
+static flagcxResult_t
+firstIpcBuildFailure(const struct flagcxIpcBuildExchange *exchanges,
+                     int nRanks) {
+  for (int rank = 0; rank < nRanks; ++rank) {
+    if (exchanges[rank].status != static_cast<int>(flagcxSuccess)) {
+      return static_cast<flagcxResult_t>(exchanges[rank].status);
     }
   }
-  if (slot < 0) {
-    WARN("buildIpcPeerPointers: IPC table full (max %d entries)",
-         FLAGCX_MAX_IPC_ENTRIES);
+  return flagcxSuccess;
+}
+
+static flagcxResult_t agreeIpcTableReuse(flagcxComm_t comm,
+                                         int localSlot,
+                                         bool *allCanReuse) {
+  if (comm == nullptr || comm->bootstrap == nullptr || allCanReuse == nullptr ||
+      comm->nranks <= 0 || comm->rank < 0 || comm->rank >= comm->nranks) {
+    return flagcxInvalidArgument;
+  }
+  *allCanReuse = false;
+  // See buildIpcPeerPointers for the bootstrap scratch/OOM constraint.
+  struct flagcxIpcReuseExchange *exchanges =
+      static_cast<struct flagcxIpcReuseExchange *>(
+          calloc(static_cast<size_t>(comm->nranks),
+                 sizeof(struct flagcxIpcReuseExchange)));
+  if (exchanges == nullptr) {
+    return flagcxSystemError;
+  }
+  const bool localCanReuse =
+      localSlot >= 0 && localSlot < FLAGCX_MAX_IPC_ENTRIES;
+  exchanges[comm->rank].bindingGeneration =
+      localCanReuse ? comm->ipcTable[localSlot].bindingGeneration : 0;
+  exchanges[comm->rank].canReuse = localCanReuse ? 1 : 0;
+  exchanges[comm->rank].status = static_cast<int>(flagcxSuccess);
+  flagcxResult_t result = bootstrapCollAllGather(
+      comm->bootstrap, exchanges, sizeof(struct flagcxIpcReuseExchange));
+  if (result == flagcxSuccess) {
+    const uint64_t expectedGeneration = exchanges[0].bindingGeneration;
+    *allCanReuse = expectedGeneration != 0;
+    for (int rank = 0; rank < comm->nranks; ++rank) {
+      if (exchanges[rank].status != static_cast<int>(flagcxSuccess)) {
+        result = static_cast<flagcxResult_t>(exchanges[rank].status);
+        *allCanReuse = false;
+        break;
+      }
+      if (exchanges[rank].canReuse == 0 ||
+          exchanges[rank].bindingGeneration != expectedGeneration) {
+        *allCanReuse = false;
+      }
+    }
+  }
+  free(exchanges);
+  return result;
+}
+
+static int findReusableIpcTableSlot(flagcxComm_t comm, int localRanks) {
+  // Prefer an inactive slot that already owns the correctly-sized device
+  // pointer array. Rebinding it avoids both exhausting the fixed table and a
+  // deviceFree that may introduce an implicit device-wide synchronization.
+  for (int k = 0; k < FLAGCX_MAX_IPC_ENTRIES; ++k) {
+    const struct flagcxIpcTableEntry *entry = &comm->ipcTable[k];
+    if (!entry->inUse && entry->refCount == 0 &&
+        entry->nPeers == localRanks) {
+      return k;
+    }
+  }
+  for (int k = 0; k < FLAGCX_MAX_IPC_ENTRIES; ++k) {
+    const struct flagcxIpcTableEntry *entry = &comm->ipcTable[k];
+    if (!entry->inUse && entry->refCount == 0 &&
+        entry->hostPeerPtrs == nullptr && entry->devPeerPtrs == nullptr &&
+        entry->nPeers == 0) {
+      return k;
+    }
+  }
+  return -1;
+}
+
+static flagcxResult_t
+closeInactiveIpcTableImports(struct flagcxIpcTableEntry *entry) {
+  if (entry == nullptr || entry->inUse || entry->refCount != 0) {
+    return flagcxInvalidUsage;
+  }
+  flagcxResult_t result = flagcxSuccess;
+  if (entry->hostPeerPtrs != nullptr) {
+    for (int peer = 0; peer < entry->nPeers; ++peer) {
+      void *peerPtr = entry->hostPeerPtrs[peer];
+      if (peerPtr != nullptr && peerPtr != entry->basePtr) {
+        flagcxResult_t closeResult =
+            deviceAdaptor->ipcMemHandleClose(peerPtr);
+        if (closeResult == flagcxSuccess) {
+          entry->hostPeerPtrs[peer] = nullptr;
+        } else if (result == flagcxSuccess) {
+          result = closeResult;
+        }
+      } else {
+        entry->hostPeerPtrs[peer] = nullptr;
+      }
+    }
+    if (result == flagcxSuccess) {
+      free(entry->hostPeerPtrs);
+      entry->hostPeerPtrs = nullptr;
+    }
+  }
+  if (result == flagcxSuccess) {
+    entry->basePtr = nullptr;
+    entry->size = 0;
+    entry->bindingGeneration = 0;
+  }
+  return result;
+}
+
+static flagcxResult_t closeIpcBuildCandidate(void **hostPeerPtrs,
+                                             int localRanks,
+                                             void *localBase) {
+  if (hostPeerPtrs == nullptr) {
+    return flagcxSuccess;
+  }
+  flagcxResult_t result = flagcxSuccess;
+  for (int peer = 0; peer < localRanks; ++peer) {
+    if (hostPeerPtrs[peer] != nullptr && hostPeerPtrs[peer] != localBase) {
+      flagcxResult_t closeResult =
+          deviceAdaptor->ipcMemHandleClose(hostPeerPtrs[peer]);
+      if (closeResult == flagcxSuccess) {
+        hostPeerPtrs[peer] = nullptr;
+      } else if (result == flagcxSuccess) {
+        result = closeResult;
+      }
+    } else {
+      hostPeerPtrs[peer] = nullptr;
+    }
+  }
+  if (result == flagcxSuccess) {
+    free(hostPeerPtrs);
+  }
+  return result;
+}
+
+static int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
+  if (comm == nullptr || buff == nullptr || size == 0 ||
+      comm->bootstrap == nullptr || comm->rank < 0 ||
+      comm->rank >= comm->nranks || comm->nranks <= 0 ||
+      comm->localRanks <= 0 || comm->localRankToRank == nullptr) {
     return -1;
   }
 
-  int myRank = comm->rank;
-  int nRanks = comm->nranks;
-  int localRanks = comm->localRanks;
+  const int myRank = comm->rank;
+  const int nRanks = comm->nranks;
+  const int localRanks = comm->localRanks;
   int *localRankToRank = comm->localRankToRank;
+  const size_t peerPointerBytes =
+      static_cast<size_t>(localRanks) * sizeof(void *);
 
-  flagcxResult_t res = flagcxSuccess;
-  struct flagcxP2pIpcDesc *allDescs = nullptr;
-  void **hostPeerPtrs = nullptr;
-  void **devPeerPtrs = nullptr;
+  // bootstrapCollAllGather requires one contiguous nranks-sized receive
+  // buffer. Like existing bootstrap callers, this path assumes that small
+  // host allocations succeed on every participating rank; eliminating a
+  // unilateral pre-collective OOM requires communicator-owned scratch.
+  struct flagcxIpcBuildExchange *exchanges =
+      static_cast<struct flagcxIpcBuildExchange *>(
+          calloc(static_cast<size_t>(nRanks),
+                 sizeof(struct flagcxIpcBuildExchange)));
+  if (exchanges == nullptr) {
+    return -1;
+  }
 
-  // Step 1: Get IPC handle for existing user buffer.
-  // First check if globalRegPool has a pre-registered handle (from
-  // flagcxCommRegister).
-  struct flagcxP2pIpcDesc myIpcDesc;
-  memset(&myIpcDesc, 0, sizeof(myIpcDesc));
-  {
+  int slot = findReusableIpcTableSlot(comm, localRanks);
+  flagcxResult_t localResult = slot >= 0 ? flagcxSuccess : flagcxSystemError;
+  struct flagcxP2pIpcDesc myIpcDesc = {};
+
+  // Prepare the local descriptor without leaving the collective sequence on a
+  // local handle error. The status travels with the descriptor in the first
+  // all-gather, so every rank makes the same continue/abort decision.
+  if (localResult == flagcxSuccess) {
     const flagcxIpcHandleData *preRegHandle = nullptr;
     void *regKey =
-        comm->heteroComm ? (void *)comm->heteroComm : (void *)comm->homoComm;
+        comm->heteroComm ? static_cast<void *>(comm->heteroComm)
+                         : static_cast<void *>(comm->homoComm);
     flagcxRegItem *regItem = globalRegPool.getItem(regKey, buff);
     if (regItem != nullptr) {
       char zeros[sizeof(flagcxIpcHandleData)] = {};
@@ -81,105 +233,204 @@ static int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
     }
 
     if (preRegHandle != nullptr) {
-      // Reuse pre-registered handle — skip ipcMemHandleGet
-      memcpy(&myIpcDesc.handleData, preRegHandle, sizeof(flagcxIpcHandleData));
+      memcpy(&myIpcDesc.handleData, preRegHandle,
+             sizeof(flagcxIpcHandleData));
       myIpcDesc.size = size;
     } else {
-      // Get IPC handle from device adaptor
       flagcxIpcMemHandle_t handlePtr = nullptr;
       size_t ipcSize = 0;
-      FLAGCXCHECKGOTO(deviceAdaptor->ipcMemHandleCreate(&handlePtr, &ipcSize),
-                      res, fail);
-      res = deviceAdaptor->ipcMemHandleGet(handlePtr, buff);
-      if (res != flagcxSuccess) {
-        deviceAdaptor->ipcMemHandleFree(handlePtr);
-        goto fail;
+      localResult =
+          deviceAdaptor->ipcMemHandleCreate(&handlePtr, &ipcSize);
+      if (localResult == flagcxSuccess) {
+        localResult = deviceAdaptor->ipcMemHandleGet(handlePtr, buff);
       }
-      if (ipcSize > sizeof(flagcxIpcHandleData)) {
-        deviceAdaptor->ipcMemHandleFree(handlePtr);
-        res = flagcxInternalError;
-        goto fail;
+      if (localResult == flagcxSuccess &&
+          ipcSize > sizeof(flagcxIpcHandleData)) {
+        localResult = flagcxInternalError;
       }
-      memcpy(&myIpcDesc.handleData, handlePtr, ipcSize);
-      myIpcDesc.size = size;
-      deviceAdaptor->ipcMemHandleFree(handlePtr);
+      if (localResult == flagcxSuccess) {
+        memcpy(&myIpcDesc.handleData, handlePtr, ipcSize);
+        myIpcDesc.size = size;
+      }
+      if (handlePtr != nullptr) {
+        (void)deviceAdaptor->ipcMemHandleFree(handlePtr);
+      }
     }
   }
 
-  // Step 2: Exchange IPC handles with all ranks
-  allDescs = (struct flagcxP2pIpcDesc *)calloc(nRanks,
-                                               sizeof(struct flagcxP2pIpcDesc));
-  if (allDescs == nullptr) {
-    res = flagcxSystemError;
-    goto fail;
+  exchanges[myRank].desc = myIpcDesc;
+  exchanges[myRank].currentGeneration = comm->ipcTableGeneration;
+  exchanges[myRank].status = static_cast<int>(localResult);
+  flagcxResult_t res = bootstrapCollAllGather(
+      comm->bootstrap, exchanges, sizeof(struct flagcxIpcBuildExchange));
+  if (res != flagcxSuccess) {
+    free(exchanges);
+    return -1;
   }
-  memcpy(&allDescs[myRank], &myIpcDesc, sizeof(struct flagcxP2pIpcDesc));
-  FLAGCXCHECKGOTO(bootstrapCollAllGather(comm->bootstrap, allDescs,
-                                         sizeof(struct flagcxP2pIpcDesc)),
-                  res, fail);
+  res = firstIpcBuildFailure(exchanges, nRanks);
+  if (res != flagcxSuccess) {
+    if (slot < 0) {
+      WARN("buildIpcPeerPointers: IPC table has no reusable slot (max %d)",
+           FLAGCX_MAX_IPC_ENTRIES);
+    }
+    free(exchanges);
+    return -1;
+  }
 
-  // Step 3: Open intra-node peer IPC handles
-  hostPeerPtrs = (void **)calloc(localRanks, sizeof(void *));
-  if (hostPeerPtrs == nullptr) {
-    res = flagcxSystemError;
-    goto fail;
+  uint64_t globalMaxGeneration = 0;
+  for (int rank = 0; rank < nRanks; ++rank) {
+    globalMaxGeneration =
+        std::max(globalMaxGeneration, exchanges[rank].currentGeneration);
   }
-  for (int lr = 0; lr < localRanks; lr++) {
-    int gr = localRankToRank[lr];
-    if (gr == myRank) {
-      hostPeerPtrs[lr] = buff;
+  if (globalMaxGeneration == std::numeric_limits<uint64_t>::max()) {
+    WARN("buildIpcPeerPointers: IPC binding generation exhausted");
+    free(exchanges);
+    return -1;
+  }
+  const uint64_t bindingGeneration = globalMaxGeneration + 1;
+
+  struct flagcxIpcTableEntry *entry = &comm->ipcTable[slot];
+  void **hostPeerPtrs = nullptr;
+  void **devPeerPtrs = entry->devPeerPtrs;
+  bool allocatedDevPeerPtrs = false;
+
+  localResult = closeInactiveIpcTableImports(entry);
+  if (localResult == flagcxSuccess) {
+    hostPeerPtrs = static_cast<void **>(
+        calloc(static_cast<size_t>(localRanks), sizeof(void *)));
+    if (hostPeerPtrs == nullptr) {
+      localResult = flagcxSystemError;
+    }
+  }
+  for (int localRank = 0;
+       localResult == flagcxSuccess && localRank < localRanks; ++localRank) {
+    const int globalRank = localRankToRank[localRank];
+    if (globalRank < 0 || globalRank >= nRanks) {
+      localResult = flagcxInternalError;
+    } else if (globalRank == myRank) {
+      hostPeerPtrs[localRank] = buff;
     } else {
       flagcxIpcMemHandle_t handlePtr =
-          (flagcxIpcMemHandle_t)&allDescs[gr].handleData;
-      FLAGCXCHECKGOTO(
-          deviceAdaptor->ipcMemHandleOpen(handlePtr, &hostPeerPtrs[lr]), res,
-          fail);
+          reinterpret_cast<flagcxIpcMemHandle_t>(
+              &exchanges[globalRank].desc.handleData);
+      localResult =
+          deviceAdaptor->ipcMemHandleOpen(handlePtr,
+                                          &hostPeerPtrs[localRank]);
     }
   }
-  free(allDescs);
-  allDescs = nullptr;
 
-  // Step 4: Build device peer pointer array
-  FLAGCXCHECKGOTO(deviceAdaptor->deviceMalloc((void **)&devPeerPtrs,
-                                              localRanks * sizeof(void *),
-                                              flagcxMemDevice, NULL),
-                  res, fail);
-  FLAGCXCHECKGOTO(deviceAdaptor->deviceMemcpy(
-                      devPeerPtrs, hostPeerPtrs, localRanks * sizeof(void *),
-                      flagcxMemcpyHostToDevice, NULL, NULL),
-                  res, fail);
+  if (localResult == flagcxSuccess && devPeerPtrs == nullptr) {
+    localResult = deviceAdaptor->deviceMalloc(
+        reinterpret_cast<void **>(&devPeerPtrs), peerPointerBytes,
+        flagcxMemDevice, NULL);
+    allocatedDevPeerPtrs = localResult == flagcxSuccess;
+  }
+  if (localResult == flagcxSuccess) {
+    localResult = deviceAdaptor->deviceMemcpy(
+        devPeerPtrs, hostPeerPtrs, peerPointerBytes,
+        flagcxMemcpyHostToDevice, NULL, NULL);
+  }
 
-  // Store in comm->ipcTable
-  comm->ipcTable[slot].hostPeerPtrs = hostPeerPtrs;
-  comm->ipcTable[slot].devPeerPtrs = devPeerPtrs;
-  comm->ipcTable[slot].nPeers = localRanks;
-  comm->ipcTable[slot].basePtr = buff;
-  comm->ipcTable[slot].inUse = true;
+  memset(exchanges, 0,
+         static_cast<size_t>(nRanks) * sizeof(struct flagcxIpcBuildExchange));
+  exchanges[myRank].status = static_cast<int>(localResult);
+  flagcxResult_t postGatherResult = bootstrapCollAllGather(
+      comm->bootstrap, exchanges, sizeof(struct flagcxIpcBuildExchange));
+  res = postGatherResult;
+  if (postGatherResult == flagcxSuccess) {
+    res = firstIpcBuildFailure(exchanges, nRanks);
+  }
+
+  if (res != flagcxSuccess) {
+    flagcxResult_t cleanupResult =
+        closeIpcBuildCandidate(hostPeerPtrs, localRanks, buff);
+    // Retain a successfully allocated pointer array in the inactive slot. It
+    // is safe to overwrite on the next build and avoids deviceFree on this
+    // failure path. No handle can observe it while refCount is zero.
+    if (allocatedDevPeerPtrs) {
+      entry->devPeerPtrs = devPeerPtrs;
+    }
+    entry->nPeers = localRanks;
+    // A failed close remains tracked in this inactive slot and is retried by
+    // the next rebind or communicator cleanup instead of leaking the mapping.
+    if (cleanupResult != flagcxSuccess && hostPeerPtrs != nullptr) {
+      entry->hostPeerPtrs = hostPeerPtrs;
+      entry->basePtr = buff;
+      entry->size = 0;
+      entry->bindingGeneration = 0;
+    } else if (entry->hostPeerPtrs == nullptr) {
+      entry->basePtr = nullptr;
+      entry->size = 0;
+      entry->bindingGeneration = 0;
+    }
+    entry->refCount = 0;
+    entry->inUse = false;
+    // When the post-open status exchange succeeded, all ranks know that the
+    // candidate is being abandoned. A final failure-only exchange ensures
+    // every importing context has closed its mapping before a caller frees the
+    // locally exported allocation.
+    if (postGatherResult == flagcxSuccess) {
+      memset(exchanges, 0, static_cast<size_t>(nRanks) *
+                               sizeof(struct flagcxIpcBuildExchange));
+      exchanges[myRank].status = static_cast<int>(cleanupResult);
+      (void)bootstrapCollAllGather(
+          comm->bootstrap, exchanges, sizeof(struct flagcxIpcBuildExchange));
+    }
+    free(exchanges);
+    return -1;
+  }
+
+  free(exchanges);
+
+  entry->hostPeerPtrs = hostPeerPtrs;
+  entry->devPeerPtrs = devPeerPtrs;
+  entry->nPeers = localRanks;
+  entry->basePtr = buff;
+  entry->size = size;
+  entry->refCount = 1;
+  entry->bindingGeneration = bindingGeneration;
+  entry->inUse = true;
+  comm->ipcTableGeneration = bindingGeneration;
 
   INFO(FLAGCX_INIT,
-       "buildIpcPeerPointers: rank %d slot %d buff=%p devPeerPtrs=%p", myRank,
-       slot, buff, (void *)devPeerPtrs);
-  for (int lr = 0; lr < localRanks; lr++) {
-    INFO(FLAGCX_INIT, "buildIpcPeerPointers:   hostPeerPtrs[%d]=%p", lr,
-         hostPeerPtrs[lr]);
+       "buildIpcPeerPointers: rank %d rebound slot %d generation=%llu "
+       "buff=%p size=%zu devPeerPtrs=%p",
+       myRank, slot, static_cast<unsigned long long>(bindingGeneration), buff,
+       size, static_cast<void *>(devPeerPtrs));
+  for (int localRank = 0; localRank < localRanks; ++localRank) {
+    INFO(FLAGCX_INIT, "buildIpcPeerPointers:   hostPeerPtrs[%d]=%p",
+         localRank, hostPeerPtrs[localRank]);
   }
   return slot;
+}
 
-fail:
-  free(allDescs);
-  // On failure, clean up partially built resources directly
-  if (hostPeerPtrs) {
-    for (int i = 0; i < localRanks; i++) {
-      if (hostPeerPtrs[i] && hostPeerPtrs[i] != buff) {
-        deviceAdaptor->ipcMemHandleClose(hostPeerPtrs[i]);
-      }
-    }
-    free(hostPeerPtrs);
+static flagcxResult_t retainIpcTableEntry(flagcxComm_t comm, int slot) {
+  if (comm == nullptr || slot < 0 || slot >= FLAGCX_MAX_IPC_ENTRIES) {
+    return flagcxInvalidArgument;
   }
-  if (devPeerPtrs) {
-    deviceAdaptor->deviceFree(devPeerPtrs, flagcxMemDevice, NULL);
+  struct flagcxIpcTableEntry *entry = &comm->ipcTable[slot];
+  if (!entry->inUse || entry->refCount == 0 ||
+      entry->refCount == std::numeric_limits<size_t>::max() ||
+      entry->devPeerPtrs == nullptr) {
+    return flagcxInternalError;
   }
-  return -1;
+  ++entry->refCount;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t releaseIpcTableEntry(flagcxComm_t comm, int slot) {
+  if (comm == nullptr || slot < 0 || slot >= FLAGCX_MAX_IPC_ENTRIES) {
+    return flagcxInvalidArgument;
+  }
+  struct flagcxIpcTableEntry *entry = &comm->ipcTable[slot];
+  if (entry->refCount == 0) {
+    WARN("releaseIpcTableEntry: slot %d reference count underflow", slot);
+    entry->inUse = false;
+    return flagcxInternalError;
+  }
+  --entry->refCount;
+  entry->inUse = entry->refCount != 0;
+  return flagcxSuccess;
 }
 
 // ==========================================================================
@@ -953,21 +1204,32 @@ extern "C" flagcxResult_t flagcxDevCommDestroy(flagcxComm_t comm,
   if (comm != nullptr && devComm->barrierIpcIndex >= 0 &&
       devComm->barrierIpcIndex < FLAGCX_MAX_IPC_ENTRIES) {
     struct flagcxIpcTableEntry *e = &comm->ipcTable[devComm->barrierIpcIndex];
-    if (e->hostPeerPtrs) {
-      for (int i = 0; i < e->nPeers; i++) {
-        if (e->hostPeerPtrs[i] && e->hostPeerPtrs[i] != e->basePtr)
-          deviceAdaptor->ipcMemHandleClose(e->hostPeerPtrs[i]);
+    flagcxResult_t releaseResult =
+        releaseIpcTableEntry(comm, devComm->barrierIpcIndex);
+    if (releaseResult != flagcxSuccess) {
+      WARN("flagcxDevCommDestroy: failed to release IPC slot %d reference",
+           devComm->barrierIpcIndex);
+    }
+    if (e->refCount == 0) {
+      if (e->hostPeerPtrs) {
+        for (int i = 0; i < e->nPeers; i++) {
+          if (e->hostPeerPtrs[i] && e->hostPeerPtrs[i] != e->basePtr)
+            deviceAdaptor->ipcMemHandleClose(e->hostPeerPtrs[i]);
+        }
+        free(e->hostPeerPtrs);
+        e->hostPeerPtrs = nullptr;
       }
-      free(e->hostPeerPtrs);
-      e->hostPeerPtrs = nullptr;
+      if (e->devPeerPtrs) {
+        deviceAdaptor->deviceFree(e->devPeerPtrs, flagcxMemDevice, NULL);
+        e->devPeerPtrs = nullptr;
+      }
+      e->basePtr = nullptr;
+      e->size = 0;
+      e->nPeers = 0;
+      e->refCount = 0;
+      e->bindingGeneration = 0;
+      e->inUse = false;
     }
-    if (e->devPeerPtrs) {
-      deviceAdaptor->deviceFree(e->devPeerPtrs, flagcxMemDevice, NULL);
-      e->devPeerPtrs = nullptr;
-    }
-    e->basePtr = nullptr;
-    e->nPeers = 0;
-    e->inUse = false;
   }
 
   // ── shm path cleanup: unregister and close all shm mappings ───────────
@@ -1083,6 +1345,7 @@ extern "C" flagcxResult_t flagcxDevMemCreate(flagcxComm_t comm, void *buff,
   if (buff == nullptr || size == 0 || devMem == nullptr) {
     return flagcxInvalidArgument;
   }
+  *devMem = nullptr;
 
   flagcxDevMem_t handle =
       (flagcxDevMem_t)malloc(sizeof(struct flagcxDevMemInternal));
@@ -1153,18 +1416,44 @@ extern "C" flagcxResult_t flagcxDevMemCreate(flagcxComm_t comm, void *buff,
     // ---- Priority 4 & 5: No window — IPC (buildIpcPeerPointers checks
     //      globalRegPool internally to reuse pre-registered handles) ----
     else if (win == nullptr) {
-      // Check if already in ipcTable (from a previous flagcxDevMemCreate call)
+      // Check whether this rank can retain an existing binding. Every rank
+      // participates in the proposal exchange before choosing a path. Reuse
+      // requires the same collective binding generation on every rank; a
+      // local cache hit must never skip the handle-exchange collective while
+      // another rank rebuilds because its base, capacity, or lifetime differs.
       int existingIdx = -1;
       for (int i = 0; i < FLAGCX_MAX_IPC_ENTRIES; i++) {
-        if (comm->ipcTable[i].inUse && comm->ipcTable[i].basePtr == buff) {
+        if (comm->ipcTable[i].inUse && comm->ipcTable[i].refCount != 0 &&
+            comm->ipcTable[i].refCount !=
+                std::numeric_limits<size_t>::max() &&
+            comm->ipcTable[i].basePtr == buff &&
+            size <= comm->ipcTable[i].size &&
+            comm->ipcTable[i].devPeerPtrs != nullptr &&
+            comm->ipcTable[i].bindingGeneration != 0) {
           existingIdx = i;
           break;
         }
       }
-      if (existingIdx >= 0) {
-        // Already built — reuse existing entry
+      bool allCanReuse = false;
+      flagcxResult_t reuseAgreement =
+          agreeIpcTableReuse(comm, existingIdx, &allCanReuse);
+      if (reuseAgreement != flagcxSuccess) {
+        pthread_mutex_destroy(&handle->cachedPtrMutex);
+        free(handle);
+        return reuseAgreement;
+      }
+      if (allCanReuse) {
+        flagcxResult_t retainResult =
+            retainIpcTableEntry(comm, existingIdx);
+        if (retainResult != flagcxSuccess) {
+          pthread_mutex_destroy(&handle->cachedPtrMutex);
+          free(handle);
+          return retainResult;
+        }
         handle->ipcIndex = existingIdx;
       } else {
+        // At least one rank needs a new binding. All ranks enter the same build
+        // sequence, including ranks that still retain an older live entry.
         int idx = buildIpcPeerPointers(comm, buff, size);
         if (idx >= 0) {
           handle->ipcIndex = idx;
@@ -1181,6 +1470,9 @@ extern "C" flagcxResult_t flagcxDevMemCreate(flagcxComm_t comm, void *buff,
     auto *kWin = new (std::nothrow) typename DeviceAPI::Window{};
     if (kWin == nullptr) {
       WARN("flagcxDevMemCreate: failed to allocate DeviceAPI::Window");
+      if (comm != nullptr && handle->ipcIndex >= 0) {
+        (void)releaseIpcTableEntry(comm, handle->ipcIndex);
+      }
       pthread_mutex_destroy(&handle->cachedPtrMutex);
       free(handle);
       return flagcxSystemError;
@@ -1206,6 +1498,9 @@ extern "C" flagcxResult_t flagcxDevMemCreate(flagcxComm_t comm, void *buff,
            "the vendor Device API path. Disable FLAGCX_USE_HETERO_COMM or "
            "rebuild with FORCE_DEFAULT_PATH=1.");
       delete kWin;
+      if (comm != nullptr && handle->ipcIndex >= 0) {
+        (void)releaseIpcTableEntry(comm, handle->ipcIndex);
+      }
       pthread_mutex_destroy(&handle->cachedPtrMutex);
       free(handle);
       return flagcxInvalidUsage;
@@ -1234,11 +1529,12 @@ extern "C" flagcxResult_t flagcxDevMemDestroy(flagcxComm_t comm,
     return flagcxSuccess;
   }
 
-  // Mark IPC table entry as no longer in use (actual cleanup deferred to
-  // flagcxCommDestroy.
+  // Drop this handle's IPC table reference. Imported mappings and the pointer
+  // array stay resident until the slot is rebound or the communicator is
+  // destroyed, avoiding deviceFree-induced synchronization here.
   if (comm != nullptr && devMem->ipcIndex >= 0 &&
       devMem->ipcIndex < FLAGCX_MAX_IPC_ENTRIES) {
-    comm->ipcTable[devMem->ipcIndex].inUse = false;
+    (void)releaseIpcTableEntry(comm, devMem->ipcIndex);
   }
 
   // Free window allocation if present
@@ -1385,10 +1681,10 @@ flagcxResult_t flagcxCommCleanupIpcTable(flagcxComm_t comm) {
       continue; // empty slot
     }
 
-    if (e->inUse) {
-      WARN("flagcxCommCleanupIpcTable: entry %d still in use — "
+    if (e->refCount != 0) {
+      WARN("flagcxCommCleanupIpcTable: entry %d still has %zu references — "
            "flagcxDevMemDestroy should be called before flagcxCommDestroy",
-           k);
+           k, e->refCount);
     }
 
     // Close IPC handles
@@ -1408,6 +1704,11 @@ flagcxResult_t flagcxCommCleanupIpcTable(flagcxComm_t comm) {
       e->devPeerPtrs = nullptr;
     }
 
+    e->basePtr = nullptr;
+    e->size = 0;
+    e->nPeers = 0;
+    e->refCount = 0;
+    e->bindingGeneration = 0;
     e->inUse = false;
   }
 
