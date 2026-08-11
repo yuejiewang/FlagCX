@@ -537,8 +537,16 @@ FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticReduceAbort(
          ordinal += stride) {
       // No reduction result is valid on this path. Publishing DONE is solely
       // an error-unwind mechanism that releases already-submitted stream
-      // waits before the original host error is returned.
-      triggers[ordinal].setComplete();
+      // waits before the original host error is returned. Static triggers are
+      // immutable invocation entries, so their mapped FIFO state is not
+      // recycled.
+      const uint64_t flagOut = triggers[ordinal].getFlagOut();
+      if (flagOut != 0) {
+        DeviceAPI::Atomic::store(
+            reinterpret_cast<uint64_t *>(flagOut),
+            static_cast<uint64_t>(flagcxStreamFlagDone),
+            flagcxDeviceMemoryOrderRelease);
+      }
     }
   }
   FLAGCX_DEVICE_SYNC_THREADS();
@@ -573,17 +581,6 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticReduceExecutor(
       return;
     }
 
-    if (tid == 0 && shm[FLAG_OUT_IDX] != 0) {
-      const uint64_t flagOut = shm[FLAG_OUT_IDX];
-      if (loadStreamFlagState(flagOut) == flagcxStreamFlagIdle) {
-        DeviceAPI::Atomic::store(
-            reinterpret_cast<uint64_t *>(flagOut),
-            static_cast<uint64_t>(flagcxStreamFlagPend),
-            flagcxDeviceMemoryOrderRelease);
-      }
-    }
-    FLAGCX_DEVICE_SYNC_THREADS();
-
     if (tid == 0) {
       shm[STATIC_ABORT_IDX] = 0;
       const uint64_t flagIn = shm[FLAG_IN_IDX];
@@ -609,12 +606,16 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticReduceExecutor(
     FLAGCX_DEVICE_SYNC_THREADS();
     FLAGCX_DEVICE_THREAD_FENCE();
     // Every reduction thread must finish its system fence before thread 0
-    // publishes DONE to a consumer on another stream.
+    // publishes DONE to a consumer on another stream. Unlike the dynamic
+    // FIFO, this exact static array is never re-enqueued, so completion does
+    // not need a mapped trigger-state read/modify/write.
     FLAGCX_DEVICE_SYNC_THREADS();
-    if (tid == 0) {
-      triggers[ordinal].setComplete();
+    if (tid == 0 && shm[FLAG_OUT_IDX] != 0) {
+      DeviceAPI::Atomic::store(
+          reinterpret_cast<uint64_t *>(shm[FLAG_OUT_IDX]),
+          static_cast<uint64_t>(flagcxStreamFlagDone),
+          flagcxDeviceMemoryOrderRelease);
     }
-    FLAGCX_DEVICE_SYNC_THREADS();
   }
 }
 
