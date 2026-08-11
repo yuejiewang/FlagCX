@@ -1020,7 +1020,7 @@ FLAGCX_DEVICE_INLINE_DECORATOR void finishStaticCollectiveExecution(
       while (true) {
         const uint64_t observed = DeviceAPI::Atomic::load(
             localDone, flagcxDeviceMemoryOrderAcquire);
-        if (flagcxIpcControlEpochMatches(observed, control.epoch)) {
+        if (flagcxIpcControlEpochReached(observed, control.epoch)) {
           if ((observed & flagcxIpcControlAbortBit) != 0) {
             aborted = true;
           }
@@ -1251,7 +1251,7 @@ FLAGCX_GLOBAL_DECORATOR void flagcxStaticIpcRecoveryKernel(
     uint64_t *localDone = getStaticIpcReadyPointer(
         readyMem, ipcControl.doneBase + static_cast<uint64_t>(peer));
     int backoff = 0;
-    while (!flagcxIpcControlEpochMatches(
+    while (!flagcxIpcControlEpochReached(
         DeviceAPI::Atomic::load(localDone, flagcxDeviceMemoryOrderAcquire),
         ipcControl.epoch)) {
       DeviceAPI::Intrin::spinBackoff(backoff++);

@@ -394,11 +394,15 @@ TEST(UniRunnerStaticIpcTrigger, EncodesBoundedControlEpochsAndAbortState) {
   EXPECT_FALSE(flagcxIpcControlEpochValid(
       flagcxIpcControlAbortBit | uint64_t{1}));
 
-  EXPECT_TRUE(flagcxIpcControlEpochMatches(7, 7));
-  EXPECT_TRUE(flagcxIpcControlEpochMatches(
+  EXPECT_TRUE(flagcxIpcControlEpochReached(7, 7));
+  EXPECT_TRUE(flagcxIpcControlEpochReached(8, 7));
+  EXPECT_TRUE(flagcxIpcControlEpochReached(
       flagcxIpcControlAbortBit | uint64_t{7}, 7));
-  EXPECT_FALSE(flagcxIpcControlEpochMatches(6, 7));
-  EXPECT_FALSE(flagcxIpcControlEpochMatches(7, 0));
+  EXPECT_TRUE(flagcxIpcControlEpochReached(
+      flagcxIpcControlAbortBit | uint64_t{8}, 7));
+  EXPECT_FALSE(flagcxIpcControlEpochReached(6, 7));
+  EXPECT_FALSE(flagcxIpcControlEpochReached(7, 0));
+  EXPECT_FALSE(flagcxIpcControlEpochReached(1, maxControlEpoch));
 }
 
 TEST(UniRunnerStaticIpcTrigger,

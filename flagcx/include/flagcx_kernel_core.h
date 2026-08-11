@@ -95,10 +95,14 @@ FLAGCX_HOST_DEVICE_INLINE bool flagcxIpcControlEpochValid(uint64_t epoch) {
   return epoch != 0 && (epoch & flagcxIpcControlAbortBit) == 0;
 }
 
-FLAGCX_HOST_DEVICE_INLINE bool flagcxIpcControlEpochMatches(uint64_t value,
+FLAGCX_HOST_DEVICE_INLINE bool flagcxIpcControlEpochReached(uint64_t value,
                                                             uint64_t epoch) {
-  return flagcxIpcControlEpochValid(epoch) &&
-         (value & ~flagcxIpcControlAbortBit) == epoch;
+  const uint64_t observedEpoch = value & ~flagcxIpcControlAbortBit;
+  // Control epochs deliberately do not wrap.  A faster rank may overwrite
+  // done[E] with done[E+1] before a slower rank observes E, so accepting only
+  // equality can strand the slower rank forever.
+  return flagcxIpcControlEpochValid(epoch) && observedEpoch != 0 &&
+         observedEpoch >= epoch;
 }
 
 struct alignas(16) flagcxStaticIpcControl {
