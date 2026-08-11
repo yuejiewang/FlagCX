@@ -1272,37 +1272,6 @@ extern "C" flagcxResult_t flagcxDevCommDestroy(flagcxComm_t comm,
   // IPC mappings to localBarrierFlags (peer writes via IPC). They are
   // drained at flagcxCommDestroy time when all peers are guaranteed done.
   if (comm != nullptr) {
-    // Emergency drain if queue is full (should never happen in practice)
-    if (comm->deferredBufferCount >= FLAGCX_MAX_DEFERRED_BUFFER_HANDLES) {
-      WARN("flagcxDevCommDestroy: deferred buffer queue full (%d), "
-           "draining now",
-           FLAGCX_MAX_DEFERRED_BUFFER_HANDLES);
-      while (!flagcxIntruQueueEmpty(&comm->deferredBufferQueue)) {
-        struct flagcxDevCommBufferHandle *h =
-            flagcxIntruQueueDequeue(&comm->deferredBufferQueue);
-        if (h->localBarrierFlags)
-          deviceAdaptor->deviceFree(h->localBarrierFlags, flagcxMemDevice,
-                                    NULL);
-        if (h->epochBuffer)
-          deviceAdaptor->deviceFree(h->epochBuffer, flagcxMemDevice, NULL);
-        if (h->signalBuffer) {
-          if (h->signalHostEnable)
-            deviceAdaptor->deviceFree(h->signalBuffer, flagcxMemHost, NULL);
-          else
-            deviceAdaptor->gdrMemFree(h->signalBuffer, NULL);
-        }
-        if (h->shadowBuffer)
-          deviceAdaptor->deviceFree(h->shadowBuffer, flagcxMemDevice, NULL);
-        if (h->counterBuffer)
-          deviceAdaptor->deviceFree(h->counterBuffer, flagcxMemHost, NULL);
-        if (h->putValueStagingBuffer)
-          deviceAdaptor->deviceFree(h->putValueStagingBuffer, flagcxMemHost,
-                                    NULL);
-        free(h);
-      }
-      comm->deferredBufferCount = 0;
-    }
-
     struct flagcxDevCommBufferHandle *bufHandle = nullptr;
     FLAGCXCHECK(flagcxCalloc(&bufHandle, 1));
     // IPC path: localBarrierFlags is device-allocated.
@@ -1318,7 +1287,12 @@ extern "C" flagcxResult_t flagcxDevCommDestroy(flagcxComm_t comm,
     bufHandle->signalHostEnable = flagcxParamSignalHostEnable();
     bufHandle->next = nullptr;
     flagcxIntruQueueEnqueue(&comm->deferredBufferQueue, bufHandle);
-    comm->deferredBufferCount++;
+    if (comm->deferredBufferCount == std::numeric_limits<size_t>::max()) {
+      WARN("flagcxDevCommDestroy: deferred buffer count saturated; "
+           "queue remains intact and will drain at communicator cleanup");
+    } else {
+      ++comm->deferredBufferCount;
+    }
   }
 
   // Device pointer cache cleanup
@@ -1721,15 +1695,35 @@ flagcxResult_t flagcxCommCleanupIpcTable(flagcxComm_t comm) {
 void flagcxCommDeferFree(flagcxComm_t comm, void *ptr, int memType) {
   if (comm == nullptr || ptr == nullptr)
     return;
-  if (comm->deferredFreeCount >= FLAGCX_MAX_DEFERRED_FREES) {
-    WARN("flagcxCommDeferFree: deferred free list full (%d), freeing now",
-         FLAGCX_MAX_DEFERRED_FREES);
-    deviceAdaptor->deviceFree(ptr, (flagcxMemType_t)memType, NULL);
+  if (comm->deferredFreeCount < FLAGCX_MAX_DEFERRED_FREES) {
+    struct flagcxDeferredFree *entry =
+        &comm->deferredFrees[comm->deferredFreeCount++];
+    entry->ptr = ptr;
+    entry->memType = memType;
+    entry->next = nullptr;
     return;
   }
-  comm->deferredFrees[comm->deferredFreeCount].ptr = ptr;
-  comm->deferredFrees[comm->deferredFreeCount].memType = memType;
-  comm->deferredFreeCount++;
+
+  struct flagcxDeferredFree *overflow =
+      static_cast<struct flagcxDeferredFree *>(malloc(sizeof(*overflow)));
+  if (overflow == nullptr) {
+    // This allocation may still have live peer IPC mappings. Leaking it is
+    // safer than an early deviceFree, which can invalidate remote access or
+    // introduce a device-wide synchronization while kernels are active.
+    WARN("flagcxCommDeferFree: overflow node allocation failed; leaking "
+         "deferred allocation %p instead of freeing it early",
+         ptr);
+    return;
+  }
+  overflow->ptr = ptr;
+  overflow->memType = memType;
+  overflow->next = nullptr;
+  if (comm->deferredFreeOverflowTail != nullptr) {
+    comm->deferredFreeOverflowTail->next = overflow;
+  } else {
+    comm->deferredFreeOverflowHead = overflow;
+  }
+  comm->deferredFreeOverflowTail = overflow;
 }
 
 flagcxResult_t flagcxCommDrainDeferredFrees(flagcxComm_t comm) {
@@ -1743,6 +1737,20 @@ flagcxResult_t flagcxCommDrainDeferredFrees(flagcxComm_t comm) {
     }
   }
   comm->deferredFreeCount = 0;
+
+  struct flagcxDeferredFree *overflow = comm->deferredFreeOverflowHead;
+  while (overflow != nullptr) {
+    struct flagcxDeferredFree *next = overflow->next;
+    if (overflow->ptr != nullptr) {
+      deviceAdaptor->deviceFree(
+          overflow->ptr, static_cast<flagcxMemType_t>(overflow->memType),
+          NULL);
+    }
+    free(overflow);
+    overflow = next;
+  }
+  comm->deferredFreeOverflowHead = nullptr;
+  comm->deferredFreeOverflowTail = nullptr;
   return flagcxSuccess;
 }
 

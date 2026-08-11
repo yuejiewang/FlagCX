@@ -36,13 +36,12 @@ struct flagcxIpcTableEntry {
 struct flagcxDeferredFree {
   void *ptr;
   int memType; // flagcxMemDevice, flagcxMemHost, etc.
+  struct flagcxDeferredFree *next; // used only by dynamic overflow nodes
 };
 
 // Deferred DevComm buffer handle — buffers that cannot be freed immediately
 // in flagcxDevCommDestroy because peers may still hold IPC mappings to them.
 // Drained at flagcxCommDestroy time.
-#define FLAGCX_MAX_DEFERRED_BUFFER_HANDLES 64
-
 struct flagcxDevCommBufferHandle {
   void *localBarrierFlags;     // flagcxMemDevice — peers write via IPC
   void *epochBuffer;           // flagcxMemDevice
@@ -119,11 +118,14 @@ struct flagcxComm {
   flagcxIntruQueue<struct flagcxDevCommBufferHandle,
                    &flagcxDevCommBufferHandle::next>
       deferredBufferQueue;
-  int deferredBufferCount;
+  size_t deferredBufferCount;
 
-  // Deferred device/host-pinned memory free list
+  // Deferred device/host-pinned memory free list. The inline array covers the
+  // common case; excess entries are appended to the dynamic overflow queue.
   struct flagcxDeferredFree deferredFrees[FLAGCX_MAX_DEFERRED_FREES];
   int deferredFreeCount;
+  struct flagcxDeferredFree *deferredFreeOverflowHead;
+  struct flagcxDeferredFree *deferredFreeOverflowTail;
 
   // Custom op state (NULL = not enabled)
   struct flagcxDevCommState *devCommState;
