@@ -89,9 +89,12 @@ FLAGCX_GLOBAL_DECORATOR void flagcxStaticCollectiveKernel(
     flagcxReduceTrigger *redTriggers, uint64_t numRedTriggers,
     flagcxIpcTrigger *ipcTriggers, uint64_t numIpcTriggers,
     flagcxDevMem inputMem, flagcxDevMem outputMem, flagcxDevMem readyMem,
-    const uint64_t *ipcParentFlags, uint64_t numRedBlocks,
-    uint64_t numIpcBlocks, const uint64_t *abortFlag,
-    uint64_t avgDivisor);
+    const uint64_t *ipcParentFlags, uint64_t numIpcParentFlags,
+    uint64_t numRedBlocks, uint64_t numIpcBlocks,
+    const uint64_t *abortFlag, uint64_t avgDivisor);
+FLAGCX_GLOBAL_DECORATOR void flagcxStaticIpcRecoveryKernel(
+    flagcxIpcTrigger *ipcTriggers, uint64_t numIpcTriggers,
+    flagcxDevMem readyMem);
 #endif // COMPILE_KERNEL
 
 flagcxResult_t flagcxLaunchCollectiveKernel(
@@ -112,8 +115,12 @@ flagcxResult_t flagcxLaunchStaticCollectiveKernel(
     void *ipcFifoDeviceBuffer, size_t numIpcTriggers,
     flagcxDevMem_t inputMem, flagcxDevMem_t outputMem,
     flagcxDevMem_t readyMem, const uint64_t *ipcParentFlags,
-    size_t nthreads, size_t nRedBlocks, size_t nIpcBlocks,
-    size_t maxExecutorBlocks, uint64_t avgDivisor, flagcxStream_t stream);
+    size_t numIpcParentFlags, size_t nthreads, size_t nRedBlocks,
+    size_t nIpcBlocks, size_t maxExecutorBlocks, uint64_t avgDivisor,
+    flagcxStream_t stream);
+flagcxResult_t flagcxLaunchStaticIpcRecoveryKernel(
+    void *ipcFifoDeviceBuffer, size_t numIpcTriggers,
+    flagcxDevMem_t readyMem, flagcxStream_t stream);
 
 // ==========================================================================
 // Device Communicator — Host-side lifecycle management
