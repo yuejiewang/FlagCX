@@ -149,6 +149,17 @@ struct uniRunnerDagExecutionPlan {
   size_t numIpcNodes = 0;
 };
 
+// Per-invocation executor counts derived from the DAG and the runtime
+// residency budget. A task of either device type with ordinal i is owned by
+// block i % num<Type>Blocks and is the (i / num<Type>Blocks)-th task of that
+// block. The trigger arrays therefore remain flat and in topological order.
+struct uniRunnerStaticExecutorSchedule {
+  size_t numRedTasks = 0;
+  size_t numIpcTasks = 0;
+  size_t numRedBlocks = 0;
+  size_t numIpcBlocks = 0;
+};
+
 typedef struct {
   pthread_t thread;
   flagcxFifo_t fifo;
@@ -276,6 +287,13 @@ flagcxResult_t compileUniRunnerDagExecutionPlan(
     const uniRunnerDagNode *nodes, size_t numNodes,
     uniRunnerDagExecutionPlan *plan);
 void destroyUniRunnerDagExecutionPlan(uniRunnerDagExecutionPlan *plan);
+flagcxResult_t resolveUniRunnerStaticExecutorSchedule(
+    const uniRunnerDagExecutionPlan *plan, size_t requestedRedBlocks,
+    size_t requestedIpcBlocks, size_t maxExecutorBlocks,
+    uniRunnerStaticExecutorSchedule *schedule);
+flagcxResult_t getUniRunnerStaticTaskAssignment(
+    size_t taskOrdinal, size_t numTasks, size_t numBlocks, size_t *blockIdx,
+    size_t *blockTaskOrdinal);
 
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm);
 flagcxResult_t

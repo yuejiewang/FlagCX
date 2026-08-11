@@ -6,6 +6,7 @@
 
 #include "alloc.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <limits>
@@ -196,4 +197,109 @@ flagcxResult_t compileUniRunnerDagExecutionPlan(
   } catch (...) {
     return flagcxSystemError;
   }
+}
+
+flagcxResult_t resolveUniRunnerStaticExecutorSchedule(
+    const uniRunnerDagExecutionPlan *plan, size_t requestedRedBlocks,
+    size_t requestedIpcBlocks, size_t maxExecutorBlocks,
+    uniRunnerStaticExecutorSchedule *schedule) {
+  if (schedule == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *schedule = {};
+  if (plan == NULL ||
+      plan->numNodes >
+          static_cast<size_t>(std::numeric_limits<int>::max()) ||
+      ((plan->numNodes == 0) != (plan->topoOrder == NULL)) ||
+      plan->numHostNodes > plan->numNodes ||
+      plan->numRedNodes > plan->numNodes - plan->numHostNodes ||
+      plan->numIpcNodes !=
+          plan->numNodes - plan->numHostNodes - plan->numRedNodes) {
+    return flagcxInvalidArgument;
+  }
+
+  schedule->numRedTasks = plan->numRedNodes;
+  schedule->numIpcTasks = plan->numIpcNodes;
+  if (plan->numRedNodes == 0 && plan->numIpcNodes == 0) {
+    return flagcxSuccess;
+  }
+  if ((plan->numRedNodes != 0 && requestedRedBlocks == 0) ||
+      (plan->numIpcNodes != 0 && requestedIpcBlocks == 0)) {
+    *schedule = {};
+    return flagcxInvalidArgument;
+  }
+
+  const size_t desiredRedBlocks =
+      std::min(requestedRedBlocks, plan->numRedNodes);
+  const size_t desiredIpcBlocks =
+      std::min(requestedIpcBlocks, plan->numIpcNodes);
+  const size_t activeExecutorTypes =
+      static_cast<size_t>(desiredRedBlocks != 0) +
+      static_cast<size_t>(desiredIpcBlocks != 0);
+  if (maxExecutorBlocks < activeExecutorTypes) {
+    *schedule = {};
+    return flagcxInvalidArgument;
+  }
+
+  const size_t desiredBlocks = desiredRedBlocks + desiredIpcBlocks;
+  if (desiredBlocks <= maxExecutorBlocks) {
+    schedule->numRedBlocks = desiredRedBlocks;
+    schedule->numIpcBlocks = desiredIpcBlocks;
+    return flagcxSuccess;
+  }
+
+  // Preserve at least one block for every non-empty executor type. Split the
+  // remaining residency budget approximately evenly, then give unused share
+  // to the type that still has requested work (RED first for deterministic
+  // tie-breaking). This path is reached only for an over-subscribed config.
+  schedule->numRedBlocks = desiredRedBlocks != 0 ? 1 : 0;
+  schedule->numIpcBlocks = desiredIpcBlocks != 0 ? 1 : 0;
+  const size_t redExtraNeeded =
+      desiredRedBlocks - schedule->numRedBlocks;
+  const size_t ipcExtraNeeded =
+      desiredIpcBlocks - schedule->numIpcBlocks;
+  const size_t totalExtraNeeded = redExtraNeeded + ipcExtraNeeded;
+  size_t remaining = std::min(
+      maxExecutorBlocks - activeExecutorTypes, totalExtraNeeded);
+
+  if (redExtraNeeded != 0 && ipcExtraNeeded != 0) {
+    const size_t redShare = remaining / 2 + remaining % 2;
+    const size_t redExtra = std::min(redExtraNeeded, redShare);
+    schedule->numRedBlocks += redExtra;
+    remaining -= redExtra;
+    const size_t ipcExtra = std::min(ipcExtraNeeded, remaining);
+    schedule->numIpcBlocks += ipcExtra;
+    remaining -= ipcExtra;
+  }
+
+  const size_t redRemaining =
+      desiredRedBlocks - schedule->numRedBlocks;
+  const size_t redExtra = std::min(redRemaining, remaining);
+  schedule->numRedBlocks += redExtra;
+  remaining -= redExtra;
+  const size_t ipcRemaining =
+      desiredIpcBlocks - schedule->numIpcBlocks;
+  schedule->numIpcBlocks += std::min(ipcRemaining, remaining);
+
+  const size_t resolvedBlocks =
+      schedule->numRedBlocks + schedule->numIpcBlocks;
+  if (resolvedBlocks != std::min(desiredBlocks, maxExecutorBlocks) ||
+      (plan->numRedNodes != 0 && schedule->numRedBlocks == 0) ||
+      (plan->numIpcNodes != 0 && schedule->numIpcBlocks == 0)) {
+    *schedule = {};
+    return flagcxInternalError;
+  }
+  return flagcxSuccess;
+}
+
+flagcxResult_t getUniRunnerStaticTaskAssignment(
+    size_t taskOrdinal, size_t numTasks, size_t numBlocks, size_t *blockIdx,
+    size_t *blockTaskOrdinal) {
+  if (blockIdx == NULL || blockTaskOrdinal == NULL || numBlocks == 0 ||
+      taskOrdinal >= numTasks) {
+    return flagcxInvalidArgument;
+  }
+  *blockIdx = taskOrdinal % numBlocks;
+  *blockTaskOrdinal = taskOrdinal / numBlocks;
+  return flagcxSuccess;
 }
