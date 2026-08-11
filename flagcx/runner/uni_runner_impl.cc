@@ -2943,6 +2943,16 @@ static void resetDagSchedulerRuntimeState(flagcxUniRunnerState *runnerState) {
   runnerState->numPendingNodes = 0;
 }
 
+static flagcxResult_t
+prepareUniRunnerDagExecutionPlan(flagcxUniRunnerState *runnerState) {
+  if (runnerState == NULL || runnerState->numDagNodes < 0) {
+    return flagcxInvalidArgument;
+  }
+  return compileUniRunnerDagExecutionPlan(
+      runnerState->dagNodes, static_cast<size_t>(runnerState->numDagNodes),
+      &runnerState->dagPlan);
+}
+
 static flagcxResult_t captureUniRunnerDagTemplateFromState(
     const flagcxUniRunnerState *runnerState, const uniRunnerDagCacheKey &key,
     const uniRunnerDagRuntimeBindings &bindings,
@@ -3147,6 +3157,7 @@ static flagcxResult_t tryLoadCachedUniRunnerDag(
   FLAGCXCHECK(
       materializeUniRunnerDagTemplate(runnerState, *dagTemplate, bindings));
   FLAGCXCHECK(validateDagNodes(runnerState));
+  FLAGCXCHECK(prepareUniRunnerDagExecutionPlan(runnerState));
   *cacheHit = true;
   return flagcxSuccess;
 }
@@ -3181,6 +3192,7 @@ static flagcxResult_t cleanupDagScheduler(flagcxUniRunnerState *runnerState) {
   if (!runnerState) {
     return flagcxSuccess;
   }
+  destroyUniRunnerDagExecutionPlan(&runnerState->dagPlan);
   if (runnerState->dagNodes) {
     for (int i = 0; i < runnerState->numDagNodes; i++) {
       if (runnerState->dagNodes[i].nodeType == uniRunnerDagNodeTypeP2p &&
@@ -3221,6 +3233,7 @@ static flagcxResult_t initUniRunnerStateCached(
   }
 
   FLAGCXCHECK(buildFn());
+  FLAGCXCHECK(prepareUniRunnerDagExecutionPlan(runnerState));
   return cacheBuiltUniRunnerDag(runnerState, key, bindings);
 }
 
@@ -3386,6 +3399,7 @@ flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
   // unchanged and all existing cached algorithms are preserved.
   FLAGCXCHECK(buildUniRunnerStateIpcAR(runnerState, sendbuff, recvbuff, count,
                                        datatype, op, comm));
+  FLAGCXCHECK(prepareUniRunnerDagExecutionPlan(runnerState));
   if (runnerState->ipcReadySlots == 0)
     return flagcxSuccess;
   FLAGCXCHECK(ensureUniRunnerIpcDataViews(runnerState, comm, sendbuff,
@@ -3867,6 +3881,11 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   runnerState->dagNodes = NULL;
   runnerState->numDagNodes = 0;
+  runnerState->dagPlan.topoOrder = NULL;
+  runnerState->dagPlan.numNodes = 0;
+  runnerState->dagPlan.numHostNodes = 0;
+  runnerState->dagPlan.numRedNodes = 0;
+  runnerState->dagPlan.numIpcNodes = 0;
   runnerState->streamFlagsSize = 0;
   runnerState->ipcReadySlots = 0;
 
@@ -3961,6 +3980,14 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
   FLAGCXCHECK(validateDagNodes(runnerState));
+  const size_t numDagNodes = static_cast<size_t>(runnerState->numDagNodes);
+  if (runnerState->dagPlan.numNodes != numDagNodes ||
+      (numDagNodes != 0 && runnerState->dagPlan.topoOrder == NULL) ||
+      runnerState->dagPlan.numHostNodes + runnerState->dagPlan.numRedNodes +
+              runnerState->dagPlan.numIpcNodes !=
+          numDagNodes) {
+    return flagcxInternalError;
+  }
   FLAGCXCHECK(prepareDagStreamFlags(runnerState));
   FLAGCXCHECK(prepareUniRunnerIpcParentFlags(runnerState));
   if (runnerState->ipcReadySlots != 0) {

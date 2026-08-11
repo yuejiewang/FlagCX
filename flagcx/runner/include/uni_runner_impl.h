@@ -138,6 +138,17 @@ struct uniRunnerDagNode {
   } nodeData;
 };
 
+// Stable, host-compiled execution order for a validated DAG. Later executor
+// stages derive per-node-type static queues and block assignments from this
+// single order, avoiding duplicate persistent arrays.
+struct uniRunnerDagExecutionPlan {
+  int *topoOrder = NULL;
+  size_t numNodes = 0;
+  size_t numHostNodes = 0;
+  size_t numRedNodes = 0;
+  size_t numIpcNodes = 0;
+};
+
 typedef struct {
   pthread_t thread;
   flagcxFifo_t fifo;
@@ -151,6 +162,7 @@ typedef struct {
   struct uniRunnerDagNode *dagNodes; // Array of all DAG nodes
   int numDagNodes;
   int numPendingNodes;
+  struct uniRunnerDagExecutionPlan dagPlan;
   flagcxIntruQueue<struct uniRunnerDagNode, &uniRunnerDagNode::next>
       p2pReadyQueue;
   flagcxIntruQueue<struct uniRunnerDagNode, &uniRunnerDagNode::next>
@@ -255,6 +267,15 @@ flagcxResult_t checkedUniRunnerDagNodeCount(size_t outerCount,
                                             size_t nodesPerOuter,
                                             size_t extraNodes,
                                             int *nodeCount);
+
+// Compile a structurally validated DAG into the stable HOST -> RED -> IPC
+// phase-drain order used by uniRunner when FIFO capacity is not a constraint.
+// The compiler is pure with respect to DAG nodes and rejects cycles instead of
+// allowing the runtime scheduler to spin indefinitely.
+flagcxResult_t compileUniRunnerDagExecutionPlan(
+    const uniRunnerDagNode *nodes, size_t numNodes,
+    uniRunnerDagExecutionPlan *plan);
+void destroyUniRunnerDagExecutionPlan(uniRunnerDagExecutionPlan *plan);
 
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm);
 flagcxResult_t
