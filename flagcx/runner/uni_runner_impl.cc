@@ -196,6 +196,7 @@ struct uniRunnerDagRuntimeBindings {
   size_t inputBytes = 0;
   size_t outputBytes = 0;
   size_t scratchBytes = 0;
+  int localRanks = 0;
 };
 
 static flagcxRedOp_t effectiveUniRunnerRedOp(flagcxRedOp_t requestedOp,
@@ -639,6 +640,96 @@ uint64_t getUniRunnerDagAlgorithmHash(
       break;
   }
   return hashValue;
+}
+
+flagcxResult_t getUniRunnerIpcTopologyHash(int localRanks, int nranks,
+                                           const int *localRankToRank,
+                                           uint64_t *topologyHash) {
+  if (localRanks <= 0 || nranks <= 0 || localRanks != nranks ||
+      nranks > FLAGCX_MAX_LOCAL_RANKS || localRankToRank == NULL ||
+      topologyHash == NULL) {
+    return localRanks > 0 && nranks > 0 && localRanks != nranks
+               ? flagcxNotSupported
+               : flagcxInvalidArgument;
+  }
+  for (int localRank = 0; localRank < localRanks; ++localRank) {
+    const int globalRank = localRankToRank[localRank];
+    if (globalRank < 0 || globalRank >= nranks) {
+      return flagcxInvalidArgument;
+    }
+    for (int previous = 0; previous < localRank; ++previous) {
+      if (localRankToRank[previous] == globalRank) {
+        return flagcxInvalidArgument;
+      }
+    }
+  }
+
+  uint64_t hashValue = kUniRunnerDagFnvOffsetBasis;
+  hashValue = hashAlgorithmUint64(hashValue,
+                                  static_cast<uint64_t>(localRanks));
+  for (int localRank = 0; localRank < localRanks; ++localRank) {
+    hashValue = hashAlgorithmUint64(
+        hashValue, static_cast<uint64_t>(localRankToRank[localRank]));
+  }
+  *topologyHash = hashValue;
+  return flagcxSuccess;
+}
+
+flagcxResult_t validateUniRunnerIpcDagTemplateBindings(
+    const uniRunnerDagTemplate &dagTemplate, size_t inputBytes,
+    size_t outputBytes, int localRanks) {
+  size_t numIpcNodes = 0;
+  for (const uniRunnerDagNodeDesc &node : dagTemplate.nodes) {
+    if (node.nodeType == uniRunnerDagNodeTypeIpc) {
+      ++numIpcNodes;
+    }
+  }
+  if (numIpcNodes == 0) {
+    return flagcxSuccess;
+  }
+  if (localRanks <= 0 ||
+      numIpcNodes > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    return flagcxInvalidArgument;
+  }
+
+  std::vector<uint8_t> readySlots;
+  try {
+    readySlots.assign(numIpcNodes, uint8_t{0});
+  } catch (...) {
+    return flagcxSystemError;
+  }
+  for (const uniRunnerDagNodeDesc &node : dagTemplate.nodes) {
+    if (node.nodeType != uniRunnerDagNodeTypeIpc) {
+      continue;
+    }
+    const uniRunnerDagIpcOpDesc &ipc = node.ipc;
+    if (ipc.srcBufferType != flagcxIpcBufferInput &&
+        ipc.srcBufferType != flagcxIpcBufferOutput) {
+      return flagcxInvalidArgument;
+    }
+    const size_t srcBytes = ipc.srcBufferType == flagcxIpcBufferInput
+                                ? inputBytes
+                                : outputBytes;
+    if (ipc.srcOffsetBytes > srcBytes ||
+        ipc.bytes > srcBytes - ipc.srcOffsetBytes ||
+        ipc.dstOffsetBytes > outputBytes ||
+        ipc.bytes > outputBytes - ipc.dstOffsetBytes ||
+        ipc.peerLocalRank < 0 || ipc.peerLocalRank >= localRanks ||
+        static_cast<size_t>(ipc.readySlot) >= numIpcNodes ||
+        readySlots[ipc.readySlot] != 0) {
+      return flagcxInvalidArgument;
+    }
+    readySlots[ipc.readySlot] = 1;
+  }
+  // There are exactly numIpcNodes unique slots in [0, numIpcNodes), which is
+  // equivalent to the required dense range. Keep the explicit check as a
+  // guard if validation above is later refactored.
+  for (uint8_t present : readySlots) {
+    if (present == 0) {
+      return flagcxInvalidArgument;
+    }
+  }
+  return flagcxSuccess;
 }
 
 size_t getUniRunnerDagPatternHash(const uniRunnerDagCacheKey &key) {
@@ -3018,12 +3109,23 @@ static flagcxResult_t captureUniRunnerDagTemplateFromState(
                                    &nodeDesc.cpy.dst));
       nodeDesc.cpy.count = node->nodeData.cpy.count;
       nodeDesc.cpy.datatype = node->nodeData.cpy.datatype;
+    } else if (node->nodeType == uniRunnerDagNodeTypeIpc) {
+      nodeDesc.ipc.srcOffsetBytes = node->nodeData.ipc.srcOffsetBytes;
+      nodeDesc.ipc.dstOffsetBytes = node->nodeData.ipc.dstOffsetBytes;
+      nodeDesc.ipc.bytes = node->nodeData.ipc.bytes;
+      nodeDesc.ipc.srcBufferType = node->nodeData.ipc.srcBufferType;
+      nodeDesc.ipc.peerLocalRank = node->nodeData.ipc.peerLocalRank;
+      nodeDesc.ipc.readySlot = node->nodeData.ipc.readySlot;
     } else {
       return flagcxNotSupported;
     }
 
     captured->nodes.push_back(nodeDesc);
   }
+
+  FLAGCXCHECK(validateUniRunnerIpcDagTemplateBindings(
+      *captured, bindings.inputBytes, bindings.outputBytes,
+      bindings.localRanks));
 
   *dagTemplate = captured;
   return flagcxSuccess;
@@ -3033,6 +3135,9 @@ static flagcxResult_t
 materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
                                 const uniRunnerDagTemplate &dagTemplate,
                                 const uniRunnerDagRuntimeBindings &bindings) {
+  // A rejected cache entry must not leave a ready-slot cardinality from a
+  // previous invocation visible to the collective IPC preparation agreement.
+  runnerState->ipcReadySlots = 0;
   const size_t maxInt =
       static_cast<size_t>(std::numeric_limits<int>::max());
   if (dagTemplate.nodes.size() > maxInt) {
@@ -3042,6 +3147,16 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
     if (node.parents.size() > maxInt || node.children.size() > maxInt ||
         node.p2pOps.size() > maxInt) {
       return flagcxInvalidArgument;
+    }
+  }
+  FLAGCXCHECK(validateUniRunnerIpcDagTemplateBindings(
+      dagTemplate, bindings.inputBytes, bindings.outputBytes,
+      bindings.localRanks));
+
+  size_t ipcReadySlots = 0;
+  for (const uniRunnerDagNodeDesc &node : dagTemplate.nodes) {
+    if (node.nodeType == uniRunnerDagNodeTypeIpc) {
+      ++ipcReadySlots;
     }
   }
 
@@ -3122,6 +3237,15 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
                                    &dst->nodeData.cpy.dst));
       dst->nodeData.cpy.count = src.cpy.count;
       dst->nodeData.cpy.datatype = src.cpy.datatype;
+    } else if (dst->nodeType == uniRunnerDagNodeTypeIpc) {
+      dst->nodeData.ipc.srcOffsetBytes = src.ipc.srcOffsetBytes;
+      dst->nodeData.ipc.dstOffsetBytes = src.ipc.dstOffsetBytes;
+      dst->nodeData.ipc.bytes = src.ipc.bytes;
+      dst->nodeData.ipc.srcBufferType = src.ipc.srcBufferType;
+      dst->nodeData.ipc.peerLocalRank = src.ipc.peerLocalRank;
+      dst->nodeData.ipc.readySlot = src.ipc.readySlot;
+      dst->nodeData.ipc.parentFlagsOffset = 0;
+      dst->nodeData.ipc.triggerIdx = -1;
     } else {
       return flagcxNotSupported;
     }
@@ -3129,6 +3253,8 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
     if (dst->numParents == 0) {
       if (dst->nodeType == uniRunnerDagNodeTypeRed) {
         flagcxIntruQueueEnqueue(&runnerState->redReadyQueue, dst);
+      } else if (dst->nodeType == uniRunnerDagNodeTypeIpc) {
+        flagcxIntruQueueEnqueue(&runnerState->ipcReadyQueue, dst);
       } else {
         flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, dst);
       }
@@ -3137,6 +3263,7 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
     }
   }
 
+  runnerState->ipcReadySlots = ipcReadySlots;
   return flagcxSuccess;
 }
 
@@ -3413,18 +3540,44 @@ flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
   if (result == flagcxSuccess) {
     result = checkedUniRunnerTypeBytes(count, 1, datatype, &bytes);
   }
-  // IPC nodes carry runtime Window/DevMem bindings and therefore intentionally
-  // bypass the static JSON DAG cache. The underlying SlicedAR topology remains
-  // unchanged and all existing cached algorithms are preserved.
+
+  uniRunnerDagRuntimeBindings bindings;
+  bindings.inputBase = sendbuff;
+  bindings.outputBase = recvbuff;
+  bindings.inputBytes = bytes;
+  bindings.outputBytes = bytes;
+  bindings.localRanks = comm->localRanks;
+
+  uniRunnerDagAlgorithmConfig algorithmConfig{};
+  algorithmConfig.numSlices = runnerState->uniRunnerNSlices;
+  algorithmConfig.numRedSlices = runnerState->uniRunnerNRedSlices;
+  algorithmConfig.bufferMode =
+      sendbuff == recvbuff ? uniRunnerDagBufferModeInPlace
+                           : uniRunnerDagBufferModeOutOfPlace;
   if (result == flagcxSuccess) {
-    result = buildUniRunnerStateIpcAR(
-        runnerState, sendbuff, recvbuff, count, datatype, op, comm);
+    result = getUniRunnerIpcTopologyHash(
+        comm->localRanks, comm->nranks, comm->localRankToRank,
+        &algorithmConfig.topologyHash);
   }
+
   if (result == flagcxSuccess) {
-    result = prepareUniRunnerDagExecutionPlan(runnerState);
+    const uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
+        uniRunnerDagAlgoIpcAR, algorithmConfig, flagcxCommOpAllReduce, count,
+        datatype, op, -1, comm);
+    try {
+      result = initUniRunnerStateCached(runnerState, key, bindings, [&]() {
+        return buildUniRunnerStateIpcAR(runnerState, sendbuff, recvbuff, count,
+                                        datatype, op, comm);
+      });
+    } catch (...) {
+      // IPC preparation is collective below: convert allocation/container
+      // exceptions into an agreed result instead of letting one rank escape.
+      result = flagcxSystemError;
+    }
   }
   // The data-view agreement below also makes DAG-build status, data bytes and
   // IPC-node cardinality collective before any rank enters DevMem creation.
+  // In particular, no local cache/build error returns before this agreement.
   FLAGCXCHECK(ensureUniRunnerIpcDataViews(
       runnerState, comm, sendbuff, recvbuff, bytes, result));
   if (runnerState->ipcReadySlots == 0)

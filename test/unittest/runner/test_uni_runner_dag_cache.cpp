@@ -119,6 +119,36 @@ TEST(UniRunnerDagCache, IpcAlgorithmHashIncludesLocalTopology) {
             getUniRunnerDagAlgorithmHash(uniRunnerDagAlgoIpcAR, config));
 }
 
+TEST(UniRunnerDagCache, IpcTopologyHashIsStableOrderedAndValidated) {
+  const int topology[] = {2, 0, 3, 1};
+  uint64_t hash = 0;
+  ASSERT_EQ(flagcxSuccess,
+            getUniRunnerIpcTopologyHash(4, 4, topology, &hash));
+  uint64_t repeated = 0;
+  ASSERT_EQ(flagcxSuccess,
+            getUniRunnerIpcTopologyHash(4, 4, topology, &repeated));
+  EXPECT_EQ(hash, repeated);
+
+  const int reordered[] = {0, 2, 3, 1};
+  uint64_t reorderedHash = 0;
+  ASSERT_EQ(flagcxSuccess,
+            getUniRunnerIpcTopologyHash(4, 4, reordered, &reorderedHash));
+  EXPECT_NE(hash, reorderedHash);
+
+  const int duplicate[] = {0, 1, 1, 3};
+  EXPECT_EQ(flagcxInvalidArgument,
+            getUniRunnerIpcTopologyHash(4, 4, duplicate, &repeated));
+  const int outOfRange[] = {0, 1, 2, 4};
+  EXPECT_EQ(flagcxInvalidArgument,
+            getUniRunnerIpcTopologyHash(4, 4, outOfRange, &repeated));
+  EXPECT_EQ(flagcxNotSupported,
+            getUniRunnerIpcTopologyHash(2, 4, topology, &repeated));
+  EXPECT_EQ(flagcxInvalidArgument,
+            getUniRunnerIpcTopologyHash(4, 4, nullptr, &repeated));
+  EXPECT_EQ(flagcxInvalidArgument,
+            getUniRunnerIpcTopologyHash(4, 4, topology, nullptr));
+}
+
 TEST(UniRunnerDagCache, PatternHashIncludesAlgorithmIdentity) {
   const uniRunnerDagCacheKey first = makeCacheKey(0x123456789abcdef0ull);
   uniRunnerDagCacheKey second = first;
@@ -256,6 +286,74 @@ TEST(UniRunnerDagCache, RejectsMalformedIpcDescriptorFields) {
     json["dag"]["nodes"][0]["ipc"][sizeField] = "1";
     EXPECT_FALSE(uniRunnerDeserializeDagTemplate(json, &decoded)) << sizeField;
   }
+}
+
+TEST(UniRunnerDagCache, ValidatesIpcMaterializationBindings) {
+  uniRunnerDagTemplate dagTemplate = makeIpcDagTemplate();
+  dagTemplate.nodes[0].ipc.srcOffsetBytes = 128;
+  dagTemplate.nodes[0].ipc.dstOffsetBytes = 256;
+  dagTemplate.nodes[0].ipc.bytes = 512;
+  dagTemplate.nodes[0].ipc.peerLocalRank = 1;
+  dagTemplate.nodes[0].ipc.readySlot = 0;
+  EXPECT_EQ(flagcxSuccess, validateUniRunnerIpcDagTemplateBindings(
+                              dagTemplate, 1024, 1024, 2));
+
+  uniRunnerDagTemplate malformed = dagTemplate;
+  malformed.nodes[0].ipc.srcBufferType =
+      static_cast<flagcxIpcBufferType>(99);
+  EXPECT_EQ(flagcxInvalidArgument,
+            validateUniRunnerIpcDagTemplateBindings(malformed, 1024, 1024,
+                                                    2));
+
+  malformed = dagTemplate;
+  malformed.nodes[0].ipc.peerLocalRank = 2;
+  EXPECT_EQ(flagcxInvalidArgument,
+            validateUniRunnerIpcDagTemplateBindings(malformed, 1024, 1024,
+                                                    2));
+
+  malformed = dagTemplate;
+  malformed.nodes[0].ipc.srcOffsetBytes = 800;
+  EXPECT_EQ(flagcxInvalidArgument,
+            validateUniRunnerIpcDagTemplateBindings(malformed, 1024, 1024,
+                                                    2));
+  malformed = dagTemplate;
+  malformed.nodes[0].ipc.dstOffsetBytes = 800;
+  EXPECT_EQ(flagcxInvalidArgument,
+            validateUniRunnerIpcDagTemplateBindings(malformed, 1024, 1024,
+                                                    2));
+
+  // A zero-byte one-past-end range is valid and cannot underflow the bounds
+  // checks used by materialization.
+  malformed = dagTemplate;
+  malformed.nodes[0].ipc.srcOffsetBytes = 1024;
+  malformed.nodes[0].ipc.dstOffsetBytes = 1024;
+  malformed.nodes[0].ipc.bytes = 0;
+  EXPECT_EQ(flagcxSuccess, validateUniRunnerIpcDagTemplateBindings(
+                              malformed, 1024, 1024, 2));
+}
+
+TEST(UniRunnerDagCache, RejectsNonDenseOrDuplicateIpcReadySlots) {
+  uniRunnerDagTemplate dagTemplate = makeIpcDagTemplate();
+  dagTemplate.nodes[0].ipc.srcOffsetBytes = 0;
+  dagTemplate.nodes[0].ipc.dstOffsetBytes = 0;
+  dagTemplate.nodes[0].ipc.bytes = 64;
+  dagTemplate.nodes[0].ipc.peerLocalRank = 0;
+  dagTemplate.nodes[0].ipc.readySlot = 0;
+  uniRunnerDagNodeDesc second = dagTemplate.nodes[0];
+  second.nodeIdx = 1;
+  second.ipc.readySlot = 1;
+  dagTemplate.nodes.push_back(second);
+  ASSERT_EQ(flagcxSuccess, validateUniRunnerIpcDagTemplateBindings(
+                              dagTemplate, 128, 128, 2));
+
+  dagTemplate.nodes[1].ipc.readySlot = 0;
+  EXPECT_EQ(flagcxInvalidArgument,
+            validateUniRunnerIpcDagTemplateBindings(dagTemplate, 128, 128,
+                                                    2));
+  dagTemplate.nodes[1].ipc.readySlot = 2;
+  EXPECT_EQ(flagcxInvalidArgument,
+            validateUniRunnerIpcDagTemplateBindings(dagTemplate, 128, 128,
+                                                    2));
 }
 
 TEST(UniRunnerDagCache, RejectsIpcPeerAndReadySlotOverflow) {

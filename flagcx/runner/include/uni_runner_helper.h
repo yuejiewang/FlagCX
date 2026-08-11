@@ -92,6 +92,15 @@ struct uniRunnerDagTemplate {
   std::vector<uniRunnerDagNodeDesc> nodes;
 };
 
+// Production validation helpers exposed here so CPU-only cache tests exercise
+// the exact IPC materialization and topology identity rules.
+flagcxResult_t validateUniRunnerIpcDagTemplateBindings(
+    const uniRunnerDagTemplate &dagTemplate, size_t inputBytes,
+    size_t outputBytes, int localRanks);
+flagcxResult_t getUniRunnerIpcTopologyHash(int localRanks, int nranks,
+                                           const int *localRankToRank,
+                                           uint64_t *topologyHash);
+
 inline const char *uniRunnerDagAlgoTypeToString(uniRunnerDagAlgoType algoType) {
   switch (algoType) {
     case uniRunnerDagAlgoDummy:
