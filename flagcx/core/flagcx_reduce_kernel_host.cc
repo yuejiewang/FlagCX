@@ -205,18 +205,34 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueueIpc(
 }
 
 flagcxResult_t flagcxFifo::flagcxIpcFifoInit() {
-  uint64_t capacity = flagcxParamIpcFifoCapacity();
+  const int64_t configuredCapacity = flagcxParamIpcFifoCapacity();
+  if (configuredCapacity <= 0) {
+    return flagcxInvalidArgument;
+  }
+  return flagcxIpcFifoInit(static_cast<size_t>(configuredCapacity));
+}
+
+flagcxResult_t flagcxFifo::flagcxIpcFifoInit(size_t numTriggers) {
+  TRACE(FLAGCX_INIT, "flagcxIpcFifoInit called");
+  if (buffer != NULL || numTriggers == 0) {
+    return flagcxInvalidArgument;
+  }
+  size_t bytes = 0;
+  FLAGCXCHECK(flagcxCheckedFifoAllocationSize(
+      numTriggers, sizeof(flagcxIpcTrigger), &bytes));
+  uint64_t *newBuffer = NULL;
   FLAGCXCHECK(deviceAdaptor->deviceMalloc(
-      reinterpret_cast<void **>(&buffer),
-      flagcxFifoIdxData * sizeof(uint64_t) +
-          capacity * sizeof(flagcxIpcTrigger),
-      flagcxMemHost, NULL));
-  buffer[flagcxFifoIdxCapacity] = capacity;
+      reinterpret_cast<void **>(&newBuffer), bytes, flagcxMemHost, NULL));
+  if (newBuffer == NULL) {
+    return flagcxSystemError;
+  }
+  buffer = newBuffer;
+  buffer[flagcxFifoIdxCapacity] = numTriggers;
   buffer[flagcxFifoIdxConsumed] = 0;
   buffer[flagcxFifoIdxProduced] = 0;
   buffer[flagcxFifoIdxTerminate] = 0;
   memset(buffer + flagcxFifoIdxData, 0,
-         capacity * sizeof(flagcxIpcTrigger));
+         numTriggers * sizeof(flagcxIpcTrigger));
   __sync_synchronize();
   return flagcxSuccess;
 }
@@ -232,7 +248,10 @@ flagcxResult_t flagcxFifo::flagcxRedFifoDestroy() {
 
 flagcxResult_t flagcxFifo::flagcxIpcFifoDestroy() {
   INFO(FLAGCX_KERNEL, "flagcxIpcFifoDestroy called");
-  FLAGCXCHECK(deviceAdaptor->deviceFree(static_cast<void *>(buffer),
-                                        flagcxMemHost, NULL));
+  if (buffer != NULL) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(static_cast<void *>(buffer),
+                                          flagcxMemHost, NULL));
+    buffer = NULL;
+  }
   return flagcxSuccess;
 }

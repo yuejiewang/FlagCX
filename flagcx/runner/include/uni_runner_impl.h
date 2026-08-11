@@ -160,6 +160,17 @@ struct uniRunnerStaticExecutorSchedule {
   size_t numIpcBlocks = 0;
 };
 
+// Runtime bounds needed to materialize immutable IPC triggers. All fields are
+// invocation-local and deliberately excluded from the DAG cache key.
+struct uniRunnerStaticIpcTriggerConfig {
+  size_t chunkSize = 0;
+  uint64_t epoch = 0;
+  size_t dataBytes = 0;
+  size_t readySlots = 0;
+  size_t parentFlagsCount = 0;
+  int localRanks = 0;
+};
+
 typedef struct {
   pthread_t thread;
   flagcxFifo_t fifo;
@@ -302,6 +313,16 @@ flagcxResult_t populateUniRunnerStaticRedTriggers(
     const uniRunnerDagExecutionPlan *plan, void *const *nodeFlags,
     size_t numNodeFlags, flagcxReduceTrigger *triggers,
     size_t triggerCapacity, size_t *numTriggers);
+flagcxResult_t normalizeUniRunnerIpcChunkSize(int64_t configuredChunkSize,
+                                              size_t *chunkSize);
+flagcxResult_t checkedUniRunnerIpcChunkCount(size_t bytes, size_t chunkSize,
+                                             uint32_t *numChunks);
+flagcxResult_t populateUniRunnerStaticIpcTriggers(
+    uniRunnerDagNode *nodes, size_t numNodes,
+    const uniRunnerDagExecutionPlan *plan, void *const *nodeFlags,
+    size_t numNodeFlags, const uniRunnerStaticIpcTriggerConfig *config,
+    flagcxIpcTrigger *triggers, size_t triggerCapacity, size_t *numTriggers,
+    size_t *maxChunksPerTrigger);
 
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm);
 flagcxResult_t

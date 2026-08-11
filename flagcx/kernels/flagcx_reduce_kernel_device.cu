@@ -768,9 +768,10 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runIpcExecutor(
               static_cast<uint64_t *>(flagcxGetLocalPointer(
                   readyMem, trigger->readySlot * sizeof(uint64_t)));
           int iter = 0;
-          while (DeviceAPI::Atomic::load(localReady,
-                                         flagcxDeviceMemoryOrderAcquire) <
-                 trigger->epoch) {
+          while (!flagcxIpcEpochReached(
+              DeviceAPI::Atomic::load(localReady,
+                                      flagcxDeviceMemoryOrderAcquire),
+              trigger->epoch)) {
             DeviceAPI::Intrin::spinBackoff(iter++);
           }
           if (trigger->flagOut != 0) {

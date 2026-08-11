@@ -50,7 +50,47 @@ static bool isValidStaticRedTriggerPayload(const uniRunnerRedNodeData &red) {
          red.nthreads <= flagcxTriggerMask(flagcxReduceTriggerBitsNThreads);
 }
 
+static bool isValidStaticIpcBufferType(flagcxIpcBufferType bufferType) {
+  return bufferType == flagcxIpcBufferInput ||
+         bufferType == flagcxIpcBufferOutput;
+}
+
 } // namespace
+
+flagcxResult_t normalizeUniRunnerIpcChunkSize(int64_t configuredChunkSize,
+                                              size_t *chunkSize) {
+  if (chunkSize == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *chunkSize = 0;
+  if (configuredChunkSize < 16 || configuredChunkSize % 16 != 0 ||
+      static_cast<uint64_t>(configuredChunkSize) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    return flagcxInvalidArgument;
+  }
+  *chunkSize = static_cast<size_t>(configuredChunkSize);
+  return flagcxSuccess;
+}
+
+flagcxResult_t checkedUniRunnerIpcChunkCount(size_t bytes, size_t chunkSize,
+                                             uint32_t *numChunks) {
+  if (numChunks == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *numChunks = 0;
+  if (chunkSize < 16 || chunkSize % 16 != 0) {
+    return flagcxInvalidArgument;
+  }
+  size_t chunks = bytes / chunkSize + (bytes % chunkSize != 0);
+  if (chunks == 0) {
+    chunks = 1;
+  }
+  if (chunks > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    return flagcxInvalidArgument;
+  }
+  *numChunks = static_cast<uint32_t>(chunks);
+  return flagcxSuccess;
+}
 
 void destroyUniRunnerDagExecutionPlan(uniRunnerDagExecutionPlan *plan) {
   if (plan == NULL) {
@@ -429,4 +469,174 @@ flagcxResult_t populateUniRunnerStaticRedTriggers(
   __sync_synchronize();
   *numTriggers = redOrdinal;
   return flagcxSuccess;
+}
+
+flagcxResult_t populateUniRunnerStaticIpcTriggers(
+    uniRunnerDagNode *nodes, size_t numNodes,
+    const uniRunnerDagExecutionPlan *plan, void *const *nodeFlags,
+    size_t numNodeFlags, const uniRunnerStaticIpcTriggerConfig *config,
+    flagcxIpcTrigger *triggers, size_t triggerCapacity, size_t *numTriggers,
+    size_t *maxChunksPerTrigger) {
+  if (numTriggers == NULL || maxChunksPerTrigger == NULL) {
+    return flagcxInvalidArgument;
+  }
+  *numTriggers = 0;
+  *maxChunksPerTrigger = 0;
+  if (plan == NULL || plan->numNodes != numNodes ||
+      numNodes > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+      ((numNodes == 0) != (plan->topoOrder == NULL)) ||
+      plan->numHostNodes > numNodes ||
+      plan->numRedNodes > numNodes - plan->numHostNodes ||
+      plan->numIpcNodes !=
+          numNodes - plan->numHostNodes - plan->numRedNodes) {
+    return flagcxInvalidArgument;
+  }
+  if (plan->numIpcNodes == 0) {
+    return flagcxSuccess;
+  }
+  if (nodes == NULL || nodeFlags == NULL || numNodeFlags < numNodes ||
+      config == NULL || triggers == NULL ||
+      triggerCapacity != plan->numIpcNodes || config->chunkSize < 16 ||
+      config->chunkSize % 16 != 0 || config->epoch == 0 ||
+      config->readySlots != plan->numIpcNodes || config->localRanks <= 0 ||
+      config->parentFlagsCount >
+          static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    return flagcxInvalidArgument;
+  }
+
+  try {
+    std::vector<unsigned char> seenNodes(numNodes, 0);
+    std::vector<unsigned char> seenReadySlots(config->readySlots, 0);
+
+    // Parent flag addresses are packed in stable node-index order by
+    // prepareUniRunnerIpcParentFlags. Validate that layout independently of
+    // the filtered topological trigger order.
+    size_t expectedParentOffset = 0;
+    for (size_t nodeIdx = 0; nodeIdx < numNodes; ++nodeIdx) {
+      const uniRunnerDagNode &node = nodes[nodeIdx];
+      if (node.nodeIdx != static_cast<int>(nodeIdx)) {
+        return flagcxInternalError;
+      }
+      if (node.nodeType != uniRunnerDagNodeTypeIpc) {
+        continue;
+      }
+      if (node.numParents < 0 ||
+          (node.numParents > 0 && node.parents == NULL) ||
+          node.nodeData.ipc.parentFlagsOffset != expectedParentOffset ||
+          expectedParentOffset > config->parentFlagsCount ||
+          static_cast<size_t>(node.numParents) >
+              config->parentFlagsCount - expectedParentOffset) {
+        return flagcxInvalidArgument;
+      }
+      expectedParentOffset += static_cast<size_t>(node.numParents);
+    }
+    if (expectedParentOffset != config->parentFlagsCount) {
+      return flagcxInvalidArgument;
+    }
+
+    size_t hostNodes = 0;
+    size_t redNodes = 0;
+    size_t ipcNodes = 0;
+    size_t validatedMaxChunks = 0;
+    for (size_t topoSlot = 0; topoSlot < numNodes; ++topoSlot) {
+      const int nodeIdx = plan->topoOrder[topoSlot];
+      if (nodeIdx < 0 || static_cast<size_t>(nodeIdx) >= numNodes ||
+          seenNodes[nodeIdx] != 0 || nodes[nodeIdx].nodeIdx != nodeIdx) {
+        return flagcxInternalError;
+      }
+      seenNodes[nodeIdx] = 1;
+      const uniRunnerDagNode &node = nodes[nodeIdx];
+      if (node.nodeType == uniRunnerDagNodeTypeP2p ||
+          node.nodeType == uniRunnerDagNodeTypeCpy) {
+        ++hostNodes;
+        continue;
+      }
+      if (node.nodeType == uniRunnerDagNodeTypeRed) {
+        ++redNodes;
+        continue;
+      }
+      if (node.nodeType != uniRunnerDagNodeTypeIpc ||
+          ipcNodes >= plan->numIpcNodes) {
+        return flagcxInternalError;
+      }
+      ++ipcNodes;
+
+      const uniRunnerIpcNodeData &ipc = node.nodeData.ipc;
+      if (!isValidStaticIpcBufferType(ipc.srcBufferType) ||
+          ipc.peerLocalRank < 0 || ipc.peerLocalRank >= config->localRanks ||
+          ipc.readySlot >= config->readySlots ||
+          seenReadySlots[ipc.readySlot] != 0 || nodeFlags[nodeIdx] == NULL ||
+          ipc.srcOffsetBytes > config->dataBytes ||
+          ipc.bytes > config->dataBytes - ipc.srcOffsetBytes ||
+          ipc.dstOffsetBytes > config->dataBytes ||
+          ipc.bytes > config->dataBytes - ipc.dstOffsetBytes) {
+        return flagcxInvalidArgument;
+      }
+      seenReadySlots[ipc.readySlot] = 1;
+
+      for (int parentSlot = 0; parentSlot < node.numParents; ++parentSlot) {
+        const int parentIdx = node.parents[parentSlot];
+        if (parentIdx < 0 || static_cast<size_t>(parentIdx) >= numNodes ||
+            nodeFlags[parentIdx] == NULL) {
+          return flagcxInvalidArgument;
+        }
+      }
+
+      uint32_t chunks = 0;
+      flagcxResult_t chunkResult = checkedUniRunnerIpcChunkCount(
+          ipc.bytes, config->chunkSize, &chunks);
+      if (chunkResult != flagcxSuccess) {
+        return chunkResult;
+      }
+      validatedMaxChunks =
+          std::max(validatedMaxChunks, static_cast<size_t>(chunks));
+    }
+    if (hostNodes != plan->numHostNodes || redNodes != plan->numRedNodes ||
+        ipcNodes != plan->numIpcNodes) {
+      return flagcxInternalError;
+    }
+    for (size_t readySlot = 0; readySlot < config->readySlots; ++readySlot) {
+      if (seenReadySlots[readySlot] == 0) {
+        return flagcxInvalidArgument;
+      }
+    }
+
+    // The validation pass above is intentionally complete: no trigger or DAG
+    // index is published until every entry can be materialized successfully.
+    size_t ipcOrdinal = 0;
+    for (size_t topoSlot = 0; topoSlot < numNodes; ++topoSlot) {
+      const int nodeIdx = plan->topoOrder[topoSlot];
+      uniRunnerDagNode &node = nodes[nodeIdx];
+      if (node.nodeType != uniRunnerDagNodeTypeIpc) {
+        continue;
+      }
+      const uniRunnerIpcNodeData &ipc = node.nodeData.ipc;
+      uint32_t chunks = 0;
+      (void)checkedUniRunnerIpcChunkCount(ipc.bytes, config->chunkSize,
+                                         &chunks);
+      flagcxIpcTrigger &trigger = triggers[ipcOrdinal];
+      trigger.srcOffsetBytes = ipc.srcOffsetBytes;
+      trigger.dstOffsetBytes = ipc.dstOffsetBytes;
+      trigger.bytes = ipc.bytes;
+      trigger.chunkSize = config->chunkSize;
+      trigger.flagOut = reinterpret_cast<uint64_t>(nodeFlags[nodeIdx]);
+      trigger.epoch = config->epoch;
+      trigger.srcBufferType = static_cast<uint32_t>(ipc.srcBufferType);
+      trigger.peerLocalRank = static_cast<uint32_t>(ipc.peerLocalRank);
+      trigger.readySlot = ipc.readySlot;
+      trigger.parentFlagsOffset = ipc.parentFlagsOffset;
+      trigger.numParentFlags = static_cast<uint32_t>(node.numParents);
+      trigger.numChunks = chunks;
+      trigger.completedChunks = 0;
+      trigger.nextChunk = 0;
+      trigger.state = flagcxReduceTriggerEnqueued;
+      node.nodeData.ipc.triggerIdx = static_cast<int>(ipcOrdinal++);
+    }
+    __sync_synchronize();
+    *numTriggers = ipcOrdinal;
+    *maxChunksPerTrigger = validatedMaxChunks;
+    return flagcxSuccess;
+  } catch (...) {
+    return flagcxSystemError;
+  }
 }

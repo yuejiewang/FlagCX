@@ -2283,6 +2283,14 @@ static flagcxResult_t buildUniRunnerStateIpcAR(
     ipc.dstOffsetBytes = srcOffset;
     FLAGCXCHECK(checkedUniRunnerTypeBytes(sendOp->count, 1, sendOp->datatype,
                                           &ipc.bytes));
+    size_t recvBytes = 0;
+    FLAGCXCHECK(checkedUniRunnerTypeBytes(recvOp->count, 1, recvOp->datatype,
+                                          &recvBytes));
+    if (ipc.bytes > totalBytes - srcOffset ||
+        recvBytes > totalBytes - localRecvOffset ||
+        ipc.bytes > totalBytes - ipc.dstOffsetBytes) {
+      return flagcxInvalidArgument;
+    }
     ipc.srcBufferType = srcBufferType;
     ipc.peerLocalRank = peerLocalRank;
     if (readySlot == std::numeric_limits<uint32_t>::max()) {
@@ -3932,7 +3940,10 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   FLAGCXCHECK(loadUniRunnerLaunchConfig(
       &runnerState->uniRunnerNThreads, &runnerState->uniRunnerNRedBlocks,
       &runnerState->uniRunnerNIpcBlocks));
-  runnerState->uniRunnerIpcChunkSize = flagcxParamUniRunnerIpcChunkSize();
+  size_t ipcChunkSize = 0;
+  FLAGCXCHECK(normalizeUniRunnerIpcChunkSize(
+      flagcxParamUniRunnerIpcChunkSize(), &ipcChunkSize));
+  runnerState->uniRunnerIpcChunkSize = ipcChunkSize;
   runnerState->avgDivisor = 1;
   // Set device context
   FLAGCXCHECK(deviceAdaptor->setDevice(hcomm->cudaDev));
@@ -4278,9 +4289,7 @@ static flagcxResult_t runDynamicDagFallback(flagcxHeteroComm_t hcomm) {
   FLAGCXCHECK(initializeDynamicRedFifo(hcomm));
   FLAGCXCHECK(prepareUniRunnerIpcParentFlags(runnerState));
   if (runnerState->ipcReadySlots != 0) {
-    runnerState->ipcEpoch++;
-    if (runnerState->ipcEpoch == 0)
-      runnerState->ipcEpoch++;
+    runnerState->ipcEpoch = flagcxNextIpcEpoch(runnerState->ipcEpoch);
   }
 
 #ifdef COMPILE_KERNEL_HOST

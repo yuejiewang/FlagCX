@@ -42,6 +42,7 @@ public:
   flagcxResult_t flagcxRedFifoInit();
   flagcxResult_t flagcxRedFifoInit(size_t numTriggers);
   flagcxResult_t flagcxIpcFifoInit();
+  flagcxResult_t flagcxIpcFifoInit(size_t numTriggers);
   flagcxResult_t flagcxFifoDestroy();
   flagcxResult_t flagcxRedFifoDestroy();
   flagcxResult_t flagcxIpcFifoDestroy();

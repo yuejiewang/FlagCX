@@ -68,6 +68,23 @@ typedef enum {
   flagcxStreamFlagDone = 2
 } flagcxStreamFlagState;
 
+// IPC ready slots use monotonically increasing serial numbers with zero
+// reserved for "never published".  A producer may advance the same slot to a
+// later epoch before a slower consumer observes the exact expected value, so
+// equality is too strict.  Serial-number arithmetic keeps that later value
+// valid across UINT64_MAX -> 1 while rejecting stale values, provided ranks do
+// not differ by 2^63 or more invocations.
+FLAGCX_HOST_DEVICE_INLINE bool flagcxIpcEpochReached(uint64_t observed,
+                                                     uint64_t expected) {
+  return observed != 0 && expected != 0 &&
+         observed - expected < (uint64_t(1) << 63);
+}
+
+FLAGCX_HOST_DEVICE_INLINE uint64_t flagcxNextIpcEpoch(uint64_t epoch) {
+  ++epoch;
+  return epoch == 0 ? 1 : epoch;
+}
+
 // ==========================================================================
 // flagcxDeviceTrigger bit layout (24 bytes = 3 × uint64_t: fst, snd, trd)
 //
