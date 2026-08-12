@@ -2,7 +2,7 @@
  * Copyright (c) 2026 BAAI. All rights reserved.
  ************************************************************************/
 
-#include "uni_runner_impl.h"
+#include "uni_runner_helper.h"
 
 #include "alloc.h"
 
@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdlib>
 #include <limits>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -37,6 +38,327 @@ static bool getUniRunnerDagPlanPhase(uniRunnerDagNodeType nodeType,
     default:
       return false;
   }
+}
+
+static bool isValidCompiledBufferRef(const uniRunnerDagBufferRef &ref,
+                                     size_t accessBytes) {
+  if (ref.offsetBytes < 0) {
+    return false;
+  }
+  switch (ref.bufferType) {
+    case uniRunnerDagBufferTypeInput:
+    case uniRunnerDagBufferTypeOutput:
+    case uniRunnerDagBufferTypeScratch:
+      return true;
+    case uniRunnerDagBufferTypeNone:
+      return accessBytes == 0 && ref.offsetBytes == 0;
+    default:
+      return false;
+  }
+}
+
+static bool checkedCompiledTypeBytes(size_t count, flagcxDataType_t datatype,
+                                     size_t *bytes) {
+  const int datatypeValue = static_cast<int>(datatype);
+  if (bytes == NULL || datatypeValue < 0 || datatypeValue >= flagcxNumTypes) {
+    return false;
+  }
+  const size_t typeSize = getFlagcxDataTypeSize(datatype);
+  if (typeSize == 0 || count > std::numeric_limits<size_t>::max() / typeSize) {
+    return false;
+  }
+  *bytes = count * typeSize;
+  return true;
+}
+
+static bool isValidP2pPrim(flagcxDevicePrim prim) {
+  return prim == flagcxDevicePrimSend || prim == flagcxDevicePrimRecv;
+}
+
+static bool isValidCompiledKey(const uniRunnerDagCacheKey &key) {
+  const int datatype = static_cast<int>(key.datatype);
+  const int redOp = static_cast<int>(key.redOp);
+  return key.commOp >= flagcxCommOpSend && key.commOp < flagcxCommNoOp &&
+         datatype >= 0 &&
+         datatype < flagcxNumTypes && getFlagcxDataTypeSize(key.datatype) != 0 &&
+         (redOp == flagcxRedNoOp ||
+          (redOp >= static_cast<int>(flagcxSum) &&
+           redOp < static_cast<int>(flagcxNumRedOps))) &&
+         key.rank >= 0 && key.nranks > 0 && key.rank < key.nranks;
+}
+
+static uint64_t makeDagEdge(int parentIdx, int childIdx) {
+  return (static_cast<uint64_t>(static_cast<uint32_t>(parentIdx)) << 32) |
+         static_cast<uint32_t>(childIdx);
+}
+
+template <typename NodeAccessor>
+flagcxResult_t compileUniRunnerDagOrder(
+    size_t numNodes, const NodeAccessor &nodeAt, std::vector<int> *topoOrder,
+    size_t *numHostNodes, size_t *numRedNodes, size_t *numIpcNodes) {
+  if (topoOrder == NULL || numHostNodes == NULL || numRedNodes == NULL ||
+      numIpcNodes == NULL ||
+      numNodes > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return flagcxInvalidArgument;
+  }
+  topoOrder->clear();
+  *numHostNodes = 0;
+  *numRedNodes = 0;
+  *numIpcNodes = 0;
+  if (numNodes == 0) {
+    return flagcxSuccess;
+  }
+
+  try {
+    std::vector<int> indegree(numNodes, 0);
+    std::vector<int> nextReady(numNodes, -1);
+    std::array<int, uniRunnerDagPlanNumPhases> readyHead = {{-1, -1, -1}};
+    std::array<int, uniRunnerDagPlanNumPhases> readyTail = {{-1, -1, -1}};
+    std::unordered_set<uint64_t> parentEdges;
+    size_t numEdges = 0;
+
+    const auto enqueueReady = [&](int phase, int nodeIdx) {
+      if (readyTail[phase] == -1) {
+        readyHead[phase] = nodeIdx;
+      } else {
+        nextReady[readyTail[phase]] = nodeIdx;
+      }
+      readyTail[phase] = nodeIdx;
+    };
+
+    for (size_t nodeIdx = 0; nodeIdx < numNodes; ++nodeIdx) {
+      const auto &node = nodeAt(nodeIdx);
+      int phase = -1;
+      if (node.nodeIdx != static_cast<int>(nodeIdx) ||
+          !getUniRunnerDagPlanPhase(node.nodeType, &phase)) {
+        return flagcxInternalError;
+      }
+      const size_t numParents = node.numParents();
+      const size_t numChildren = node.numChildren();
+      if (numParents > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+          numChildren > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+          numParents > std::numeric_limits<size_t>::max() - numEdges) {
+        return flagcxInvalidArgument;
+      }
+      numEdges += numParents;
+      indegree[nodeIdx] = static_cast<int>(numParents);
+      if (numParents == 0) {
+        enqueueReady(phase, static_cast<int>(nodeIdx));
+      }
+    }
+
+    parentEdges.reserve(numEdges);
+    for (size_t nodeIdx = 0; nodeIdx < numNodes; ++nodeIdx) {
+      const auto &node = nodeAt(nodeIdx);
+      for (size_t parentSlot = 0; parentSlot < node.numParents();
+           ++parentSlot) {
+        const int parentIdx = node.parent(parentSlot);
+        if (parentIdx < 0 || static_cast<size_t>(parentIdx) >= numNodes ||
+            parentIdx == static_cast<int>(nodeIdx) ||
+            !parentEdges.emplace(
+                makeDagEdge(parentIdx, static_cast<int>(nodeIdx))).second) {
+          return flagcxInternalError;
+        }
+      }
+    }
+
+    for (size_t nodeIdx = 0; nodeIdx < numNodes; ++nodeIdx) {
+      const auto &node = nodeAt(nodeIdx);
+      for (size_t childSlot = 0; childSlot < node.numChildren();
+           ++childSlot) {
+        const int childIdx = node.child(childSlot);
+        if (childIdx < 0 || static_cast<size_t>(childIdx) >= numNodes ||
+            childIdx == static_cast<int>(nodeIdx)) {
+          return flagcxInternalError;
+        }
+        const std::unordered_set<uint64_t>::iterator edge =
+            parentEdges.find(makeDagEdge(static_cast<int>(nodeIdx), childIdx));
+        if (edge == parentEdges.end()) {
+          return flagcxInternalError;
+        }
+        parentEdges.erase(edge);
+      }
+    }
+    if (!parentEdges.empty()) {
+      return flagcxInternalError;
+    }
+
+    topoOrder->reserve(numNodes);
+    while (topoOrder->size() < numNodes) {
+      const size_t orderedBeforeRound = topoOrder->size();
+      for (int phase = 0; phase < uniRunnerDagPlanNumPhases; ++phase) {
+        while (readyHead[phase] != -1) {
+          const int nodeIdx = readyHead[phase];
+          readyHead[phase] = nextReady[nodeIdx];
+          nextReady[nodeIdx] = -1;
+          if (readyHead[phase] == -1) {
+            readyTail[phase] = -1;
+          }
+
+          if (topoOrder->size() >= numNodes) {
+            return flagcxInternalError;
+          }
+          topoOrder->push_back(nodeIdx);
+          if (phase == uniRunnerDagPlanPhaseHost) {
+            ++*numHostNodes;
+          } else if (phase == uniRunnerDagPlanPhaseRed) {
+            ++*numRedNodes;
+          } else {
+            ++*numIpcNodes;
+          }
+
+          const auto &node = nodeAt(static_cast<size_t>(nodeIdx));
+          for (size_t childSlot = 0; childSlot < node.numChildren();
+               ++childSlot) {
+            const int childIdx = node.child(childSlot);
+            if (indegree[childIdx] <= 0) {
+              return flagcxInternalError;
+            }
+            --indegree[childIdx];
+            if (indegree[childIdx] == 0) {
+              int childPhase = -1;
+              if (!getUniRunnerDagPlanPhase(
+                      nodeAt(static_cast<size_t>(childIdx)).nodeType,
+                      &childPhase)) {
+                return flagcxInternalError;
+              }
+              enqueueReady(childPhase, childIdx);
+            }
+          }
+        }
+      }
+      if (topoOrder->size() == orderedBeforeRound) {
+        return flagcxInvalidArgument;
+      }
+    }
+
+    return *numHostNodes + *numRedNodes + *numIpcNodes == numNodes
+               ? flagcxSuccess
+               : flagcxInternalError;
+  } catch (...) {
+    topoOrder->clear();
+    *numHostNodes = 0;
+    *numRedNodes = 0;
+    *numIpcNodes = 0;
+    return flagcxSystemError;
+  }
+}
+
+struct RuntimeNodeAccessor {
+  explicit RuntimeNodeAccessor(const uniRunnerDagNode *nodes) : nodes(nodes) {}
+  struct View {
+    explicit View(const uniRunnerDagNode &node)
+        : nodeIdx(node.nodeIdx), nodeType(node.nodeType), node(node) {}
+    size_t numParents() const { return static_cast<size_t>(node.numParents); }
+    size_t numChildren() const { return static_cast<size_t>(node.numChildren); }
+    int parent(size_t slot) const { return node.parents[slot]; }
+    int child(size_t slot) const { return node.children[slot]; }
+    int nodeIdx;
+    uniRunnerDagNodeType nodeType;
+    const uniRunnerDagNode &node;
+  };
+  View operator()(size_t nodeIdx) const { return View(nodes[nodeIdx]); }
+  const uniRunnerDagNode *nodes;
+};
+
+struct TemplateNodeAccessor {
+  explicit TemplateNodeAccessor(const std::vector<uniRunnerDagNodeDesc> &nodes)
+      : nodes(nodes) {}
+  struct View {
+    explicit View(const uniRunnerDagNodeDesc &node)
+        : nodeIdx(node.nodeIdx), nodeType(node.nodeType), node(node) {}
+    size_t numParents() const { return node.parents.size(); }
+    size_t numChildren() const { return node.children.size(); }
+    int parent(size_t slot) const { return node.parents[slot]; }
+    int child(size_t slot) const { return node.children[slot]; }
+    int nodeIdx;
+    uniRunnerDagNodeType nodeType;
+    const uniRunnerDagNodeDesc &node;
+  };
+  View operator()(size_t nodeIdx) const { return View(nodes[nodeIdx]); }
+  const std::vector<uniRunnerDagNodeDesc> &nodes;
+};
+
+static flagcxResult_t
+validateUniRunnerDagTemplatePayload(const uniRunnerDagTemplate &dagTemplate) {
+  if (!isValidCompiledKey(dagTemplate.key) ||
+      dagTemplate.nodes.size() >
+          static_cast<size_t>(std::numeric_limits<int>::max()) ||
+      (dagTemplate.hashValue != 0 &&
+       dagTemplate.hashValue !=
+           getUniRunnerDagPatternHash(dagTemplate.key))) {
+    return flagcxInvalidArgument;
+  }
+  size_t numIpcNodes = 0;
+  for (const uniRunnerDagNodeDesc &node : dagTemplate.nodes) {
+    if (node.nodeType == uniRunnerDagNodeTypeIpc) {
+      ++numIpcNodes;
+    }
+  }
+  std::vector<uint8_t> ipcReadySlots;
+  try {
+    ipcReadySlots.assign(numIpcNodes, uint8_t{0});
+  } catch (...) {
+    return flagcxSystemError;
+  }
+  for (const uniRunnerDagNodeDesc &node : dagTemplate.nodes) {
+    switch (node.nodeType) {
+      case uniRunnerDagNodeTypeP2p:
+        for (const uniRunnerDagP2pOpDesc &op : node.p2pOps) {
+          size_t bytes = 0;
+          if (!checkedCompiledTypeBytes(op.count, op.datatype, &bytes) ||
+              !isValidP2pPrim(op.type) || op.peerRank < 0 ||
+              op.peerRank >= dagTemplate.key.nranks ||
+              !isValidCompiledBufferRef(op.buffer, bytes)) {
+            return flagcxInvalidArgument;
+          }
+        }
+        break;
+      case uniRunnerDagNodeTypeRed: {
+        size_t bytes = 0;
+        const int redOp = static_cast<int>(node.red.redOp);
+        if (!checkedCompiledTypeBytes(node.red.count, node.red.datatype,
+                                      &bytes) ||
+            redOp < static_cast<int>(flagcxSum) ||
+            redOp >= static_cast<int>(flagcxNumRedOps) ||
+            node.red.count >
+                flagcxTriggerMask(flagcxReduceTriggerBitsCount) ||
+            !isValidCompiledBufferRef(node.red.input1, bytes) ||
+            !isValidCompiledBufferRef(node.red.input2, bytes) ||
+            !isValidCompiledBufferRef(node.red.output, bytes)) {
+          return flagcxInvalidArgument;
+        }
+        break;
+      }
+      case uniRunnerDagNodeTypeCpy: {
+        size_t bytes = 0;
+        if (!checkedCompiledTypeBytes(node.cpy.count, node.cpy.datatype,
+                                      &bytes) ||
+            !isValidCompiledBufferRef(node.cpy.src, bytes) ||
+            !isValidCompiledBufferRef(node.cpy.dst, bytes)) {
+          return flagcxInvalidArgument;
+        }
+        break;
+      }
+      case uniRunnerDagNodeTypeIpc:
+        if (node.ipc.srcBufferType != flagcxIpcBufferInput &&
+            node.ipc.srcBufferType != flagcxIpcBufferOutput) {
+          return flagcxInvalidArgument;
+        }
+        if (node.ipc.peerLocalRank < 0 ||
+            node.ipc.peerLocalRank >= dagTemplate.key.nranks ||
+            static_cast<size_t>(node.ipc.readySlot) >= numIpcNodes ||
+            ipcReadySlots[node.ipc.readySlot] != 0) {
+          return flagcxInvalidArgument;
+        }
+        ipcReadySlots[node.ipc.readySlot] = 1;
+        break;
+      default:
+        return flagcxInternalError;
+    }
+  }
+  // Unique slots in [0, numIpcNodes) imply an exact dense assignment.
+  return flagcxSuccess;
 }
 
 static bool isValidStaticRedTriggerPayload(const uniRunnerRedNodeData &red) {
@@ -96,14 +418,10 @@ void destroyUniRunnerDagExecutionPlan(uniRunnerDagExecutionPlan *plan) {
   if (plan == NULL) {
     return;
   }
-  if (plan->topoOrder != NULL) {
-    free(plan->topoOrder);
+  if (plan->ownsTopoOrder && plan->topoOrder != NULL) {
+    free(const_cast<int *>(plan->topoOrder));
   }
-  plan->topoOrder = NULL;
-  plan->numNodes = 0;
-  plan->numHostNodes = 0;
-  plan->numRedNodes = 0;
-  plan->numIpcNodes = 0;
+  *plan = {};
 }
 
 flagcxResult_t compileUniRunnerDagExecutionPlan(
@@ -125,127 +443,60 @@ flagcxResult_t compileUniRunnerDagExecutionPlan(
     return flagcxInvalidArgument;
   }
 
-  try {
-    std::vector<int> indegree(numNodes, 0);
-    std::vector<int> nextReady(numNodes, -1);
-    std::array<int, uniRunnerDagPlanNumPhases> readyHead = {{-1, -1, -1}};
-    std::array<int, uniRunnerDagPlanNumPhases> readyTail = {{-1, -1, -1}};
-
-    const auto enqueueReady = [&](int phase, int nodeIdx) {
-      if (readyTail[phase] == -1) {
-        readyHead[phase] = nodeIdx;
-      } else {
-        nextReady[readyTail[phase]] = nodeIdx;
-      }
-      readyTail[phase] = nodeIdx;
-    };
-
-    for (size_t nodeIdx = 0; nodeIdx < numNodes; ++nodeIdx) {
-      const uniRunnerDagNode &node = nodes[nodeIdx];
-      int phase = -1;
-      if (node.nodeIdx != static_cast<int>(nodeIdx) ||
-          node.numParents < 0 || node.numChildren < 0 ||
-          (node.numParents > 0 && node.parents == NULL) ||
-          (node.numChildren > 0 && node.children == NULL) ||
-          !getUniRunnerDagPlanPhase(node.nodeType, &phase)) {
-        return flagcxInternalError;
-      }
-
-      for (int parentSlot = 0; parentSlot < node.numParents; ++parentSlot) {
-        const int parentIdx = node.parents[parentSlot];
-        if (parentIdx < 0 || static_cast<size_t>(parentIdx) >= numNodes ||
-            parentIdx == static_cast<int>(nodeIdx)) {
-          return flagcxInternalError;
-        }
-      }
-      for (int childSlot = 0; childSlot < node.numChildren; ++childSlot) {
-        const int childIdx = node.children[childSlot];
-        if (childIdx < 0 || static_cast<size_t>(childIdx) >= numNodes ||
-            childIdx == static_cast<int>(nodeIdx)) {
-          return flagcxInternalError;
-        }
-      }
-
-      indegree[nodeIdx] = node.numParents;
-      if (node.numParents == 0) {
-        enqueueReady(phase, static_cast<int>(nodeIdx));
-      }
-    }
-
-    int *topoOrder = NULL;
-    flagcxResult_t allocResult = flagcxCalloc(&topoOrder, numNodes);
-    if (allocResult != flagcxSuccess) {
-      return allocResult;
-    }
-
-    size_t numOrdered = 0;
-    size_t numHostNodes = 0;
-    size_t numRedNodes = 0;
-    size_t numIpcNodes = 0;
-
-    while (numOrdered < numNodes) {
-      const size_t orderedBeforeRound = numOrdered;
-      for (int phase = 0; phase < uniRunnerDagPlanNumPhases; ++phase) {
-        while (readyHead[phase] != -1) {
-          const int nodeIdx = readyHead[phase];
-          readyHead[phase] = nextReady[nodeIdx];
-          nextReady[nodeIdx] = -1;
-          if (readyHead[phase] == -1) {
-            readyTail[phase] = -1;
-          }
-
-          if (numOrdered >= numNodes) {
-            free(topoOrder);
-            return flagcxInternalError;
-          }
-          topoOrder[numOrdered++] = nodeIdx;
-          if (phase == uniRunnerDagPlanPhaseHost) {
-            ++numHostNodes;
-          } else if (phase == uniRunnerDagPlanPhaseRed) {
-            ++numRedNodes;
-          } else {
-            ++numIpcNodes;
-          }
-
-          const uniRunnerDagNode &node = nodes[nodeIdx];
-          for (int childSlot = 0; childSlot < node.numChildren; ++childSlot) {
-            const int childIdx = node.children[childSlot];
-            if (indegree[childIdx] <= 0) {
-              free(topoOrder);
-              return flagcxInternalError;
-            }
-            --indegree[childIdx];
-            if (indegree[childIdx] == 0) {
-              int childPhase = -1;
-              if (!getUniRunnerDagPlanPhase(nodes[childIdx].nodeType,
-                                            &childPhase)) {
-                free(topoOrder);
-                return flagcxInternalError;
-              }
-              enqueueReady(childPhase, childIdx);
-            }
-          }
-        }
-      }
-
-      if (numOrdered == orderedBeforeRound) {
-        free(topoOrder);
-        return flagcxInvalidArgument;
-      }
-    }
-
-    if (numHostNodes + numRedNodes + numIpcNodes != numNodes) {
-      free(topoOrder);
+  for (size_t nodeIdx = 0; nodeIdx < numNodes; ++nodeIdx) {
+    if (nodes[nodeIdx].numParents < 0 || nodes[nodeIdx].numChildren < 0 ||
+        (nodes[nodeIdx].numParents > 0 && nodes[nodeIdx].parents == NULL) ||
+        (nodes[nodeIdx].numChildren > 0 && nodes[nodeIdx].children == NULL)) {
       return flagcxInternalError;
     }
+  }
 
-    plan->topoOrder = topoOrder;
-    plan->numNodes = numNodes;
-    plan->numHostNodes = numHostNodes;
-    plan->numRedNodes = numRedNodes;
-    plan->numIpcNodes = numIpcNodes;
+  std::vector<int> order;
+  size_t numHostNodes = 0;
+  size_t numRedNodes = 0;
+  size_t numIpcNodes = 0;
+  FLAGCXCHECK(compileUniRunnerDagOrder(
+      numNodes, RuntimeNodeAccessor(nodes), &order, &numHostNodes,
+      &numRedNodes, &numIpcNodes));
+
+  int *topoOrder = NULL;
+  FLAGCXCHECK(flagcxCalloc(&topoOrder, numNodes));
+  std::copy(order.begin(), order.end(), topoOrder);
+  plan->topoOrder = topoOrder;
+  plan->numNodes = numNodes;
+  plan->numHostNodes = numHostNodes;
+  plan->numRedNodes = numRedNodes;
+  plan->numIpcNodes = numIpcNodes;
+  plan->ownsTopoOrder = true;
+  return flagcxSuccess;
+}
+
+flagcxResult_t compileUniRunnerDagTemplate(
+    const uniRunnerDagTemplate &dagTemplate,
+    uniRunnerCompiledDagTemplate *compiledTemplate) {
+  if (compiledTemplate == NULL) {
+    return flagcxInvalidArgument;
+  }
+  try {
+    *compiledTemplate = {};
+    const size_t numNodes = dagTemplate.nodes.size();
+    if (numNodes > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      return flagcxInvalidArgument;
+    }
+    FLAGCXCHECK(validateUniRunnerDagTemplatePayload(dagTemplate));
+    uniRunnerCompiledDagTemplate compiled;
+    FLAGCXCHECK(compileUniRunnerDagOrder(
+        numNodes, TemplateNodeAccessor(dagTemplate.nodes),
+        &compiled.topoOrder, &compiled.numHostNodes, &compiled.numRedNodes,
+        &compiled.numIpcNodes));
+    compiled.dagTemplate = dagTemplate;
+    compiled.dagTemplate.hashValue =
+        getUniRunnerDagPatternHash(compiled.dagTemplate.key);
+    compiled.numNodes = numNodes;
+    *compiledTemplate = std::move(compiled);
     return flagcxSuccess;
   } catch (...) {
+    *compiledTemplate = {};
     return flagcxSystemError;
   }
 }

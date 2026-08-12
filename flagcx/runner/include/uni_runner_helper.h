@@ -113,6 +113,22 @@ struct uniRunnerDagTemplate {
   std::vector<uniRunnerDagNodeDesc> nodes;
 };
 
+// Process-local compiled form of a cacheable DAG. Disk persistence continues
+// to contain only dagTemplate; the stable topological order is reconstructed
+// once when a template first enters this process and then reused read-only.
+struct uniRunnerCompiledDagTemplate {
+  uniRunnerDagTemplate dagTemplate;
+  std::vector<int> topoOrder;
+  size_t numNodes = 0;
+  size_t numHostNodes = 0;
+  size_t numRedNodes = 0;
+  size_t numIpcNodes = 0;
+};
+
+flagcxResult_t compileUniRunnerDagTemplate(
+    const uniRunnerDagTemplate &dagTemplate,
+    uniRunnerCompiledDagTemplate *compiledTemplate);
+
 // Production validation helpers exposed here so CPU-only cache tests exercise
 // the exact IPC materialization and topology identity rules.
 flagcxResult_t validateUniRunnerIpcDagTemplateBindings(

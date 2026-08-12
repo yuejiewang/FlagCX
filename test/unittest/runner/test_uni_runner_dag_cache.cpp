@@ -40,7 +40,101 @@ uniRunnerDagTemplate makeIpcDagTemplate() {
   return dagTemplate;
 }
 
+uniRunnerDagTemplate makeCompiledDagTemplate() {
+  uniRunnerDagTemplate dagTemplate;
+  dagTemplate.key = makeCacheKey(0x8877665544332211ull);
+  const std::array<uniRunnerDagNodeType, 4> types = {
+      uniRunnerDagNodeTypeP2p, uniRunnerDagNodeTypeRed,
+      uniRunnerDagNodeTypeCpy, uniRunnerDagNodeTypeIpc};
+  uniRunnerDagP2pOpDesc p2p;
+  p2p.buffer.bufferType = uniRunnerDagBufferTypeInput;
+  p2p.peerRank = 4;
+  p2p.count = 4;
+  p2p.datatype = flagcxFloat32;
+  p2p.type = flagcxDevicePrimSend;
+  uniRunnerDagBufferRef input{uniRunnerDagBufferTypeInput, 0};
+  uniRunnerDagBufferRef output{uniRunnerDagBufferTypeOutput, 0};
+  for (size_t nodeIdx = 0; nodeIdx < types.size(); ++nodeIdx) {
+    uniRunnerDagNodeDesc node;
+    node.nodeIdx = static_cast<int>(nodeIdx);
+    node.nodeType = types[nodeIdx];
+    if (nodeIdx != 0) {
+      node.parents.push_back(static_cast<int>(nodeIdx - 1));
+    }
+    if (nodeIdx + 1 != types.size()) {
+      node.children.push_back(static_cast<int>(nodeIdx + 1));
+    }
+    if (node.nodeType == uniRunnerDagNodeTypeP2p) {
+      node.p2pOps.push_back(p2p);
+    } else if (node.nodeType == uniRunnerDagNodeTypeRed) {
+      node.red.input1 = input;
+      node.red.input2 = output;
+      node.red.output = output;
+      node.red.count = 4;
+      node.red.datatype = flagcxFloat32;
+      node.red.redOp = flagcxSum;
+    } else if (node.nodeType == uniRunnerDagNodeTypeCpy) {
+      node.cpy.src = input;
+      node.cpy.dst = output;
+      node.cpy.count = 4;
+      node.cpy.datatype = flagcxFloat32;
+    } else if (node.nodeType == uniRunnerDagNodeTypeIpc) {
+      node.ipc.peerLocalRank = 4;
+      node.ipc.readySlot = 0;
+    }
+    dagTemplate.nodes.push_back(node);
+  }
+  return dagTemplate;
+}
+
 } // namespace
+
+TEST(UniRunnerDagCache, CompilesReusableStaticTemplate) {
+  const uniRunnerDagTemplate dagTemplate = makeCompiledDagTemplate();
+  uniRunnerCompiledDagTemplate compiled;
+  ASSERT_EQ(flagcxSuccess,
+            compileUniRunnerDagTemplate(dagTemplate, &compiled));
+  EXPECT_EQ((std::vector<int>{0, 1, 2, 3}), compiled.topoOrder);
+  EXPECT_EQ(4u, compiled.numNodes);
+  EXPECT_EQ(2u, compiled.numHostNodes);
+  EXPECT_EQ(1u, compiled.numRedNodes);
+  EXPECT_EQ(1u, compiled.numIpcNodes);
+  EXPECT_EQ(dagTemplate.key.algoHash,
+            compiled.dagTemplate.key.algoHash);
+
+  // Compiled-only fields remain process local and cannot alter JSON v5.
+  const Json encoded = uniRunnerSerializeDagTemplate(compiled.dagTemplate);
+  EXPECT_FALSE(encoded.contains("topo_order"));
+  EXPECT_FALSE(encoded.contains("compiled"));
+}
+
+TEST(UniRunnerDagCache, CompiledTemplateRejectsInvalidStaticTopology) {
+  uniRunnerDagTemplate malformed = makeCompiledDagTemplate();
+  uniRunnerCompiledDagTemplate compiled;
+
+  malformed.nodes[1].nodeIdx = 0;
+  EXPECT_EQ(flagcxInternalError,
+            compileUniRunnerDagTemplate(malformed, &compiled));
+  EXPECT_TRUE(compiled.topoOrder.empty());
+
+  malformed = makeCompiledDagTemplate();
+  malformed.nodes[0].children.clear();
+  EXPECT_EQ(flagcxInternalError,
+            compileUniRunnerDagTemplate(malformed, &compiled));
+
+  malformed = makeCompiledDagTemplate();
+  malformed.nodes[0].parents.push_back(3);
+  malformed.nodes[3].children.push_back(0);
+  EXPECT_EQ(flagcxInvalidArgument,
+            compileUniRunnerDagTemplate(malformed, &compiled));
+
+  malformed = makeCompiledDagTemplate();
+  malformed.nodes[1].red.redOp = flagcxRedNoOp;
+  EXPECT_EQ(flagcxInvalidArgument,
+            compileUniRunnerDagTemplate(malformed, &compiled));
+  EXPECT_TRUE(compiled.topoOrder.empty());
+  EXPECT_EQ(0u, compiled.numNodes);
+}
 
 TEST(UniRunnerDagCache, BindingRangeRequiresCompleteAccess) {
   std::array<unsigned char, 32> storage{};

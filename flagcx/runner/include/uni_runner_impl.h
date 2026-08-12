@@ -141,11 +141,16 @@ struct uniRunnerDagNode {
 // stages derive per-node-type static queues and block assignments from this
 // single order, avoiding duplicate persistent arrays.
 struct uniRunnerDagExecutionPlan {
-  int *topoOrder = NULL;
+  const int *topoOrder = NULL;
   size_t numNodes = 0;
   size_t numHostNodes = 0;
   size_t numRedNodes = 0;
   size_t numIpcNodes = 0;
+  // Cached plans borrow immutable storage owned by the process cache.
+  bool ownsTopoOrder = false;
+  // Set only after static topology and node payload validation succeeds.
+  // This lets runUniRunner keep per-invocation validation O(1).
+  bool staticValidated = false;
 };
 
 // Per-invocation executor counts derived from the DAG and the runtime

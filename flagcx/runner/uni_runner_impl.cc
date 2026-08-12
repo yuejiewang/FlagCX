@@ -212,9 +212,15 @@ static void setUniRunnerAvgDivisor(flagcxUniRunnerState *runnerState,
   runnerState->avgDivisor = (op == flagcxAvg && divisor != 0) ? divisor : 1;
 }
 
+// Compiled entries are process-lifetime objects: insertion is keep-first and
+// there is deliberately no erase or replacement path. Runtime plans may
+// therefore borrow topoOrder storage without per-invocation copies. Any future
+// eviction policy must first add an owning cache pin to each active invocation.
 std::mutex gUniRunnerDagCacheMutex;
-std::unordered_map<size_t, std::vector<std::shared_ptr<uniRunnerDagTemplate>>>
-    gUniRunnerDagCache;
+std::unordered_map<
+    size_t,
+    std::vector<std::shared_ptr<const uniRunnerCompiledDagTemplate>>>
+    gUniRunnerCompiledDagCache;
 std::unordered_set<std::string> gUniRunnerDagLoadedPaths;
 
 static size_t hashCombine(size_t seed, size_t value) {
@@ -269,43 +275,65 @@ static bool uniRunnerDagCacheKeysEqual(const uniRunnerDagCacheKey &lhs,
          lhs.nranks == rhs.nranks && lhs.root == rhs.root;
 }
 
-static flagcxResult_t insertUniRunnerDagTemplateLocked(
-    const std::shared_ptr<uniRunnerDagTemplate> &dagTemplate) {
-  std::vector<std::shared_ptr<uniRunnerDagTemplate>> &bucket =
-      gUniRunnerDagCache[dagTemplate->hashValue];
-  for (std::shared_ptr<uniRunnerDagTemplate> &entry : bucket) {
-    if (uniRunnerDagCacheKeysEqual(entry->key, dagTemplate->key)) {
-      entry = dagTemplate;
+static flagcxResult_t insertUniRunnerCompiledDagTemplateLocked(
+    const std::shared_ptr<const uniRunnerCompiledDagTemplate> &compiled,
+    std::shared_ptr<const uniRunnerCompiledDagTemplate> *canonical) {
+  const uniRunnerDagTemplate &dagTemplate = compiled->dagTemplate;
+  std::vector<std::shared_ptr<const uniRunnerCompiledDagTemplate>> &bucket =
+      gUniRunnerCompiledDagCache[dagTemplate.hashValue];
+  for (const std::shared_ptr<const uniRunnerCompiledDagTemplate> &entry :
+       bucket) {
+    if (uniRunnerDagCacheKeysEqual(entry->dagTemplate.key, dagTemplate.key)) {
+      if (canonical != NULL) {
+        *canonical = entry;
+      }
       return flagcxSuccess;
     }
   }
-  bucket.push_back(dagTemplate);
+  bucket.push_back(compiled);
+  if (canonical != NULL) {
+    *canonical = compiled;
+  }
   return flagcxSuccess;
 }
 
-static bool findUniRunnerDagTemplateLocked(
+static bool findUniRunnerCompiledDagTemplateLocked(
     size_t hashValue, const uniRunnerDagCacheKey &key,
-    std::shared_ptr<uniRunnerDagTemplate> *dagTemplate) {
+    std::shared_ptr<const uniRunnerCompiledDagTemplate> *compiled) {
   std::unordered_map<
-      size_t, std::vector<std::shared_ptr<uniRunnerDagTemplate>>>::iterator it =
-      gUniRunnerDagCache.find(hashValue);
-  if (it == gUniRunnerDagCache.end()) {
+      size_t,
+      std::vector<std::shared_ptr<const uniRunnerCompiledDagTemplate>>>::
+      iterator it = gUniRunnerCompiledDagCache.find(hashValue);
+  if (it == gUniRunnerCompiledDagCache.end()) {
     return false;
   }
-  for (const std::shared_ptr<uniRunnerDagTemplate> &entry : it->second) {
-    if (uniRunnerDagCacheKeysEqual(entry->key, key)) {
-      *dagTemplate = entry;
+  for (const std::shared_ptr<const uniRunnerCompiledDagTemplate> &entry :
+       it->second) {
+    if (uniRunnerDagCacheKeysEqual(entry->dagTemplate.key, key)) {
+      *compiled = entry;
       return true;
     }
   }
   return false;
 }
 
-static flagcxResult_t importUniRunnerDagTemplatesLocked(
+static flagcxResult_t importUniRunnerDagTemplates(
     const std::vector<uniRunnerDagTemplate> &dagTemplates) {
-  for (const uniRunnerDagTemplate &dagTemplate : dagTemplates) {
-    FLAGCXCHECK(insertUniRunnerDagTemplateLocked(
-        std::make_shared<uniRunnerDagTemplate>(dagTemplate)));
+  try {
+    std::vector<std::shared_ptr<const uniRunnerCompiledDagTemplate>> compiled;
+    compiled.reserve(dagTemplates.size());
+    for (const uniRunnerDagTemplate &dagTemplate : dagTemplates) {
+      std::shared_ptr<uniRunnerCompiledDagTemplate> entry =
+          std::make_shared<uniRunnerCompiledDagTemplate>();
+      FLAGCXCHECK(compileUniRunnerDagTemplate(dagTemplate, entry.get()));
+      compiled.push_back(entry);
+    }
+    std::lock_guard<std::mutex> lock(gUniRunnerDagCacheMutex);
+    for (const auto &entry : compiled) {
+      FLAGCXCHECK(insertUniRunnerCompiledDagTemplateLocked(entry, NULL));
+    }
+  } catch (...) {
+    return flagcxSystemError;
   }
   return flagcxSuccess;
 }
@@ -397,11 +425,8 @@ static flagcxResult_t loadUniRunnerDagFileIntoCache(const std::string &path) {
     return flagcxSuccess;
   }
 
+  FLAGCXCHECK(importUniRunnerDagTemplates(dagTemplates));
   std::lock_guard<std::mutex> lock(gUniRunnerDagCacheMutex);
-  if (gUniRunnerDagLoadedPaths.count(path) != 0) {
-    return flagcxSuccess;
-  }
-  FLAGCXCHECK(importUniRunnerDagTemplatesLocked(dagTemplates));
   gUniRunnerDagLoadedPaths.insert(path);
   return flagcxSuccess;
 }
@@ -543,10 +568,11 @@ static uniRunnerDagCacheKey makeUniRunnerDagCacheKey(
 }
 
 static bool
-findUniRunnerDagTemplate(size_t hashValue, const uniRunnerDagCacheKey &key,
-                         std::shared_ptr<uniRunnerDagTemplate> *dagTemplate) {
+findUniRunnerCompiledDagTemplate(
+    size_t hashValue, const uniRunnerDagCacheKey &key,
+    std::shared_ptr<const uniRunnerCompiledDagTemplate> *compiled) {
   std::lock_guard<std::mutex> lock(gUniRunnerDagCacheMutex);
-  return findUniRunnerDagTemplateLocked(hashValue, key, dagTemplate);
+  return findUniRunnerCompiledDagTemplateLocked(hashValue, key, compiled);
 }
 
 static flagcxResult_t loadUniRunnerDagFromCacheDir(size_t hashValue, int rank) {
@@ -558,21 +584,24 @@ static flagcxResult_t loadUniRunnerDagFromCacheDir(size_t hashValue, int rank) {
       makeUniRunnerDagFilePath(cacheDir, hashValue, rank));
 }
 
-static flagcxResult_t cacheUniRunnerDagTemplate(
-    const std::shared_ptr<uniRunnerDagTemplate> &dagTemplate) {
-  size_t hashValue = getUniRunnerDagPatternHash(dagTemplate->key);
+static flagcxResult_t cacheUniRunnerCompiledDagTemplate(
+    const std::shared_ptr<const uniRunnerCompiledDagTemplate> &compiled) {
+  const uniRunnerDagTemplate &dagTemplate = compiled->dagTemplate;
+  size_t hashValue = getUniRunnerDagPatternHash(dagTemplate.key);
+  std::shared_ptr<const uniRunnerCompiledDagTemplate> canonical;
   std::string dagDir = getUniRunnerDagCacheDirFromEnv();
   std::string dagPath =
-      makeUniRunnerDagFilePath(dagDir, hashValue, dagTemplate->key.rank);
+      makeUniRunnerDagFilePath(dagDir, hashValue, dagTemplate.key.rank);
   {
     std::lock_guard<std::mutex> lock(gUniRunnerDagCacheMutex);
-    FLAGCXCHECK(insertUniRunnerDagTemplateLocked(dagTemplate));
+    FLAGCXCHECK(
+        insertUniRunnerCompiledDagTemplateLocked(compiled, &canonical));
   }
   if (dagDir.empty()) {
     return flagcxSuccess;
   }
   FLAGCXCHECK(ensureUniRunnerDagDirExists(dagDir));
-  FLAGCXCHECK(uniRunnerSaveDagJsonFile(dagPath, *dagTemplate));
+  FLAGCXCHECK(uniRunnerSaveDagJsonFile(dagPath, canonical->dagTemplate));
   std::lock_guard<std::mutex> lock(gUniRunnerDagCacheMutex);
   gUniRunnerDagLoadedPaths.insert(dagPath);
   return flagcxSuccess;
@@ -3152,13 +3181,6 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
       dagTemplate, bindings.inputBytes, bindings.outputBytes,
       bindings.localRanks));
 
-  size_t ipcReadySlots = 0;
-  for (const uniRunnerDagNodeDesc &node : dagTemplate.nodes) {
-    if (node.nodeType == uniRunnerDagNodeTypeIpc) {
-      ++ipcReadySlots;
-    }
-  }
-
   resetDagSchedulerRuntimeState(runnerState);
   runnerState->numDagNodes = static_cast<int>(dagTemplate.nodes.size());
   if (runnerState->numDagNodes == 0) {
@@ -3262,7 +3284,28 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
     }
   }
 
-  runnerState->ipcReadySlots = ipcReadySlots;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t bindUniRunnerCompiledDagPlan(
+    const uniRunnerCompiledDagTemplate &compiled,
+    uniRunnerDagExecutionPlan *plan) {
+  if (plan == NULL || compiled.numNodes != compiled.dagTemplate.nodes.size() ||
+      compiled.topoOrder.size() != compiled.numNodes ||
+      compiled.numHostNodes + compiled.numRedNodes + compiled.numIpcNodes !=
+          compiled.numNodes) {
+    return flagcxInternalError;
+  }
+  destroyUniRunnerDagExecutionPlan(plan);
+  plan->topoOrder = compiled.topoOrder.empty()
+                        ? NULL
+                        : compiled.topoOrder.data();
+  plan->numNodes = compiled.numNodes;
+  plan->numHostNodes = compiled.numHostNodes;
+  plan->numRedNodes = compiled.numRedNodes;
+  plan->numIpcNodes = compiled.numIpcNodes;
+  plan->ownsTopoOrder = false;
+  plan->staticValidated = true;
   return flagcxSuccess;
 }
 
@@ -3270,11 +3313,11 @@ static flagcxResult_t tryLoadCachedUniRunnerDag(
     flagcxUniRunnerState *runnerState, const uniRunnerDagCacheKey &key,
     const uniRunnerDagRuntimeBindings &bindings, bool *cacheHit) {
   *cacheHit = false;
-  std::shared_ptr<uniRunnerDagTemplate> dagTemplate;
+  std::shared_ptr<const uniRunnerCompiledDagTemplate> compiled;
   size_t hashValue = getUniRunnerDagPatternHash(key);
-  if (!findUniRunnerDagTemplate(hashValue, key, &dagTemplate)) {
+  if (!findUniRunnerCompiledDagTemplate(hashValue, key, &compiled)) {
     flagcxResult_t loadRes = loadUniRunnerDagFromCacheDir(hashValue, key.rank);
-    if (!findUniRunnerDagTemplate(hashValue, key, &dagTemplate)) {
+    if (!findUniRunnerCompiledDagTemplate(hashValue, key, &compiled)) {
       if (loadRes != flagcxSuccess) {
         return loadRes;
       }
@@ -3292,9 +3335,12 @@ static flagcxResult_t tryLoadCachedUniRunnerDag(
         static_cast<unsigned long long>(key.algoHash),
         uniRunnerCommOpToString(key.commOp), hashValue);
   FLAGCXCHECK(
-      materializeUniRunnerDagTemplate(runnerState, *dagTemplate, bindings));
-  FLAGCXCHECK(validateDagNodes(runnerState));
-  FLAGCXCHECK(prepareUniRunnerDagExecutionPlan(runnerState));
+      materializeUniRunnerDagTemplate(runnerState, compiled->dagTemplate,
+                                      bindings));
+  FLAGCXCHECK(bindUniRunnerCompiledDagPlan(*compiled, &runnerState->dagPlan));
+  // IPC ready slots are one-to-one with cached IPC nodes. Use the compiled
+  // count instead of scanning the materialized DAG again.
+  runnerState->ipcReadySlots = compiled->numIpcNodes;
   *cacheHit = true;
   return flagcxSuccess;
 }
@@ -3304,21 +3350,46 @@ cacheBuiltUniRunnerDag(const flagcxUniRunnerState *runnerState,
                        const uniRunnerDagCacheKey &key,
                        const uniRunnerDagRuntimeBindings &bindings) {
   size_t hashValue = getUniRunnerDagPatternHash(key);
-  std::shared_ptr<uniRunnerDagTemplate> dagTemplate;
-  flagcxResult_t captureRes = captureUniRunnerDagTemplateFromState(
-      runnerState, key, bindings, &dagTemplate);
-  if (captureRes != flagcxSuccess) {
-    TRACE(FLAGCX_UNIRUNNER,
-          "uniRunner DAG capture skipped for hash=%lu, result=%d", hashValue,
-          captureRes);
-    return flagcxSuccess;
+  if (!runnerState->dagPlan.staticValidated) {
+    return flagcxInternalError;
   }
 
-  flagcxResult_t cacheRes = cacheUniRunnerDagTemplate(dagTemplate);
-  if (cacheRes != flagcxSuccess) {
-    TRACE(FLAGCX_UNIRUNNER,
-          "uniRunner DAG cache persist skipped for hash=%lu, result=%d",
-          hashValue, cacheRes);
+  try {
+    std::shared_ptr<uniRunnerDagTemplate> dagTemplate;
+    flagcxResult_t captureRes = captureUniRunnerDagTemplateFromState(
+        runnerState, key, bindings, &dagTemplate);
+    if (captureRes != flagcxSuccess) {
+      TRACE(FLAGCX_UNIRUNNER,
+            "uniRunner DAG capture skipped for hash=%lu, result=%d",
+            hashValue, captureRes);
+      return flagcxSuccess;
+    }
+
+    std::shared_ptr<uniRunnerCompiledDagTemplate> compiled =
+        std::make_shared<uniRunnerCompiledDagTemplate>();
+    compiled->dagTemplate = std::move(*dagTemplate);
+    // The builder path has already completed validateDagNodes() and the
+    // runtime plan compiler, so its cached copy is a validated static plan.
+    compiled->numNodes = runnerState->dagPlan.numNodes;
+    compiled->numHostNodes = runnerState->dagPlan.numHostNodes;
+    compiled->numRedNodes = runnerState->dagPlan.numRedNodes;
+    compiled->numIpcNodes = runnerState->dagPlan.numIpcNodes;
+    if (runnerState->dagPlan.numNodes != 0) {
+      if (runnerState->dagPlan.topoOrder == NULL) {
+        return flagcxInternalError;
+      }
+      compiled->topoOrder.assign(
+          runnerState->dagPlan.topoOrder,
+          runnerState->dagPlan.topoOrder + runnerState->dagPlan.numNodes);
+    }
+    flagcxResult_t cacheRes = cacheUniRunnerCompiledDagTemplate(compiled);
+    if (cacheRes != flagcxSuccess) {
+      TRACE(FLAGCX_UNIRUNNER,
+            "uniRunner DAG cache persist skipped for hash=%lu, result=%d",
+            hashValue, cacheRes);
+    }
+  } catch (...) {
+    return flagcxSuccess;
   }
   return flagcxSuccess;
 }
@@ -3371,6 +3442,7 @@ static flagcxResult_t initUniRunnerStateCached(
 
   FLAGCXCHECK(buildFn());
   FLAGCXCHECK(prepareUniRunnerDagExecutionPlan(runnerState));
+  runnerState->dagPlan.staticValidated = true;
   return cacheBuiltUniRunnerDag(runnerState, key, bindings);
 }
 
@@ -4351,6 +4423,8 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   if (runnerState->dagNodes != NULL || runnerState->numDagNodes != 0 ||
       runnerState->numPendingNodes != 0 ||
       runnerState->dagPlan.topoOrder != NULL ||
+      runnerState->dagPlan.ownsTopoOrder ||
+      runnerState->dagPlan.staticValidated ||
       runnerState->dagPlan.numNodes != 0 ||
       runnerState->dagPlan.numHostNodes != 0 ||
       runnerState->dagPlan.numRedNodes != 0 ||
@@ -4372,6 +4446,8 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->dagPlan.numHostNodes = 0;
   runnerState->dagPlan.numRedNodes = 0;
   runnerState->dagPlan.numIpcNodes = 0;
+  runnerState->dagPlan.ownsTopoOrder = false;
+  runnerState->dagPlan.staticValidated = false;
   runnerState->streamFlagsSize = 0;
   runnerState->ipcReadySlots = 0;
   runnerState->fifo = NULL;
@@ -5424,15 +5500,27 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
   const bool ipcIntent =
       runnerState->ipcOwner == comm && runnerState->ipcReadySlots != 0;
-  flagcxResult_t localPreparationResult = validateDagNodes(runnerState);
+  flagcxResult_t localPreparationResult = flagcxSuccess;
+  if (runnerState->numDagNodes < 0 ||
+      (runnerState->numDagNodes == 0) != (runnerState->dagNodes == NULL)) {
+    localPreparationResult = flagcxInternalError;
+  }
   if (localPreparationResult == flagcxSuccess) {
-    const size_t numDagNodes =
-        static_cast<size_t>(runnerState->numDagNodes);
-    if (runnerState->dagPlan.numNodes != numDagNodes ||
+    const size_t numDagNodes = static_cast<size_t>(runnerState->numDagNodes);
+    const uniRunnerDagExecutionPlan &plan = runnerState->dagPlan;
+    if (!plan.staticValidated || plan.numNodes != numDagNodes ||
         (numDagNodes != 0 && runnerState->dagPlan.topoOrder == NULL) ||
-        runnerState->dagPlan.numHostNodes + runnerState->dagPlan.numRedNodes +
-                runnerState->dagPlan.numIpcNodes !=
-            numDagNodes) {
+        plan.numHostNodes > numDagNodes ||
+        plan.numRedNodes > numDagNodes - plan.numHostNodes ||
+        plan.numIpcNodes != numDagNodes - plan.numHostNodes - plan.numRedNodes ||
+        (plan.numRedNodes != 0 &&
+         (runnerState->uniRunnerNRedBlocks == 0 ||
+          runnerState->uniRunnerNThreads == 0 ||
+          runnerState->uniRunnerNThreads >
+              flagcxTriggerMask(flagcxReduceTriggerBitsNThreads))) ||
+        (plan.numIpcNodes != 0 &&
+         (runnerState->uniRunnerNIpcBlocks == 0 ||
+          runnerState->ipcReadySlots != plan.numIpcNodes))) {
       localPreparationResult = flagcxInternalError;
     }
   }
