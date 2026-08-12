@@ -55,9 +55,8 @@ struct uniRunnerDagAlgorithmConfig {
 
 // Cache key describing a reusable uniRunner DAG template.
 struct uniRunnerDagCacheKey {
-  // algoType is the strongly typed algorithm name. algoHash distinguishes
-  // normalized builder configurations of the same named algorithm.
-  uniRunnerDagAlgoType algoType;
+  // algoHash covers both the algorithm type and its normalized builder
+  // configuration.
   uint64_t algoHash;
   flagcxCommOp_t commOp;
   size_t count;

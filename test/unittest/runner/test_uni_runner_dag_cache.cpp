@@ -12,7 +12,6 @@ namespace {
 
 uniRunnerDagCacheKey makeCacheKey(uint64_t algoHash) {
   uniRunnerDagCacheKey key{};
-  key.algoType = uniRunnerDagAlgoSlicedAR;
   key.algoHash = algoHash;
   key.commOp = flagcxCommOpAllReduce;
   key.count = 1048576;
@@ -27,7 +26,6 @@ uniRunnerDagCacheKey makeCacheKey(uint64_t algoHash) {
 uniRunnerDagTemplate makeIpcDagTemplate() {
   uniRunnerDagTemplate dagTemplate;
   dagTemplate.key = makeCacheKey(0x123456789abcdef0ull);
-  dagTemplate.key.algoType = uniRunnerDagAlgoIpcAR;
 
   uniRunnerDagNodeDesc node;
   node.nodeType = uniRunnerDagNodeTypeIpc;
@@ -68,7 +66,7 @@ TEST(UniRunnerDagCache, BindingRangeRequiresCompleteAccess) {
   EXPECT_EQ(16, offsetBytes);
 }
 
-TEST(UniRunnerDagCache, AlgorithmHashIsStableAndCoversBuilderInputs) {
+TEST(UniRunnerDagCache, AlgorithmHashCoversAlgorithmTypeAndBuilderInputs) {
   uniRunnerDagAlgorithmConfig config{};
   config.numSlices = 2;
   config.numRedSlices = 8;
@@ -99,6 +97,10 @@ TEST(UniRunnerDagCache, AlgorithmHashIsStableAndCoversBuilderInputs) {
 
   EXPECT_NE(expected,
             getUniRunnerDagAlgorithmHash(uniRunnerDagAlgoRingAR, config));
+  // SlicedAR and RingRS hash the same builder fields, so this comparison
+  // specifically verifies that the algorithm type itself is part of the hash.
+  EXPECT_NE(expected,
+            getUniRunnerDagAlgorithmHash(uniRunnerDagAlgoRingRS, config));
 }
 
 TEST(UniRunnerDagCache, AlgorithmHashIgnoresUnrelatedBuilderSlots) {
@@ -174,32 +176,27 @@ TEST(UniRunnerDagCache, IpcTopologyHashIsStableOrderedAndValidated) {
             getUniRunnerIpcTopologyHash(4, 4, topology, nullptr));
 }
 
-TEST(UniRunnerDagCache, PatternHashIncludesAlgorithmIdentity) {
+TEST(UniRunnerDagCache, PatternHashIncludesAlgorithmHash) {
   const uniRunnerDagCacheKey first = makeCacheKey(0x123456789abcdef0ull);
   uniRunnerDagCacheKey second = first;
   second.algoHash++;
   EXPECT_NE(getUniRunnerDagPatternHash(first),
             getUniRunnerDagPatternHash(second));
-
-  second = first;
-  second.algoType = uniRunnerDagAlgoRingAR;
-  EXPECT_NE(getUniRunnerDagPatternHash(first),
-            getUniRunnerDagPatternHash(second));
 }
 
-TEST(UniRunnerDagCache, JsonKeyContainsOnlyAlgorithmAndCollectiveIdentity) {
+TEST(UniRunnerDagCache, JsonKeyContainsOnlyAlgorithmHashAndCollectiveIdentity) {
   const uniRunnerDagCacheKey key = makeCacheKey(0xfedcba9876543210ull);
   const Json json = uniRunnerDagCacheKeyToJson(key);
   const std::set<std::string> expectedFields = {
-      "algo_name", "algo_hash", "comm_op", "count", "datatype",
-      "red_op",   "rank",      "nranks",  "root"};
+      "algo_hash", "comm_op", "count", "datatype",
+      "red_op",    "rank",    "nranks", "root"};
   std::set<std::string> actualFields;
   for (auto it = json.begin(); it != json.end(); ++it) {
     actualFields.insert(it.key());
   }
 
   EXPECT_EQ(expectedFields, actualFields);
-  EXPECT_EQ("sliced_ar", json.at("algo_name").get<std::string>());
+  EXPECT_FALSE(json.contains("algo_name"));
   EXPECT_TRUE(json.at("algo_hash").is_string());
   EXPECT_EQ("18364758544493064720",
             json.at("algo_hash").get<std::string>());
@@ -219,7 +216,6 @@ TEST(UniRunnerDagCache, JsonRoundTripPreservesFullWidthAlgorithmHash) {
 
   uniRunnerDagTemplate decoded;
   ASSERT_TRUE(uniRunnerDeserializeDagTemplate(json, &decoded));
-  EXPECT_EQ(original.key.algoType, decoded.key.algoType);
   EXPECT_EQ(original.key.algoHash, decoded.key.algoHash);
   EXPECT_EQ(original.key.commOp, decoded.key.commOp);
   EXPECT_EQ(original.key.count, decoded.key.count);
@@ -234,7 +230,8 @@ TEST(UniRunnerDagCache, JsonRoundTripPreservesFullWidthAlgorithmHash) {
 TEST(UniRunnerDagCache, IpcDescriptorJsonRoundTripContainsOnlyStructure) {
   const uniRunnerDagTemplate original = makeIpcDagTemplate();
   const Json json = uniRunnerSerializeDagTemplate(original);
-  ASSERT_EQ(4, json.at("format_version").get<int>());
+  ASSERT_EQ(kUniRunnerDagCacheFormatVersion,
+            json.at("format_version").get<int>());
   ASSERT_EQ(1u, json.at("dag").at("nodes").size());
 
   const Json &nodeJson = json.at("dag").at("nodes").at(0);

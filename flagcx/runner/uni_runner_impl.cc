@@ -263,8 +263,7 @@ static int positiveModulo(int64_t value, int modulus) {
 
 static bool uniRunnerDagCacheKeysEqual(const uniRunnerDagCacheKey &lhs,
                                        const uniRunnerDagCacheKey &rhs) {
-  return lhs.algoType == rhs.algoType && lhs.algoHash == rhs.algoHash &&
-         lhs.commOp == rhs.commOp &&
+  return lhs.algoHash == rhs.algoHash && lhs.commOp == rhs.commOp &&
          lhs.count == rhs.count && lhs.datatype == rhs.datatype &&
          lhs.redOp == rhs.redOp && lhs.rank == rhs.rank &&
          lhs.nranks == rhs.nranks && lhs.root == rhs.root;
@@ -532,7 +531,6 @@ static uniRunnerDagCacheKey makeUniRunnerDagCacheKey(
     flagcxCommOp_t commOp, size_t count, flagcxDataType_t datatype,
     flagcxRedOp_t redOp, int root, flagcxComm_t comm) {
   uniRunnerDagCacheKey key{};
-  key.algoType = algoType;
   key.algoHash = getUniRunnerDagAlgorithmHash(algoType, algorithmConfig);
   key.commOp = commOp;
   key.count = count;
@@ -723,7 +721,6 @@ size_t getUniRunnerDagPatternHash(const uniRunnerDagCacheKey &key) {
   // share a cache filename.
   hashValue = hashCombine(
       hashValue, static_cast<size_t>(kUniRunnerDagCacheFormatVersion));
-  hashValue = hashCombine(hashValue, static_cast<size_t>(key.algoType));
   hashValue = hashCombine(
       hashValue,
       static_cast<size_t>(static_cast<uint32_t>(key.algoHash & 0xffffffffu)));
@@ -3282,9 +3279,8 @@ static flagcxResult_t tryLoadCachedUniRunnerDag(
         return loadRes;
       }
       TRACE(FLAGCX_UNIRUNNER,
-            "uniRunner DAG cache miss, algo_name=%s algo_hash=%llu "
-            "commOp=%s pattern_hash=%lu",
-            uniRunnerDagAlgoTypeToString(key.algoType),
+            "uniRunner DAG cache miss, algo_hash=%llu commOp=%s "
+            "pattern_hash=%lu",
             static_cast<unsigned long long>(key.algoHash),
             uniRunnerCommOpToString(key.commOp), hashValue);
       return flagcxSuccess;
@@ -3292,9 +3288,7 @@ static flagcxResult_t tryLoadCachedUniRunnerDag(
   }
 
   TRACE(FLAGCX_UNIRUNNER,
-        "uniRunner DAG cache hit, algo_name=%s algo_hash=%llu commOp=%s "
-        "pattern_hash=%lu",
-        uniRunnerDagAlgoTypeToString(key.algoType),
+        "uniRunner DAG cache hit, algo_hash=%llu commOp=%s pattern_hash=%lu",
         static_cast<unsigned long long>(key.algoHash),
         uniRunnerCommOpToString(key.commOp), hashValue);
   FLAGCXCHECK(

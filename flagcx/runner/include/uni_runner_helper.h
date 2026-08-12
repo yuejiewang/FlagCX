@@ -15,7 +15,7 @@
 
 using Json = nlohmann::json;
 
-inline constexpr int kUniRunnerDagCacheFormatVersion = 4;
+inline constexpr int kUniRunnerDagCacheFormatVersion = 5;
 
 inline bool uniRunnerDagDataTypeValueValid(int value) {
   return value >= 0 && value < flagcxNumTypes;
@@ -403,7 +403,6 @@ inline bool uniRunnerDagBufferRefFromJson(const Json &j,
 
 inline Json uniRunnerDagCacheKeyToJson(const uniRunnerDagCacheKey &key) {
   return Json{
-      {"algo_name", uniRunnerDagAlgoTypeToString(key.algoType)},
       // Persist uint64_t as decimal text so external JSON tooling cannot lose
       // precision by routing the value through an IEEE-754 number.
       {"algo_hash", std::to_string(key.algoHash)},
@@ -540,10 +539,8 @@ inline bool uniRunnerDagCacheKeyFromJson(const Json &j,
     return false;
   }
   try {
-    const std::string algoName = j.at("algo_name").get<std::string>();
     const std::string commOpName = j.at("comm_op").get<std::string>();
-    if (!uniRunnerDagAlgoTypeFromString(algoName, &key->algoType) ||
-        !uniRunnerCommOpFromString(commOpName, &key->commOp) ||
+    if (!uniRunnerCommOpFromString(commOpName, &key->commOp) ||
         !uniRunnerDagUint64FromJsonString(j, "algo_hash", &key->algoHash)) {
       return false;
     }
