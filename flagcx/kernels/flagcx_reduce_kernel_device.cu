@@ -25,6 +25,8 @@
 #define STATIC_IPC_ABORT_IDX 0
 #define STATIC_IPC_STATE_IDX 1
 
+static constexpr uint32_t kStaticReduceAbortPollInterval = 8;
+
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxStreamFlagState
 loadStreamFlagState(uint64_t flagAddr) {
   return static_cast<flagcxStreamFlagState>(DeviceAPI::Atomic::load(
@@ -585,9 +587,12 @@ FLAGCX_DEVICE_INLINE_DECORATOR void runStaticReduceExecutor(
       shm[STATIC_ABORT_IDX] = 0;
       const uint64_t flagIn = shm[FLAG_IN_IDX];
       int backoff = 0;
+      uint32_t abortPollIterations = 0;
       while (flagIn != 0 &&
              !isStreamFlagStateDone(loadStreamFlagState(flagIn))) {
-        if (isStaticAbortRequested(abortFlag)) {
+        ++abortPollIterations;
+        if ((abortPollIterations & (kStaticReduceAbortPollInterval - 1)) == 0 &&
+            isStaticAbortRequested(abortFlag)) {
           shm[STATIC_ABORT_IDX] = 1;
           break;
         }

@@ -3565,6 +3565,14 @@ flagcxResult_t initUniRunnerStateSlicedAR(flagcxUniRunnerState *runnerState,
   setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
   FLAGCXCHECK(
       setEffectiveUniRunnerRedSlices(runnerState, count, comm->nranks));
+  if (runnerState->uniRunnerNSlices != 0 &&
+      runnerState->uniRunnerNRedSlices >
+          std::numeric_limits<uint64_t>::max() /
+              runnerState->uniRunnerNSlices) {
+    return flagcxInvalidArgument;
+  }
+  runnerState->uniRunnerMaxRedParallelism =
+      runnerState->uniRunnerNSlices * runnerState->uniRunnerNRedSlices;
 
   uniRunnerDagRuntimeBindings bindings;
   bindings.inputBase = sendbuff;
@@ -4464,6 +4472,7 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   FLAGCXCHECK(loadUniRunnerLaunchConfig(
       &runnerState->uniRunnerNThreads, &runnerState->uniRunnerNRedBlocks,
       &runnerState->uniRunnerNIpcBlocks));
+  runnerState->uniRunnerMaxRedParallelism = 0;
   size_t ipcChunkSize = 0;
   FLAGCXCHECK(normalizeUniRunnerIpcChunkSize(
       flagcxParamUniRunnerIpcChunkSize(), &ipcChunkSize));
@@ -5018,10 +5027,15 @@ static flagcxResult_t prepareStaticRedExecution(
   FLAGCXCHECK(flagcxGetStaticReduceKernelMaxExecutorBlocks(
       static_cast<size_t>(runnerState->uniRunnerNThreads),
       maxExecutorBlocks));
+  const size_t requestedRedBlocks =
+      runnerState->uniRunnerMaxRedParallelism == 0
+          ? static_cast<size_t>(runnerState->uniRunnerNRedBlocks)
+          : std::min(static_cast<size_t>(runnerState->uniRunnerNRedBlocks),
+                     static_cast<size_t>(
+                         runnerState->uniRunnerMaxRedParallelism));
   FLAGCXCHECK(resolveUniRunnerStaticExecutorSchedule(
-      &runnerState->dagPlan,
-      static_cast<size_t>(runnerState->uniRunnerNRedBlocks), 0, 0,
-      *maxExecutorBlocks, schedule));
+      &runnerState->dagPlan, requestedRedBlocks, 0, 0, *maxExecutorBlocks,
+      schedule));
 #else
   return flagcxNotSupported;
 #endif

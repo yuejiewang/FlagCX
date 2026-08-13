@@ -203,6 +203,9 @@ typedef struct {
   uint64_t uniRunnerIpcChunkSize;
   uint64_t uniRunnerNRedSlices;
   uint64_t uniRunnerRedSliceSize;
+  // Maximum RED nodes exposed by one SlicedAR reduce-scatter step. Zero for
+  // algorithms without a runtime-provided static RED frontier bound.
+  uint64_t uniRunnerMaxRedParallelism;
   // One launch-wide divisor used by terminal Avg RED nodes. Intermediate
   // Avg nodes are materialized as Sum nodes, so no trigger needs to carry it.
   uint64_t avgDivisor;
