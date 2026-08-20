@@ -1,4 +1,5 @@
 #include "mpi.h"
+#include "flagcx.h"
 #include <cstddef>
 #include <cstdint>
 
@@ -27,6 +28,8 @@ public:
   int getRootRank() const { return root; }
   uint64_t getSplitMask() const { return splitMask; }
   int getLocalRegister() const { return localRegister; }
+  flagcxDataType_t getDataType() const { return datatype; }
+  flagcxRedOp_t getRedOp() const { return redOp; }
 
   size_t minBytes;
   size_t maxBytes;
@@ -37,4 +40,6 @@ public:
   int root;
   uint64_t splitMask;
   int localRegister;
+  flagcxDataType_t datatype;
+  flagcxRedOp_t redOp;
 };

@@ -23,7 +23,10 @@ struct flagcxIpcTableEntry {
   void **devPeerPtrs;  // device array: peer buffer ptrs (for cudaFree)
   int nPeers;          // number of local peers
   void *basePtr;       // own buffer ptr (skip in ipcMemHandleClose loop)
-  bool inUse;          // true while a devMem references this entry
+  size_t size;         // bytes covered by the exported allocation binding
+  size_t refCount;     // live DevMem/DevComm references to this entry
+  uint64_t bindingGeneration; // collective binding identity across ranks
+  bool inUse;          // compatibility mirror of refCount != 0
 };
 
 // Deferred device/host-pinned memory free — collected during cleanup,
@@ -33,13 +36,12 @@ struct flagcxIpcTableEntry {
 struct flagcxDeferredFree {
   void *ptr;
   int memType; // flagcxMemDevice, flagcxMemHost, etc.
+  struct flagcxDeferredFree *next; // used only by dynamic overflow nodes
 };
 
 // Deferred DevComm buffer handle — buffers that cannot be freed immediately
 // in flagcxDevCommDestroy because peers may still hold IPC mappings to them.
 // Drained at flagcxCommDestroy time.
-#define FLAGCX_MAX_DEFERRED_BUFFER_HANDLES 64
-
 struct flagcxDevCommBufferHandle {
   void *localBarrierFlags;     // flagcxMemDevice — peers write via IPC
   void *epochBuffer;           // flagcxMemDevice
@@ -109,17 +111,21 @@ struct flagcxComm {
 
   // IPC peer pointer table — deferred cleanup
   struct flagcxIpcTableEntry ipcTable[FLAGCX_MAX_IPC_ENTRIES];
+  uint64_t ipcTableGeneration;
 
   // Deferred DevComm buffer queue — buffers stashed here during
   // flagcxDevCommDestroy, drained at flagcxCommDestroy.
   flagcxIntruQueue<struct flagcxDevCommBufferHandle,
                    &flagcxDevCommBufferHandle::next>
       deferredBufferQueue;
-  int deferredBufferCount;
+  size_t deferredBufferCount;
 
-  // Deferred device/host-pinned memory free list
+  // Deferred device/host-pinned memory free list. The inline array covers the
+  // common case; excess entries are appended to the dynamic overflow queue.
   struct flagcxDeferredFree deferredFrees[FLAGCX_MAX_DEFERRED_FREES];
   int deferredFreeCount;
+  struct flagcxDeferredFree *deferredFreeOverflowHead;
+  struct flagcxDeferredFree *deferredFreeOverflowTail;
 
   // Custom op state (NULL = not enabled)
   struct flagcxDevCommState *devCommState;

@@ -22,6 +22,12 @@
 #include "adaptor.h"
 #include "flagcx_kernel_core.h"
 
+struct flagcxDevMemInternal;
+#ifndef FLAGCX_DEV_MEM_T_DEFINED
+#define FLAGCX_DEV_MEM_T_DEFINED
+typedef struct flagcxDevMemInternal *flagcxDevMem_t;
+#endif
+
 struct flagcxFifo {
   // Unified fifo layout: [capacity][consumed][produced][terminate][data...]
   // flagcxDeviceTrigger fifo: terminate slot is reserved but unused
@@ -30,14 +36,26 @@ struct flagcxFifo {
   uint64_t *buffer;
 
 public:
-  flagcxFifo() {}
+  flagcxFifo() : buffer(NULL) {}
   ~flagcxFifo() {}
   flagcxResult_t flagcxFifoInit();
   flagcxResult_t flagcxRedFifoInit();
+  flagcxResult_t flagcxRedFifoInit(size_t numTriggers);
+  flagcxResult_t flagcxIpcFifoInit();
+  flagcxResult_t flagcxIpcFifoInit(size_t numTriggers);
   flagcxResult_t flagcxFifoDestroy();
   flagcxResult_t flagcxRedFifoDestroy();
+  flagcxResult_t flagcxIpcFifoDestroy();
 };
 typedef struct flagcxFifo *flagcxFifo_t;
+
+flagcxResult_t flagcxCheckedFifoAllocationSize(size_t capacity,
+                                               size_t elementSize,
+                                               size_t *bytes);
+flagcxResult_t resolveUniRunnerStaticExecutorResidencyBudget(
+    bool cooperativeLaunch, bool concurrentKernels, size_t smCount,
+    size_t activeBlocksPerSm, size_t maxThreadsPerBlock, size_t nthreads,
+    size_t *maxExecutorBlocks);
 
 FLAGCX_HOST_DECORATOR flagcxResult_t dequeue(void *fifoBuffer,
                                              flagcxDeviceTrigger_t trigger);
@@ -48,15 +66,61 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr1,
                                              flagcxRedOp_t redop,
                                              uint64_t flagIn,
                                              uint64_t flagOut, int *idx);
+FLAGCX_HOST_DECORATOR flagcxResult_t enqueueIpc(
+    void *fifoBuffer, uint64_t srcOffsetBytes, uint64_t dstOffsetBytes,
+    uint64_t bytes, uint64_t chunkSize, flagcxIpcBufferType srcBufferType,
+    int peerLocalRank, uint32_t readySlot, uint64_t epoch,
+    uint32_t parentFlagsOffset, uint32_t numParentFlags, uint64_t flagOut,
+    int *idx);
 #ifdef COMPILE_KERNEL
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
                                                       int *idx);
 
-FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer);
+struct flagcxDevMem;
+FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(
+    void *redFifoBuffer, void *ipcFifoBuffer, flagcxDevMem inputMem,
+    flagcxDevMem outputMem, flagcxDevMem readyMem,
+    const uint64_t *ipcParentFlags, int nRedBlocks, int nIpcBlocks,
+    uint64_t avgDivisor);
+FLAGCX_GLOBAL_DECORATOR void flagcxStaticReduceKernel(
+    flagcxReduceTrigger *triggers, uint64_t numTriggers,
+    const uint64_t *abortFlag, uint64_t avgDivisor);
+FLAGCX_GLOBAL_DECORATOR void flagcxStaticCollectiveKernel(
+    flagcxReduceTrigger *redTriggers, uint64_t numRedTriggers,
+    flagcxIpcTrigger *ipcTriggers, uint64_t numIpcTriggers,
+    flagcxDevMem inputMem, flagcxDevMem outputMem, flagcxDevMem readyMem,
+    const uint64_t *ipcParentFlags, uint64_t numIpcParentFlags,
+    uint64_t numRedBlocks, uint64_t numIpcBlocks,
+    uint64_t *blocksDone, const uint64_t *abortFlag,
+    flagcxStaticIpcControl ipcControl, uint64_t avgDivisor);
+FLAGCX_GLOBAL_DECORATOR void flagcxStaticIpcRecoveryKernel(
+    flagcxDevMem readyMem, flagcxStaticIpcControl ipcControl);
 #endif // COMPILE_KERNEL
 
-void flagcxLaunchCollectiveKernel(void *fifoBuffer, size_t nthreads,
-                                  size_t nblocks, flagcxStream_t stream);
+flagcxResult_t flagcxLaunchCollectiveKernel(
+    void *redFifoBuffer, void *ipcFifoBuffer, flagcxDevMem_t inputMem,
+    flagcxDevMem_t outputMem, flagcxDevMem_t readyMem,
+    const uint64_t *ipcParentFlags, size_t nthreads, size_t nRedBlocks,
+    size_t nIpcBlocks, uint64_t avgDivisor, flagcxStream_t stream);
+flagcxResult_t flagcxGetStaticReduceKernelMaxExecutorBlocks(
+    size_t nthreads, size_t *maxExecutorBlocks);
+flagcxResult_t flagcxGetStaticCollectiveKernelMaxExecutorBlocks(
+    size_t nthreads, size_t *maxExecutorBlocks);
+flagcxResult_t flagcxLaunchStaticReduceKernel(
+    void *redFifoDeviceBuffer, size_t numTriggers, size_t nthreads,
+    size_t nRedBlocks, size_t maxExecutorBlocks, uint64_t avgDivisor,
+    flagcxStream_t stream);
+flagcxResult_t flagcxLaunchStaticCollectiveKernel(
+    void *redFifoDeviceBuffer, size_t numRedTriggers,
+    void *ipcFifoDeviceBuffer, size_t numIpcTriggers,
+    flagcxDevMem_t inputMem, flagcxDevMem_t outputMem,
+    flagcxDevMem_t readyMem, const uint64_t *ipcParentFlags,
+    size_t numIpcParentFlags, size_t nthreads, size_t nRedBlocks,
+    size_t nIpcBlocks, size_t maxExecutorBlocks, uint64_t avgDivisor,
+    const flagcxStaticIpcControl *ipcControl, flagcxStream_t stream);
+flagcxResult_t flagcxLaunchStaticIpcRecoveryKernel(
+    flagcxDevMem_t readyMem, const flagcxStaticIpcControl *ipcControl,
+    flagcxStream_t stream);
 
 // ==========================================================================
 // Device Communicator — Host-side lifecycle management
