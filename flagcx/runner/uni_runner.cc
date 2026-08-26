@@ -127,12 +127,15 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
   flagcxHeteroComm_t hcomm = comm->heteroComm;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   FLAGCXCHECK(validateUniRunnerReduceArgs(count, datatype, op));
-  FLAGCXCHECK(validateUniRunnerLaunchConfig(flagcxCommOpAllReduce));
+  if (!flagcxParamUniRunnerUseIpcAR()) {
+    FLAGCXCHECK(validateUniRunnerLaunchConfig(flagcxCommOpAllReduce));
+  }
   FLAGCXCHECK(initUniRunner(comm, stream));
   if (flagcxParamUniRunnerUseIpcAR()) {
-    /* Sliced AllReduce with intra-node IPC/LSA push transport. */
-    FLAGCXCHECKGOTO(initUniRunnerStateIpcAR(runnerState, sendbuff, recvbuff,
-                                            count, datatype, op, comm),
+    /* Primitive-level Ring/Simple AllReduce over intra-node IPC memory. */
+    FLAGCXCHECKGOTO(initUniRunnerStateIpcRingAR(
+                        runnerState, sendbuff, recvbuff, count, datatype, op,
+                        comm),
                     res, out);
   } else if (flagcxParamUniRunnerUseLocRed()) {
     /* initialize uniRunnerState for reduce test */
@@ -157,6 +160,9 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
   }
   FLAGCXCHECKGOTO(runUniRunner(comm), res, out);
 out:
+  if (flagcxParamUniRunnerUseIpcAR() && res != flagcxSuccess) {
+    runnerState->ipcRingResourcesDirty = true;
+  }
   FLAGCXCHECK(cleanupUniRunner(comm));
   return res;
 }

@@ -15,7 +15,7 @@
 
 using Json = nlohmann::json;
 
-inline constexpr int kUniRunnerDagCacheFormatVersion = 5;
+inline constexpr int kUniRunnerDagCacheFormatVersion = 6;
 
 inline bool uniRunnerDagDataTypeValueValid(int value) {
   return value >= 0 && value < flagcxNumTypes;
@@ -96,6 +96,15 @@ struct uniRunnerDagIpcOpDesc {
   uint32_t readySlot = 0;
 };
 
+struct uniRunnerDagRingStepDesc {
+  uint32_t channelId = 0;
+  uint32_t laneOrdinal = 0;
+  uint32_t kind = uniRunnerRingStepSend;
+  uint32_t postOp = 0;
+  uint64_t offsetElements = 0;
+  uint64_t countElements = 0;
+};
+
 struct uniRunnerDagNodeDesc {
   uniRunnerDagNodeType nodeType = uniRunnerDagNodeTypeP2p;
   int nodeIdx = 0;
@@ -105,6 +114,7 @@ struct uniRunnerDagNodeDesc {
   uniRunnerDagRedOpDesc red;
   uniRunnerDagCpyOpDesc cpy;
   uniRunnerDagIpcOpDesc ipc;
+  uniRunnerDagRingStepDesc ringStep;
 };
 
 struct uniRunnerDagTemplate {
@@ -123,6 +133,9 @@ struct uniRunnerCompiledDagTemplate {
   size_t numHostNodes = 0;
   size_t numRedNodes = 0;
   size_t numIpcNodes = 0;
+  std::vector<uint32_t> ringLaneOffsets;
+  size_t numRingLanes = 0;
+  size_t numRingStepNodes = 0;
 };
 
 flagcxResult_t compileUniRunnerDagTemplate(
@@ -158,6 +171,8 @@ inline const char *uniRunnerDagAlgoTypeToString(uniRunnerDagAlgoType algoType) {
       return "tree_red";
     case uniRunnerDagAlgoIpcAR:
       return "ipc_ar";
+    case uniRunnerDagAlgoIpcRingAR:
+      return "ipc_ring_ar";
     default:
       return "unknown";
   }
@@ -183,6 +198,8 @@ inline bool uniRunnerDagAlgoTypeFromString(const std::string &text,
     *algoType = uniRunnerDagAlgoTreeRed;
   } else if (text == "ipc_ar") {
     *algoType = uniRunnerDagAlgoIpcAR;
+  } else if (text == "ipc_ring_ar") {
+    *algoType = uniRunnerDagAlgoIpcRingAR;
   } else {
     return false;
   }
@@ -262,6 +279,8 @@ inline const char *uniRunnerDagNodeTypeToString(uniRunnerDagNodeType nodeType) {
       return "cpy";
     case uniRunnerDagNodeTypeIpc:
       return "ipc";
+    case uniRunnerDagNodeTypeRingStep:
+      return "ring_step";
     default:
       return "unknown";
   }
@@ -277,6 +296,8 @@ inline bool uniRunnerDagNodeTypeFromString(const std::string &text,
     *nodeType = uniRunnerDagNodeTypeCpy;
   } else if (text == "ipc") {
     *nodeType = uniRunnerDagNodeTypeIpc;
+  } else if (text == "ring_step") {
+    *nodeType = uniRunnerDagNodeTypeRingStep;
   } else {
     return false;
   }
@@ -549,6 +570,39 @@ inline bool uniRunnerDagIpcOpDescFromJson(const Json &j,
   }
 }
 
+inline Json
+uniRunnerDagRingStepDescToJson(const uniRunnerDagRingStepDesc &step) {
+  return Json{{"channel_id", step.channelId},
+              {"lane_ordinal", step.laneOrdinal},
+              {"kind", step.kind},
+              {"post_op", step.postOp},
+              {"offset_elements", std::to_string(step.offsetElements)},
+              {"count_elements", std::to_string(step.countElements)}};
+}
+
+inline bool uniRunnerDagRingStepDescFromJson(
+    const Json &j, uniRunnerDagRingStepDesc *step) {
+  if (step == nullptr || !j.is_object() || j.size() != 6 ||
+      !j.contains("channel_id") || !j.contains("lane_ordinal") ||
+      !j.contains("kind") || !j.contains("post_op") ||
+      !j.contains("offset_elements") || !j.contains("count_elements")) {
+    return false;
+  }
+  try {
+    return uniRunnerDagUint32FromJson(j.at("channel_id"), &step->channelId) &&
+           uniRunnerDagUint32FromJson(j.at("lane_ordinal"),
+                                      &step->laneOrdinal) &&
+           uniRunnerDagUint32FromJson(j.at("kind"), &step->kind) &&
+           uniRunnerDagUint32FromJson(j.at("post_op"), &step->postOp) &&
+           uniRunnerDagUint64FromJsonString(j, "offset_elements",
+                                            &step->offsetElements) &&
+           uniRunnerDagUint64FromJsonString(j, "count_elements",
+                                            &step->countElements);
+  } catch (...) {
+    return false;
+  }
+}
+
 inline bool uniRunnerDagCacheKeyFromJson(const Json &j,
                                          uniRunnerDagCacheKey *key) {
   if (key == nullptr || !j.is_object()) {
@@ -621,6 +675,9 @@ uniRunnerDagTemplateToJson(const uniRunnerDagTemplate &dagTemplate) {
       };
     } else if (node.nodeType == uniRunnerDagNodeTypeIpc) {
       nodeJson["ipc"] = uniRunnerDagIpcOpDescToJson(node.ipc);
+    } else if (node.nodeType == uniRunnerDagNodeTypeRingStep) {
+      nodeJson["ring_step"] =
+          uniRunnerDagRingStepDescToJson(node.ringStep);
     }
     nodes.push_back(nodeJson);
   }
@@ -781,6 +838,16 @@ inline bool uniRunnerDagTemplateFromJson(const Json &j,
             !nodeJson.contains("parents") ||
             !nodeJson.contains("children") || !nodeJson.contains("ipc") ||
             !uniRunnerDagIpcOpDescFromJson(nodeJson.at("ipc"), &node.ipc)) {
+          return false;
+        }
+      } else if (node.nodeType == uniRunnerDagNodeTypeRingStep) {
+        if (nodeJson.size() != 5 || !nodeJson.contains("node_idx") ||
+            !nodeJson.contains("node_type") ||
+            !nodeJson.contains("parents") ||
+            !nodeJson.contains("children") ||
+            !nodeJson.contains("ring_step") ||
+            !uniRunnerDagRingStepDescFromJson(nodeJson.at("ring_step"),
+                                               &node.ringStep)) {
           return false;
         }
       }

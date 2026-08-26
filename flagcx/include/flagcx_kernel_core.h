@@ -19,6 +19,7 @@
 
 #include "device_utils.h"
 #include "flagcx.h"
+#include <stddef.h>
 
 struct flagcxHeteroComm;
 
@@ -62,6 +63,17 @@ typedef enum {
   flagcxIpcBufferInput = 0,
   flagcxIpcBufferOutput = 1
 } flagcxIpcBufferType;
+
+#ifndef FLAGCX_RING_STEP_KIND_DEFINED
+#define FLAGCX_RING_STEP_KIND_DEFINED
+typedef enum {
+  uniRunnerRingStepSend = 0,
+  uniRunnerRingStepRecvReduceSend = 1,
+  uniRunnerRingStepRecvReduceCopySend = 2,
+  uniRunnerRingStepRecvCopySend = 3,
+  uniRunnerRingStepRecv = 4
+} uniRunnerRingStepKind;
+#endif
 
 typedef enum {
   flagcxStreamFlagIdle = 0,
@@ -305,6 +317,56 @@ struct alignas(16) flagcxIpcTrigger {
   uint32_t state;
   uint64_t nextChunk; // atomically claimed by IPC executor blocks
 };
+
+struct alignas(16) flagcxRingStepTrigger {
+  uint64_t offsetElements;
+  uint64_t countElements;
+  uint64_t flagOut;
+  uint32_t channelId;
+  uint32_t laneOrdinal;
+  uint32_t kind;
+  uint32_t postOp;
+};
+
+struct alignas(16) flagcxRingLaneDesc {
+  uint64_t firstTrigger;
+  uint64_t numTriggers;
+  uint64_t scratchChannelOffsetBytes;
+  uint32_t channelId;
+  uint32_t ringIndex;
+  int32_t prevLocalRank;
+  int32_t nextLocalRank;
+  uint32_t nRanks;
+  uint32_t reserved;
+};
+
+struct alignas(128) flagcxRingCounterLine {
+  uint64_t value;
+  uint8_t padding[120];
+};
+
+struct alignas(128) flagcxRingChannelProgress {
+  flagcxRingCounterLine head;
+  flagcxRingCounterLine tail;
+  uint64_t sendStep;
+  uint64_t recvStep;
+  uint8_t padding[112];
+};
+
+static_assert(sizeof(flagcxRingStepTrigger) % 16 == 0,
+              "RingStep trigger must preserve 16-byte ABI granularity");
+static_assert(alignof(flagcxRingStepTrigger) >= 16,
+              "RingStep trigger must be at least 16-byte aligned");
+static_assert(sizeof(flagcxRingLaneDesc) % 16 == 0,
+              "Ring lane descriptor must preserve 16-byte ABI granularity");
+static_assert(alignof(flagcxRingLaneDesc) >= 16,
+              "Ring lane descriptor must be at least 16-byte aligned");
+static_assert(offsetof(flagcxRingChannelProgress, tail) -
+                      offsetof(flagcxRingChannelProgress, head) >=
+                  128,
+              "Ring head and tail must occupy distinct cache lines");
+static_assert(sizeof(flagcxRingChannelProgress) % 128 == 0,
+              "Ring progress must preserve cache-line granularity");
 typedef flagcxReduceTrigger *flagcxReduceTrigger_t;
 
 #endif // FLAGCX_KERNEL_CORE_H_

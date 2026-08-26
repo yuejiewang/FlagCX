@@ -113,12 +113,194 @@ static flagcxResult_t ensureUniRunnerIpcDataViews(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm,
     const void *sendbuff, void *recvbuff, size_t bytes,
     flagcxResult_t localPreparationResult);
+static flagcxResult_t agreeUniRunnerResourceState(
+    flagcxComm_t comm, bool localCanReuse, flagcxResult_t localResult,
+    bool *allCanReuse, flagcxResult_t *collectiveResult);
+static flagcxResult_t ensureUniRunnerIpcRingResources(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm,
+    size_t numChannels, size_t simpleBufferBytes) {
+  if (runnerState == NULL || comm == NULL || numChannels == 0 ||
+      simpleBufferBytes == 0 ||
+      numChannels > std::numeric_limits<size_t>::max() / simpleBufferBytes ||
+      numChannels > std::numeric_limits<size_t>::max() /
+                        sizeof(flagcxRingChannelProgress))
+    return flagcxInvalidArgument;
+  const size_t scratchBytes = numChannels * simpleBufferBytes;
+  const size_t progressBytes =
+      numChannels * sizeof(flagcxRingChannelProgress);
+  const bool completeMatch =
+      runnerState->ipcRingScratchMem != NULL &&
+      runnerState->ipcRingProgressMem != NULL &&
+      runnerState->ipcRingScratchBuffer != NULL &&
+      runnerState->ipcRingProgressBuffer != NULL &&
+      runnerState->ipcRingChannels == numChannels &&
+      runnerState->ipcRingSimpleBufferBytes == simpleBufferBytes;
+  const bool empty = runnerState->ipcRingScratchMem == NULL &&
+                     runnerState->ipcRingProgressMem == NULL &&
+                     runnerState->ipcRingScratchBuffer == NULL &&
+                     runnerState->ipcRingProgressBuffer == NULL;
+  bool allMatch = false;
+  flagcxResult_t collectiveResult = flagcxSuccess;
+  FLAGCXCHECK(agreeUniRunnerResourceState(
+      comm, completeMatch,
+      completeMatch || empty ? flagcxSuccess : flagcxInvalidUsage,
+      &allMatch, &collectiveResult));
+  if (collectiveResult != flagcxSuccess)
+    return collectiveResult;
+  if (allMatch)
+    return flagcxSuccess;
+  bool allEmpty = false;
+  FLAGCXCHECK(agreeUniRunnerResourceState(
+      comm, empty, flagcxSuccess, &allEmpty, &collectiveResult));
+  if (collectiveResult != flagcxSuccess)
+    return collectiveResult;
+  if (!allEmpty)
+    return flagcxInvalidUsage;
+
+  flagcxResult_t result = flagcxSuccess;
+  bool ignoredReuse = false;
+  void *scratch = NULL;
+  void *progress = NULL;
+  flagcxDevMem_t scratchMem = NULL;
+  flagcxDevMem_t progressMem = NULL;
+  bool scratchCreateEntered = false;
+  bool progressCreateEntered = false;
+
+  result = deviceAdaptor->deviceMalloc(&scratch, scratchBytes,
+                                        flagcxMemDevice, NULL);
+  if (result == flagcxSuccess && scratch == NULL)
+    result = flagcxSystemError;
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, result, &ignoredReuse, &collectiveResult),
+                  result, fail);
+  if (collectiveResult != flagcxSuccess) {
+    result = collectiveResult;
+    goto fail;
+  }
+  scratchCreateEntered = true;
+  result = flagcxDevMemCreate(comm, scratch, scratchBytes, NULL, &scratchMem);
+  if (result == flagcxSuccess && scratchMem == NULL)
+    result = flagcxSystemError;
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, result, &ignoredReuse, &collectiveResult),
+                  result, fail);
+  if (collectiveResult != flagcxSuccess) {
+    result = collectiveResult;
+    goto fail;
+  }
+
+  result = deviceAdaptor->deviceMalloc(&progress, progressBytes,
+                                        flagcxMemDevice, NULL);
+  if (result == flagcxSuccess && progress == NULL)
+    result = flagcxSystemError;
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, result, &ignoredReuse, &collectiveResult),
+                  result, fail);
+  if (collectiveResult != flagcxSuccess) {
+    result = collectiveResult;
+    goto fail;
+  }
+  progressCreateEntered = true;
+  result = flagcxDevMemCreate(comm, progress, progressBytes, NULL,
+                              &progressMem);
+  if (result == flagcxSuccess && progressMem == NULL)
+    result = flagcxSystemError;
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, result, &ignoredReuse, &collectiveResult),
+                  result, fail);
+  if (collectiveResult != flagcxSuccess) {
+    result = collectiveResult;
+    goto fail;
+  }
+  result = scratchMem->hasWindow && progressMem->hasWindow
+               ? flagcxSuccess
+               : flagcxNotSupported;
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, result, &ignoredReuse, &collectiveResult),
+                  result, fail);
+  if (collectiveResult != flagcxSuccess) {
+    result = collectiveResult;
+    goto fail;
+  }
+  result = deviceAdaptor->deviceMemset(scratch, 0, scratchBytes,
+                                        flagcxMemDevice, NULL);
+  if (result == flagcxSuccess)
+    result = deviceAdaptor->deviceMemset(progress, 0, progressBytes,
+                                          flagcxMemDevice, NULL);
+  FLAGCXCHECKGOTO(agreeUniRunnerResourceState(
+                      comm, false, result, &ignoredReuse, &collectiveResult),
+                  result, fail);
+  if (collectiveResult != flagcxSuccess) {
+    result = collectiveResult;
+    goto fail;
+  }
+
+  runnerState->ipcRingScratchBuffer = scratch;
+  runnerState->ipcRingScratchMem = scratchMem;
+  runnerState->ipcRingScratchBytes = scratchBytes;
+  runnerState->ipcRingProgressBuffer = progress;
+  runnerState->ipcRingProgressMem = progressMem;
+  runnerState->ipcRingProgressBytes = progressBytes;
+  runnerState->ipcRingChannels = numChannels;
+  runnerState->ipcRingSimpleBufferBytes = simpleBufferBytes;
+  runnerState->ipcRingResourcesDirty = false;
+  return flagcxSuccess;
+
+fail:
+  if (progressMem != NULL)
+    (void)flagcxDevMemDestroy(comm, progressMem);
+  if (scratchMem != NULL)
+    (void)flagcxDevMemDestroy(comm, scratchMem);
+  if (progress != NULL) {
+    if (progressCreateEntered)
+      flagcxCommDeferFree(comm, progress, flagcxMemDevice);
+    else
+      (void)deviceAdaptor->deviceFree(progress, flagcxMemDevice, NULL);
+  }
+  if (scratch != NULL) {
+    if (scratchCreateEntered)
+      flagcxCommDeferFree(comm, scratch, flagcxMemDevice);
+    else
+      (void)deviceAdaptor->deviceFree(scratch, flagcxMemDevice, NULL);
+  }
+  return result;
+}
+
+static flagcxResult_t resetDirtyUniRunnerIpcRingResources(
+    flagcxUniRunnerState *runnerState, flagcxComm_t comm) {
+  bool allClean = false;
+  flagcxResult_t collectiveResult = flagcxSuccess;
+  FLAGCXCHECK(agreeUniRunnerResourceState(
+      comm, !runnerState->ipcRingResourcesDirty, flagcxSuccess, &allClean,
+      &collectiveResult));
+  if (collectiveResult != flagcxSuccess)
+    return collectiveResult;
+  if (allClean)
+    return flagcxSuccess;
+  flagcxResult_t result = deviceAdaptor->deviceMemset(
+      runnerState->ipcRingScratchBuffer, 0, runnerState->ipcRingScratchBytes,
+      flagcxMemDevice, NULL);
+  if (result == flagcxSuccess)
+    result = deviceAdaptor->deviceMemset(
+        runnerState->ipcRingProgressBuffer, 0,
+        runnerState->ipcRingProgressBytes, flagcxMemDevice, NULL);
+  bool ignoredReuse = false;
+  FLAGCXCHECK(agreeUniRunnerResourceState(
+      comm, false, result, &ignoredReuse, &collectiveResult));
+  if (collectiveResult != flagcxSuccess)
+    return collectiveResult;
+  runnerState->ipcRingResourcesDirty = false;
+  return flagcxSuccess;
+}
+
 static flagcxResult_t ensureUniRunnerIpcReadyStorage(
     flagcxUniRunnerState *runnerState, flagcxComm_t comm,
     size_t requiredSlots);
 static flagcxResult_t agreeUniRunnerInvocationState(
     flagcxComm_t comm, uint64_t localSignature, flagcxResult_t localResult,
     flagcxResult_t *collectiveResult);
+static flagcxResult_t releaseUniRunnerIpcRingInvocation(
+    flagcxUniRunnerState *runnerState);
 
 static bool isValidUniRunnerDataType(flagcxDataType_t datatype) {
   return static_cast<int>(datatype) >= 0 &&
@@ -185,7 +367,7 @@ flagcxResult_t checkedUniRunnerDagNodeCount(size_t outerCount,
 namespace {
 
 constexpr char kUniRunnerDagCachePathEnv[] = "FLAGCX_UNIRUNNER_DAG_CACHE_PATH";
-constexpr uint64_t kUniRunnerDagAlgorithmHashSchemaVersion = 1;
+constexpr uint64_t kUniRunnerDagAlgorithmHashSchemaVersion = 2;
 constexpr uint64_t kUniRunnerDagFnvOffsetBasis = 14695981039346656037ull;
 constexpr uint64_t kUniRunnerDagFnvPrime = 1099511628211ull;
 
@@ -646,6 +828,17 @@ uint64_t getUniRunnerDagAlgorithmHash(
       hashValue = hashAlgorithmUint64(
           hashValue, static_cast<uint64_t>(algorithmConfig.bufferMode));
       break;
+    case uniRunnerDagAlgoIpcRingAR:
+      hashValue = hashAlgorithmUint64(hashValue, algorithmConfig.numChannels);
+      hashValue =
+          hashAlgorithmUint64(hashValue, algorithmConfig.simpleBufferBytes);
+      hashValue = hashAlgorithmUint64(hashValue, algorithmConfig.nThreads);
+      hashValue = hashAlgorithmUint64(hashValue, algorithmConfig.chunkSteps);
+      hashValue = hashAlgorithmUint64(hashValue, algorithmConfig.sliceSteps);
+      hashValue = hashAlgorithmUint64(hashValue, algorithmConfig.topologyHash);
+      hashValue = hashAlgorithmUint64(
+          hashValue, static_cast<uint64_t>(algorithmConfig.bufferMode));
+      break;
     case uniRunnerDagAlgoDummy:
     default:
       break;
@@ -865,6 +1058,15 @@ static flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState) {
           return flagcxInvalidArgument;
         }
         break;
+      case uniRunnerDagNodeTypeRingStep:
+        if (node->nodeData.ringStep.kind > uniRunnerRingStepRecv ||
+            node->nodeData.ringStep.postOp > 1 ||
+            node->nodeData.ringStep.offsetElements >
+                std::numeric_limits<uint64_t>::max() -
+                    node->nodeData.ringStep.countElements) {
+          return flagcxInvalidArgument;
+        }
+        break;
       default:
         return flagcxInternalError;
     }
@@ -1063,6 +1265,8 @@ getDagNodeExecutionStream(flagcxUniRunnerState *runnerState,
     case uniRunnerDagNodeTypeCpy:
       return runnerState->cpyStream;
     case uniRunnerDagNodeTypeIpc:
+      return runnerState->redStream;
+    case uniRunnerDagNodeTypeRingStep:
       return runnerState->redStream;
     default:
       return NULL;
@@ -2324,6 +2528,332 @@ static int globalRankToLocalRank(flagcxComm_t comm, int globalRank) {
   return -1;
 }
 
+/*************************************************************************
+ * SPDX-FileCopyrightText: Copyright (c) 2015-2026 NVIDIA CORPORATION &
+ * AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *************************************************************************/
+struct uniRunnerRingCbd {
+  uint32_t channelLo;
+  uint32_t channelHi;
+  uint64_t countLo;
+  uint64_t countMid;
+  uint64_t countHi;
+  uint64_t chunkGrainsLo;
+  uint64_t chunkGrainsMid;
+  uint64_t chunkGrainsHi;
+};
+
+static flagcxResult_t selectUniRunnerRingSimple(
+    flagcxHeteroComm_t hcomm, size_t nBytes, size_t *numChannels,
+    size_t *nThreads, size_t *simpleBufferBytes) {
+  if (hcomm == NULL || numChannels == NULL || nThreads == NULL ||
+      simpleBufferBytes == NULL || hcomm->collChannels <= 0) {
+    return flagcxInvalidArgument;
+  }
+  size_t nc = static_cast<size_t>(hcomm->collChannels);
+  const int configuredThreads =
+      hcomm->maxThreads[FLAGCX_ALGO_RING][FLAGCX_PROTO_SIMPLE];
+  const ssize_t signedThreshold =
+      hcomm->threadThresholds[FLAGCX_ALGO_RING][FLAGCX_PROTO_SIMPLE];
+  if (configuredThreads <= 0 || signedThreshold <= 0 ||
+      hcomm->buffSizes[FLAGCX_PROTO_SIMPLE] <= 0) {
+    return flagcxInvalidArgument;
+  }
+  size_t nt = static_cast<size_t>(configuredThreads);
+  const size_t threshold = static_cast<size_t>(signedThreshold);
+  const auto belowThreshold = [&](size_t channels, size_t threads) {
+    return channels > std::numeric_limits<size_t>::max() / threads ||
+           channels * threads >
+               std::numeric_limits<size_t>::max() / threshold ||
+           nBytes < channels * threads * threshold;
+  };
+  while (belowThreshold(nc, nt) && nc >= 2)
+    --nc;
+  while (belowThreshold(nc, nt) && nt % 128 == 0)
+    nt /= 2;
+  if (nt > std::numeric_limits<size_t>::max() - WARP_SIZE)
+    return flagcxInvalidArgument;
+  nt += WARP_SIZE;
+  nt = std::max(nt, static_cast<size_t>(3 * WARP_SIZE));
+  const size_t bufferBytes =
+      static_cast<size_t>(hcomm->buffSizes[FLAGCX_PROTO_SIMPLE]);
+  if (nc == 0 || nc > static_cast<size_t>(hcomm->collChannels) ||
+      nt < 3 * WARP_SIZE || nt % WARP_SIZE != 0 ||
+      nt > FLAGCX_SIMPLE_MAX_NTHREADS || bufferBytes == 0 ||
+      bufferBytes % FLAGCX_STEPS != 0) {
+    return flagcxInvalidArgument;
+  }
+  *numChannels = nc;
+  *nThreads = nt;
+  *simpleBufferBytes = bufferBytes;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t getUniRunnerIpcRingTopologyHash(
+    flagcxHeteroComm_t hcomm, size_t numChannels, uint64_t *topologyHash) {
+  if (hcomm == NULL || topologyHash == NULL || hcomm->localRanks <= 0 ||
+      hcomm->nRanks <= 0 || hcomm->localRanks != hcomm->nRanks) {
+    return hcomm != NULL && hcomm->localRanks != hcomm->nRanks
+               ? flagcxNotSupported
+               : flagcxInvalidArgument;
+  }
+  if (hcomm->localRankToRank == NULL || hcomm->rankToLocalRank == NULL ||
+      numChannels == 0 ||
+      numChannels > static_cast<size_t>(hcomm->collChannels) ||
+      numChannels > MAXCHANNELS) {
+    return flagcxInvalidArgument;
+  }
+  uint64_t hash = kUniRunnerDagFnvOffsetBasis;
+  hash = hashAlgorithmUint64(hash, static_cast<uint64_t>(hcomm->nRanks));
+  hash = hashAlgorithmUint64(hash, static_cast<uint64_t>(hcomm->localRanks));
+  for (int i = 0; i < hcomm->localRanks; ++i) {
+    const int rank = hcomm->localRankToRank[i];
+    if (rank < 0 || rank >= hcomm->nRanks ||
+        hcomm->rankToLocalRank[rank] != i)
+      return flagcxInvalidArgument;
+    for (int j = 0; j < i; ++j)
+      if (hcomm->localRankToRank[j] == rank)
+        return flagcxInvalidArgument;
+    hash = hashAlgorithmUint64(hash, static_cast<uint64_t>(rank));
+  }
+  hash = hashAlgorithmUint64(hash, static_cast<uint64_t>(numChannels));
+  for (size_t c = 0; c < numChannels; ++c) {
+    const flagcxRing &ring = hcomm->channels[c].ring;
+    if (ring.userRanks == NULL || ring.index < 0 ||
+        ring.index >= hcomm->nRanks || ring.prev < 0 ||
+        ring.prev >= hcomm->nRanks || ring.next < 0 ||
+        ring.next >= hcomm->nRanks) {
+      return flagcxInvalidArgument;
+    }
+    hash = hashAlgorithmUint64(hash, c);
+    hash = hashAlgorithmUint64(hash, static_cast<uint64_t>(ring.index));
+    hash = hashAlgorithmUint64(hash, static_cast<uint64_t>(ring.prev));
+    hash = hashAlgorithmUint64(hash, static_cast<uint64_t>(ring.next));
+    for (int i = 0; i < hcomm->nRanks; ++i) {
+      const int rank = ring.userRanks[i];
+      if (rank < 0 || rank >= hcomm->nRanks)
+        return flagcxInvalidArgument;
+      for (int j = 0; j < i; ++j)
+        if (ring.userRanks[j] == rank)
+          return flagcxInvalidArgument;
+      hash = hashAlgorithmUint64(hash, static_cast<uint64_t>(rank));
+    }
+  }
+  *topologyHash = hash;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t buildUniRunnerRingCbd(
+    uint64_t count, size_t typeSize, size_t numChannels,
+    size_t simpleBufferBytes, uniRunnerRingCbd *cbd) {
+  if (cbd == NULL || typeSize == 0 || 512 % typeSize != 0 ||
+      numChannels == 0 || numChannels > std::numeric_limits<uint32_t>::max())
+    return flagcxInvalidArgument;
+  const uint64_t grainElements = 512 / typeSize;
+  const uint64_t grains = count / grainElements + (count % grainElements != 0);
+  const uint64_t active =
+      std::min<uint64_t>(numChannels, std::max<uint64_t>(grains, 1));
+  const uint64_t baseGrains = active == 0 ? 0 : grains / active;
+  const uint64_t extraGrains = active == 0 ? 0 : grains % active;
+  const uint64_t chunkElements =
+      simpleBufferBytes / FLAGCX_STEPS / typeSize * ALLREDUCE_CHUNKSTEPS;
+  if (chunkElements == 0 || chunkElements % grainElements != 0)
+    return flagcxInvalidArgument;
+  cbd->channelLo = 0;
+  cbd->channelHi = static_cast<uint32_t>(active - 1);
+  cbd->countLo = std::min<uint64_t>(
+      count, (baseGrains + (extraGrains != 0)) * grainElements);
+  cbd->countMid = std::min<uint64_t>(count, baseGrains * grainElements);
+  const uint64_t midChannels = active > 2 ? active - 2 : 0;
+  const uint64_t assigned =
+      cbd->countLo + midChannels * cbd->countMid;
+  cbd->countHi = active > 1 ? count - std::min(count, assigned) : 0;
+  cbd->chunkGrainsLo = chunkElements / grainElements;
+  cbd->chunkGrainsMid = cbd->chunkGrainsLo;
+  cbd->chunkGrainsHi = cbd->chunkGrainsLo;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t getUniRunnerRingCbdPart(
+    const uniRunnerRingCbd &cbd, uint32_t channelId, uint64_t totalCount,
+    uint64_t *gridOffset, uint64_t *channelCount, uint64_t *chunkCount,
+    size_t typeSize) {
+  if (gridOffset == NULL || channelCount == NULL || chunkCount == NULL ||
+      channelId < cbd.channelLo || channelId > cbd.channelHi || typeSize == 0)
+    return flagcxInvalidArgument;
+  const uint64_t mid = channelId - cbd.channelLo - 1;
+  const uint64_t offset = channelId == cbd.channelLo
+                              ? 0
+                              : cbd.countLo + mid * cbd.countMid;
+  const bool last = channelId == cbd.channelHi;
+  uint64_t partCount = channelId == cbd.channelLo
+                           ? cbd.countLo
+                           : (last ? cbd.countHi : cbd.countMid);
+  const uint64_t chunkGrains = channelId == cbd.channelLo
+                                   ? cbd.chunkGrainsLo
+                                   : (last ? cbd.chunkGrainsHi
+                                           : cbd.chunkGrainsMid);
+  *gridOffset = offset;
+  *channelCount = std::min(partCount, totalCount - std::min(totalCount, offset));
+  *chunkCount = chunkGrains * (512 / typeSize);
+  return *chunkCount == 0 ? flagcxInvalidArgument : flagcxSuccess;
+}
+
+static flagcxResult_t buildUniRunnerStateIpcRingAR(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
+    flagcxComm_t comm, size_t numChannels, size_t simpleBufferBytes) {
+  (void)op;
+  if (runnerState == NULL || comm == NULL || comm->heteroComm == NULL ||
+      comm->localRanks != comm->nranks)
+    return comm != NULL && comm->localRanks != comm->nranks
+               ? flagcxNotSupported
+               : flagcxInvalidArgument;
+  const size_t typeSize = getFlagcxDataTypeSize(datatype);
+  size_t bytes = 0;
+  FLAGCXCHECK(checkedUniRunnerTypeBytes(count, 1, datatype, &bytes));
+  if ((bytes != 0 && (sendbuff == NULL || recvbuff == NULL)) || typeSize == 0)
+    return flagcxInvalidArgument;
+  if (comm->nranks == 1) {
+    if (count == 0 || sendbuff == recvbuff) {
+      runnerState->dagNodes = NULL;
+      runnerState->numDagNodes = 0;
+      return flagcxSuccess;
+    }
+    FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, 1));
+    runnerState->numDagNodes = 1;
+    uniRunnerDagNode &node = runnerState->dagNodes[0];
+    node.nodeType = uniRunnerDagNodeTypeCpy;
+    node.nodeIdx = 0;
+    node.nodeData.cpy.src = const_cast<void *>(sendbuff);
+    node.nodeData.cpy.dst = recvbuff;
+    node.nodeData.cpy.count = count;
+    node.nodeData.cpy.datatype = datatype;
+    return validateDagNodes(runnerState);
+  }
+  if (count == 0) {
+    runnerState->dagNodes = NULL;
+    runnerState->numDagNodes = 0;
+    return flagcxSuccess;
+  }
+
+  uniRunnerRingCbd cbd = {};
+  FLAGCXCHECK(buildUniRunnerRingCbd(count, typeSize, numChannels,
+                                     simpleBufferBytes, &cbd));
+  const size_t activeChannels = cbd.channelHi - cbd.channelLo + 1;
+  const uint64_t stepSizeElements =
+      simpleBufferBytes / FLAGCX_STEPS / typeSize;
+  if (stepSizeElements == 0 ||
+      stepSizeElements > std::numeric_limits<uint64_t>::max() /
+                             ALLREDUCE_CHUNKSTEPS)
+    return flagcxInvalidArgument;
+
+  struct PendingStep {
+    uint32_t channel;
+    uint32_t ordinal;
+    uint32_t kind;
+    uint32_t postOp;
+    uint64_t offset;
+    uint64_t count;
+  };
+  std::vector<PendingStep> steps;
+  try {
+    for (size_t c = 0; c < activeChannels; ++c) {
+      uint64_t gridOffset = 0, channelCount = 0, baseChunkCount = 0;
+      FLAGCXCHECK(getUniRunnerRingCbdPart(
+          cbd, static_cast<uint32_t>(c), count, &gridOffset, &channelCount,
+          &baseChunkCount, typeSize));
+      if (baseChunkCount > stepSizeElements * ALLREDUCE_CHUNKSTEPS)
+        return flagcxInvalidArgument;
+      const int ringIx = comm->heteroComm->channels[c].ring.index;
+      if (ringIx < 0 || ringIx >= comm->nranks)
+        return flagcxInvalidArgument;
+      uint32_t ordinal = 0;
+      for (uint64_t elemOffset = 0; elemOffset < channelCount;) {
+        const uint64_t remCount = channelCount - elemOffset;
+        uint64_t effectiveChunkCount = baseChunkCount;
+        if (effectiveChunkCount >
+                std::numeric_limits<uint64_t>::max() / comm->nranks ||
+            remCount < effectiveChunkCount * comm->nranks) {
+          const uint64_t alignment = std::max<uint64_t>(1, 16 / typeSize);
+          const uint64_t perRank = remCount / comm->nranks +
+                                   (remCount % comm->nranks != 0);
+          effectiveChunkCount =
+              ((perRank + alignment - 1) / alignment) * alignment;
+        }
+        if (effectiveChunkCount == 0 ||
+            effectiveChunkCount >
+                std::numeric_limits<uint64_t>::max() / comm->nranks)
+          return flagcxInvalidArgument;
+        const auto addStep = [&](int chunk, uint32_t kind,
+                                 uint32_t postOp) -> flagcxResult_t {
+          const uint64_t chunkOffset =
+              static_cast<uint64_t>(chunk) * effectiveChunkCount;
+          const uint64_t nelem = chunkOffset >= remCount
+                                     ? 0
+                                     : std::min(effectiveChunkCount,
+                                                remCount - chunkOffset);
+          if (gridOffset > std::numeric_limits<uint64_t>::max() - elemOffset ||
+              gridOffset + elemOffset >
+                  std::numeric_limits<uint64_t>::max() - chunkOffset ||
+              ordinal == std::numeric_limits<uint32_t>::max())
+            return flagcxInvalidArgument;
+          steps.push_back(PendingStep{
+              static_cast<uint32_t>(c), ordinal++, kind, postOp,
+              gridOffset + elemOffset + chunkOffset, nelem});
+          return flagcxSuccess;
+        };
+        const auto modRanks = [&](int value) {
+          return value >= comm->nranks ? value - comm->nranks : value;
+        };
+        FLAGCXCHECK(addStep(modRanks(ringIx + comm->nranks - 1),
+                            uniRunnerRingStepSend, 0));
+        for (int j = 2; j < comm->nranks; ++j)
+          FLAGCXCHECK(addStep(modRanks(ringIx + comm->nranks - j),
+                              uniRunnerRingStepRecvReduceSend, 0));
+        FLAGCXCHECK(addStep(ringIx,
+                            uniRunnerRingStepRecvReduceCopySend, 1));
+        for (int j = 1; j < comm->nranks - 1; ++j)
+          FLAGCXCHECK(addStep(modRanks(ringIx + comm->nranks - j),
+                              uniRunnerRingStepRecvCopySend, 0));
+        FLAGCXCHECK(addStep(modRanks(ringIx + 1), uniRunnerRingStepRecv, 0));
+        elemOffset += effectiveChunkCount * comm->nranks;
+      }
+    }
+  } catch (...) {
+    return flagcxSystemError;
+  }
+  if (steps.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+    return flagcxInvalidArgument;
+  runnerState->numDagNodes = static_cast<int>(steps.size());
+  FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, steps.size()));
+  for (size_t i = 0; i < steps.size(); ++i) {
+    const PendingStep &src = steps[i];
+    uniRunnerDagNode &dst = runnerState->dagNodes[i];
+    const bool first = src.ordinal == 0;
+    const bool last = i + 1 == steps.size() ||
+                      steps[i + 1].channel != src.channel;
+    dst.nodeType = uniRunnerDagNodeTypeRingStep;
+    dst.nodeIdx = static_cast<int>(i);
+    dst.numParents = first ? 0 : 1;
+    dst.numChildren = last ? 0 : 1;
+    FLAGCXCHECK(allocDagNodeDeps(&dst));
+    if (!first)
+      FLAGCXCHECK(setDagNodeParent(&dst, 0, static_cast<int>(i - 1)));
+    if (!last)
+      dst.children[0] = static_cast<int>(i + 1);
+    dst.nodeData.ringStep.channelId = src.channel;
+    dst.nodeData.ringStep.laneOrdinal = src.ordinal;
+    dst.nodeData.ringStep.kind = src.kind;
+    dst.nodeData.ringStep.postOp = src.postOp;
+    dst.nodeData.ringStep.offsetElements = src.offset;
+    dst.nodeData.ringStep.countElements = src.count;
+    dst.nodeData.ringStep.triggerIdx = -1;
+  }
+  return validateDagNodes(runnerState);
+}
+
 static flagcxResult_t buildUniRunnerStateIpcAR(
     flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
     size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
@@ -3144,6 +3674,14 @@ static flagcxResult_t captureUniRunnerDagTemplateFromState(
       nodeDesc.ipc.srcBufferType = node->nodeData.ipc.srcBufferType;
       nodeDesc.ipc.peerLocalRank = node->nodeData.ipc.peerLocalRank;
       nodeDesc.ipc.readySlot = node->nodeData.ipc.readySlot;
+    } else if (node->nodeType == uniRunnerDagNodeTypeRingStep) {
+      nodeDesc.ringStep.channelId = node->nodeData.ringStep.channelId;
+      nodeDesc.ringStep.laneOrdinal = node->nodeData.ringStep.laneOrdinal;
+      nodeDesc.ringStep.kind = node->nodeData.ringStep.kind;
+      nodeDesc.ringStep.postOp = node->nodeData.ringStep.postOp;
+      nodeDesc.ringStep.offsetElements =
+          node->nodeData.ringStep.offsetElements;
+      nodeDesc.ringStep.countElements = node->nodeData.ringStep.countElements;
     } else {
       return flagcxNotSupported;
     }
@@ -3267,6 +3805,14 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
       dst->nodeData.ipc.readySlot = src.ipc.readySlot;
       dst->nodeData.ipc.parentFlagsOffset = 0;
       dst->nodeData.ipc.triggerIdx = -1;
+    } else if (dst->nodeType == uniRunnerDagNodeTypeRingStep) {
+      dst->nodeData.ringStep.channelId = src.ringStep.channelId;
+      dst->nodeData.ringStep.laneOrdinal = src.ringStep.laneOrdinal;
+      dst->nodeData.ringStep.kind = src.ringStep.kind;
+      dst->nodeData.ringStep.postOp = src.ringStep.postOp;
+      dst->nodeData.ringStep.offsetElements = src.ringStep.offsetElements;
+      dst->nodeData.ringStep.countElements = src.ringStep.countElements;
+      dst->nodeData.ringStep.triggerIdx = -1;
     } else {
       return flagcxNotSupported;
     }
@@ -3276,6 +3822,8 @@ materializeUniRunnerDagTemplate(flagcxUniRunnerState *runnerState,
         flagcxIntruQueueEnqueue(&runnerState->redReadyQueue, dst);
       } else if (dst->nodeType == uniRunnerDagNodeTypeIpc) {
         flagcxIntruQueueEnqueue(&runnerState->ipcReadyQueue, dst);
+      } else if (dst->nodeType == uniRunnerDagNodeTypeRingStep) {
+        // Same-lane edges are lowered to persistent-CTA program order.
       } else {
         flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, dst);
       }
@@ -3292,8 +3840,11 @@ static flagcxResult_t bindUniRunnerCompiledDagPlan(
     uniRunnerDagExecutionPlan *plan) {
   if (plan == NULL || compiled.numNodes != compiled.dagTemplate.nodes.size() ||
       compiled.topoOrder.size() != compiled.numNodes ||
-      compiled.numHostNodes + compiled.numRedNodes + compiled.numIpcNodes !=
-          compiled.numNodes) {
+      compiled.numHostNodes + compiled.numRedNodes + compiled.numIpcNodes +
+              compiled.numRingStepNodes !=
+          compiled.numNodes ||
+      (compiled.numRingStepNodes != 0 &&
+       compiled.ringLaneOffsets.size() != compiled.numRingLanes + 1)) {
     return flagcxInternalError;
   }
   destroyUniRunnerDagExecutionPlan(plan);
@@ -3304,7 +3855,13 @@ static flagcxResult_t bindUniRunnerCompiledDagPlan(
   plan->numHostNodes = compiled.numHostNodes;
   plan->numRedNodes = compiled.numRedNodes;
   plan->numIpcNodes = compiled.numIpcNodes;
+  plan->numRingStepNodes = compiled.numRingStepNodes;
+  plan->numRingLanes = compiled.numRingLanes;
+  plan->ringLaneOffsets = compiled.ringLaneOffsets.empty()
+                              ? NULL
+                              : compiled.ringLaneOffsets.data();
   plan->ownsTopoOrder = false;
+  plan->ownsRingLaneOffsets = false;
   plan->staticValidated = true;
   return flagcxSuccess;
 }
@@ -3374,6 +3931,8 @@ cacheBuiltUniRunnerDag(const flagcxUniRunnerState *runnerState,
     compiled->numHostNodes = runnerState->dagPlan.numHostNodes;
     compiled->numRedNodes = runnerState->dagPlan.numRedNodes;
     compiled->numIpcNodes = runnerState->dagPlan.numIpcNodes;
+    compiled->numRingLanes = runnerState->dagPlan.numRingLanes;
+    compiled->numRingStepNodes = runnerState->dagPlan.numRingStepNodes;
     if (runnerState->dagPlan.numNodes != 0) {
       if (runnerState->dagPlan.topoOrder == NULL) {
         return flagcxInternalError;
@@ -3381,6 +3940,15 @@ cacheBuiltUniRunnerDag(const flagcxUniRunnerState *runnerState,
       compiled->topoOrder.assign(
           runnerState->dagPlan.topoOrder,
           runnerState->dagPlan.topoOrder + runnerState->dagPlan.numNodes);
+    }
+    if (runnerState->dagPlan.numRingLanes != 0) {
+      if (runnerState->dagPlan.ringLaneOffsets == NULL) {
+        return flagcxInternalError;
+      }
+      compiled->ringLaneOffsets.assign(
+          runnerState->dagPlan.ringLaneOffsets,
+          runnerState->dagPlan.ringLaneOffsets +
+              runnerState->dagPlan.numRingLanes + 1);
     }
     flagcxResult_t cacheRes = cacheUniRunnerCompiledDagTemplate(compiled);
     if (cacheRes != flagcxSuccess) {
@@ -3661,6 +4229,91 @@ flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
   // Static IPC prepends abort and rank-done control slots to the logical ready
   // array. Allocate that collective storage only after static occupancy and
   // schedule validation have succeeded.
+  return flagcxSuccess;
+}
+
+flagcxResult_t initUniRunnerStateIpcRingAR(
+    flagcxUniRunnerState *runnerState, const void *sendbuff, void *recvbuff,
+    size_t count, flagcxDataType_t datatype, flagcxRedOp_t op,
+    flagcxComm_t comm) {
+  if (runnerState == NULL || comm == NULL || comm->heteroComm == NULL)
+    return flagcxInvalidArgument;
+  setUniRunnerAvgDivisor(runnerState, op, comm->nranks);
+  size_t bytes = 0;
+  flagcxResult_t result =
+      checkedUniRunnerTypeBytes(count, 1, datatype, &bytes);
+  size_t numChannels = 0;
+  size_t nThreads = 0;
+  size_t simpleBufferBytes = 0;
+  if (result == flagcxSuccess && comm->nranks > 1) {
+    result = comm->localRanks == comm->nranks ? flagcxSuccess
+                                              : flagcxNotSupported;
+  }
+  if (result == flagcxSuccess && comm->nranks > 1) {
+    result = selectUniRunnerRingSimple(comm->heteroComm, bytes, &numChannels,
+                                       &nThreads, &simpleBufferBytes);
+  }
+  if (result == flagcxSuccess && comm->nranks > 1 && count != 0) {
+    const size_t typeSize = getFlagcxDataTypeSize(datatype);
+    const uint64_t grains =
+        count / (512 / typeSize) + (count % (512 / typeSize) != 0);
+    numChannels = std::min<uint64_t>(numChannels, std::max<uint64_t>(grains, 1));
+  }
+  if (comm->nranks == 1) {
+    numChannels = 0;
+    nThreads = 0;
+    simpleBufferBytes = 0;
+  }
+  runnerState->uniRunnerNThreads = nThreads;
+  runnerState->uniRunnerNRedBlocks = 0;
+  runnerState->uniRunnerNIpcBlocks = 0;
+
+  uniRunnerDagRuntimeBindings bindings;
+  bindings.inputBase = sendbuff;
+  bindings.outputBase = recvbuff;
+  bindings.inputBytes = bytes;
+  bindings.outputBytes = bytes;
+  bindings.localRanks = comm->localRanks;
+  uniRunnerDagAlgorithmConfig algorithmConfig{};
+  algorithmConfig.numChannels = numChannels;
+  algorithmConfig.simpleBufferBytes = simpleBufferBytes;
+  algorithmConfig.nThreads = nThreads;
+  algorithmConfig.chunkSteps = ALLREDUCE_CHUNKSTEPS;
+  algorithmConfig.sliceSteps = ALLREDUCE_SLICESTEPS;
+  algorithmConfig.bufferMode =
+      sendbuff == recvbuff ? uniRunnerDagBufferModeInPlace
+                           : uniRunnerDagBufferModeOutOfPlace;
+  if (result == flagcxSuccess && comm->nranks > 1) {
+    result = getUniRunnerIpcRingTopologyHash(
+        comm->heteroComm, numChannels, &algorithmConfig.topologyHash);
+  }
+  if (result == flagcxSuccess) {
+    const uniRunnerDagCacheKey key = makeUniRunnerDagCacheKey(
+        uniRunnerDagAlgoIpcRingAR, algorithmConfig, flagcxCommOpAllReduce,
+        count, datatype, op, -1, comm);
+    try {
+      result = initUniRunnerStateCached(runnerState, key, bindings, [&]() {
+        return buildUniRunnerStateIpcRingAR(
+            runnerState, sendbuff, recvbuff, count, datatype, op, comm,
+            numChannels, simpleBufferBytes);
+      });
+    } catch (...) {
+      result = flagcxSystemError;
+    }
+  }
+  if (result == flagcxSuccess && runnerState->ipcRingScratchMem != NULL &&
+      (runnerState->ipcRingChannels != numChannels ||
+       runnerState->ipcRingSimpleBufferBytes != simpleBufferBytes)) {
+    result = flagcxInvalidUsage;
+  }
+  if (runnerState->ipcRingScratchMem == NULL) {
+    runnerState->ipcRingChannels = numChannels;
+    runnerState->ipcRingSimpleBufferBytes = simpleBufferBytes;
+  }
+  runnerState->ipcRingDatatype = datatype;
+  runnerState->ipcRingRedOp = op;
+  FLAGCXCHECK(ensureUniRunnerIpcDataViews(
+      runnerState, comm, sendbuff, recvbuff, bytes, result));
   return flagcxSuccess;
 }
 
@@ -4088,7 +4741,9 @@ static flagcxResult_t ensureUniRunnerIpcDataViews(
     flagcxResult_t localPreparationResult) {
   const bool localCanReuse =
       localPreparationResult == flagcxSuccess &&
-      runnerState->ipcReadySlots != 0 && runnerState->ipcOwner == comm &&
+      (runnerState->ipcReadySlots != 0 ||
+       runnerState->dagPlan.numRingStepNodes != 0) &&
+      runnerState->ipcOwner == comm &&
       runnerState->ipcInputMem != NULL &&
       runnerState->ipcOutputMem != NULL &&
       runnerState->ipcInputBase == sendbuff &&
@@ -4097,12 +4752,17 @@ static flagcxResult_t ensureUniRunnerIpcDataViews(
   bool allCanReuse = false;
   flagcxResult_t collectiveResult = flagcxSuccess;
   FLAGCXCHECK(agreeUniRunnerDataViewState(
-      comm, runnerState->ipcReadySlots, bytes, localCanReuse,
+      comm,
+      runnerState->dagPlan.numRingStepNodes != 0
+          ? runnerState->dagPlan.numRingStepNodes
+          : runnerState->ipcReadySlots,
+      bytes, localCanReuse,
       localPreparationResult, &allCanReuse, &collectiveResult));
   if (collectiveResult != flagcxSuccess) {
     return collectiveResult;
   }
-  if (runnerState->ipcReadySlots == 0) {
+  if (runnerState->ipcReadySlots == 0 &&
+      runnerState->dagPlan.numRingStepNodes == 0) {
     return flagcxSuccess;
   }
   if (allCanReuse) {
@@ -4437,13 +5097,23 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
       runnerState->dagPlan.numHostNodes != 0 ||
       runnerState->dagPlan.numRedNodes != 0 ||
       runnerState->dagPlan.numIpcNodes != 0 ||
+      runnerState->dagPlan.numRingLanes != 0 ||
+      runnerState->dagPlan.numRingStepNodes != 0 ||
+      runnerState->dagPlan.ringLaneOffsets != NULL ||
+      runnerState->dagPlan.ownsRingLaneOffsets ||
       runnerState->streamFlagsSize != 0 || runnerState->ipcReadySlots != 0 ||
       runnerState->fifo != NULL || runnerState->ipcFifo != NULL ||
       runnerState->ipcFifoDevicePtr != NULL ||
       runnerState->commStream != NULL || runnerState->redStream != NULL ||
       runnerState->cpyStream != NULL || hcomm->uniRunnerFifoBuffer != NULL ||
       runnerState->ipcParentFlagsDevice != NULL ||
-      runnerState->ipcParentFlagsCount != 0) {
+      runnerState->ipcParentFlagsCount != 0 ||
+      runnerState->ipcRingTriggersDevice != NULL ||
+      runnerState->ipcRingTriggerCount != 0 ||
+      runnerState->ipcRingLanesDevice != NULL ||
+      runnerState->ipcRingLaneCount != 0 ||
+      runnerState->ipcRingControlHost != NULL ||
+      runnerState->ipcRingControlDevice != NULL) {
     WARN("UniRunner invocation-local state was not fully cleaned before init");
     return flagcxInvalidUsage;
   }
@@ -4454,7 +5124,11 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   runnerState->dagPlan.numHostNodes = 0;
   runnerState->dagPlan.numRedNodes = 0;
   runnerState->dagPlan.numIpcNodes = 0;
+  runnerState->dagPlan.ringLaneOffsets = NULL;
+  runnerState->dagPlan.numRingLanes = 0;
+  runnerState->dagPlan.numRingStepNodes = 0;
   runnerState->dagPlan.ownsTopoOrder = false;
+  runnerState->dagPlan.ownsRingLaneOffsets = false;
   runnerState->dagPlan.staticValidated = false;
   runnerState->streamFlagsSize = 0;
   runnerState->ipcReadySlots = 0;
@@ -4549,6 +5223,9 @@ flagcxResult_t cleanupUniRunner(flagcxComm_t comm) {
   if (commStream != NULL) {
     FLAGCXCHECK(deviceAdaptor->streamSynchronize(commStream));
   }
+
+  FLAGCXCHECK(releaseUniRunnerIpcRingInvocation(
+      &hcomm->proxyState->uniRunnerState));
 
   hcomm->proxyState->uniRunnerState.streamFlagsSize = 0;
 
@@ -5010,7 +5687,9 @@ static flagcxResult_t prepareStaticRedExecution(
   *numTriggers = 0;
   *maxExecutorBlocks = 0;
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
-  if (runnerState->dagPlan.numIpcNodes != 0 || runnerState->fifo == NULL ||
+  if (runnerState->dagPlan.numIpcNodes != 0 ||
+      runnerState->dagPlan.numRingStepNodes != 0 ||
+      runnerState->fifo == NULL ||
       runnerState->fifo->buffer != NULL ||
       hcomm->uniRunnerFifoBuffer != NULL) {
     return flagcxInternalError;
@@ -5127,6 +5806,11 @@ static void requestUniRunnerStaticAbort(flagcxUniRunnerState *runnerState) {
     // as its one rank-local abort flag.
     __atomic_store_n(runnerState->ipcFifo->buffer + flagcxFifoIdxTerminate, 1,
                      __ATOMIC_RELEASE);
+  }
+  if (runnerState->ipcRingControlHost != NULL) {
+    __atomic_store_n(
+        runnerState->ipcRingControlHost + flagcxFifoIdxTerminate, 1,
+        __ATOMIC_RELEASE);
   }
 }
 
@@ -5415,6 +6099,224 @@ static flagcxResult_t recoverFailedStaticCollectiveLaunch(
   return launchResult;
 }
 
+static flagcxResult_t releaseUniRunnerIpcRingInvocation(
+    flagcxUniRunnerState *runnerState) {
+  flagcxResult_t result = flagcxSuccess;
+  if (runnerState->ipcRingTriggersDevice != NULL) {
+    result = deviceAdaptor->deviceFree(runnerState->ipcRingTriggersDevice,
+                                        flagcxMemDevice, NULL);
+  }
+  if (runnerState->ipcRingLanesDevice != NULL) {
+    flagcxResult_t laneResult = deviceAdaptor->deviceFree(
+        runnerState->ipcRingLanesDevice, flagcxMemDevice, NULL);
+    preserveFirstUniRunnerError(laneResult, &result);
+  }
+  if (runnerState->ipcRingControlHost != NULL) {
+    flagcxResult_t controlResult = deviceAdaptor->deviceFree(
+        runnerState->ipcRingControlHost, flagcxMemHost, NULL);
+    preserveFirstUniRunnerError(controlResult, &result);
+  }
+  runnerState->ipcRingTriggersDevice = NULL;
+  runnerState->ipcRingTriggerCount = 0;
+  runnerState->ipcRingLanesDevice = NULL;
+  runnerState->ipcRingLaneCount = 0;
+  runnerState->ipcRingControlHost = NULL;
+  runnerState->ipcRingControlDevice = NULL;
+  return result;
+}
+
+static flagcxResult_t runStaticRingDag(
+    flagcxComm_t comm, flagcxResult_t localPreparationResult) {
+  flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  const uniRunnerDagExecutionPlan &plan = runnerState->dagPlan;
+  flagcxResult_t result = localPreparationResult;
+  if (result == flagcxSuccess &&
+      (plan.numRingStepNodes == 0 || plan.numRingLanes == 0 ||
+      plan.numHostNodes != 0 || plan.numRedNodes != 0 ||
+      plan.numIpcNodes != 0 || runnerState->ipcOwner != comm ||
+       runnerState->ipcInputMem == NULL || runnerState->ipcOutputMem == NULL)) {
+    result = flagcxInvalidArgument;
+  }
+  flagcxResult_t collectiveResult = flagcxSuccess;
+  flagcxResult_t agreementResult = agreeUniRunnerInvocationState(
+      comm,
+      mixUniRunnerInvocationSignature(uint64_t{0xcbf29ce484222325},
+                                      plan.numRingStepNodes),
+      result, &collectiveResult);
+  if (agreementResult != flagcxSuccess || collectiveResult != flagcxSuccess) {
+    runnerState->ipcRingResourcesDirty = true;
+    return agreementResult != flagcxSuccess ? agreementResult
+                                            : collectiveResult;
+  }
+  result = ensureUniRunnerIpcReadyStorage(
+      runnerState, comm, size_t{1} + static_cast<size_t>(comm->localRanks));
+  if (result == flagcxSuccess)
+    result = ensureUniRunnerIpcRingResources(
+        runnerState, comm, plan.numRingLanes,
+        runnerState->ipcRingSimpleBufferBytes);
+  if (result == flagcxSuccess)
+    result = resetDirtyUniRunnerIpcRingResources(runnerState, comm);
+  if (result != flagcxSuccess) {
+    runnerState->ipcRingResourcesDirty = true;
+    return result;
+  }
+
+  std::vector<flagcxRingStepTrigger> hostTriggers;
+  std::vector<flagcxRingLaneDesc> hostLanes;
+  flagcxRingStepTrigger *newTriggers = NULL;
+  flagcxRingLaneDesc *newLanes = NULL;
+  uint64_t *newControlHost = NULL;
+  void *newControlDevice = NULL;
+  const auto releaseNewInvocation = [&]() {
+    if (newTriggers != NULL)
+      (void)deviceAdaptor->deviceFree(newTriggers, flagcxMemDevice, NULL);
+    if (newLanes != NULL)
+      (void)deviceAdaptor->deviceFree(newLanes, flagcxMemDevice, NULL);
+    if (newControlHost != NULL)
+      (void)deviceAdaptor->deviceFree(newControlHost, flagcxMemHost, NULL);
+  };
+  try {
+    hostTriggers.resize(plan.numRingStepNodes);
+    hostLanes.resize(plan.numRingLanes);
+  } catch (...) {
+    result = flagcxSystemError;
+  }
+  if (result == flagcxSuccess)
+    result = populateUniRunnerStaticRingDag(
+        runnerState->dagNodes, static_cast<size_t>(runnerState->numDagNodes),
+        &plan, runnerState->streamFlags, runnerState->streamFlagsSize, hcomm,
+        runnerState->ipcRingSimpleBufferBytes, hostTriggers.data(),
+        hostTriggers.size(), hostLanes.data(), hostLanes.size());
+  if (result == flagcxSuccess)
+    result = deviceAdaptor->deviceMalloc(
+        reinterpret_cast<void **>(&newTriggers),
+        hostTriggers.size() * sizeof(flagcxRingStepTrigger), flagcxMemDevice,
+        NULL);
+  if (result == flagcxSuccess && newTriggers == NULL)
+    result = flagcxSystemError;
+  if (result == flagcxSuccess)
+    result = deviceAdaptor->deviceMalloc(
+        reinterpret_cast<void **>(&newLanes),
+        hostLanes.size() * sizeof(flagcxRingLaneDesc), flagcxMemDevice, NULL);
+  if (result == flagcxSuccess && newLanes == NULL)
+    result = flagcxSystemError;
+  if (result == flagcxSuccess)
+    result = deviceAdaptor->deviceMemcpy(
+        newTriggers, hostTriggers.data(),
+        hostTriggers.size() * sizeof(flagcxRingStepTrigger),
+        flagcxMemcpyHostToDevice, NULL, NULL);
+  if (result == flagcxSuccess)
+    result = deviceAdaptor->deviceMemcpy(
+        newLanes, hostLanes.data(),
+        hostLanes.size() * sizeof(flagcxRingLaneDesc),
+        flagcxMemcpyHostToDevice, NULL, NULL);
+  if (result == flagcxSuccess)
+    result = deviceAdaptor->deviceMalloc(
+        reinterpret_cast<void **>(&newControlHost),
+        flagcxFifoIdxData * sizeof(uint64_t), flagcxMemHost, NULL);
+  if (result == flagcxSuccess && newControlHost == NULL)
+    result = flagcxSystemError;
+  if (result == flagcxSuccess)
+    result = deviceAdaptor->hostGetDevicePointer(
+        &newControlDevice, newControlHost);
+  if (result == flagcxSuccess && newControlDevice == NULL)
+    result = flagcxSystemError;
+  if (result == flagcxSuccess) {
+    newControlHost[flagcxFifoIdxCapacity] = plan.numRingLanes;
+    newControlHost[flagcxFifoIdxConsumed] = 0;
+    newControlHost[flagcxFifoIdxProduced] = 0;
+    newControlHost[flagcxFifoIdxTerminate] = 0;
+    __sync_synchronize();
+  }
+
+  if (result == flagcxSuccess &&
+      runnerState->ipcEpoch >= flagcxIpcControlAbortBit - 1)
+    result = flagcxInvalidUsage;
+  flagcxStaticIpcControl control = {};
+  control.epoch = result == flagcxSuccess ? runnerState->ipcEpoch + 1 : 1;
+  control.abortSlot = 0;
+  control.doneBase = 1;
+  control.readyDataOffset = 1 + static_cast<uint64_t>(comm->localRanks);
+  control.localRank = static_cast<uint32_t>(comm->localRank);
+  control.localRanks = static_cast<uint32_t>(comm->localRanks);
+  collectiveResult = flagcxSuccess;
+  agreementResult = agreeUniRunnerInvocationState(
+      comm,
+      mixUniRunnerInvocationSignature(
+          mixUniRunnerInvocationSignature(uint64_t{0xcbf29ce484222325},
+                                          control.epoch),
+          plan.numRingStepNodes),
+      result, &collectiveResult);
+  if (agreementResult != flagcxSuccess) {
+    releaseNewInvocation();
+    runnerState->ipcRingResourcesDirty = true;
+    return agreementResult;
+  }
+  if (collectiveResult != flagcxSuccess) {
+    releaseNewInvocation();
+    runnerState->ipcRingResourcesDirty = true;
+    return collectiveResult;
+  }
+  runnerState->ipcRingTriggersDevice = newTriggers;
+  runnerState->ipcRingTriggerCount = hostTriggers.size();
+  runnerState->ipcRingLanesDevice = newLanes;
+  runnerState->ipcRingLaneCount = hostLanes.size();
+  runnerState->ipcRingControlHost = newControlHost;
+  runnerState->ipcRingControlDevice = newControlDevice;
+  runnerState->ipcEpoch = control.epoch;
+  size_t maxExecutorBlocks = 0;
+#ifdef COMPILE_KERNEL_HOST
+  result = flagcxGetStaticRingDagKernelMaxExecutorBlocks(
+      static_cast<size_t>(runnerState->uniRunnerNThreads),
+      &maxExecutorBlocks);
+  if (result == flagcxSuccess && plan.numRingLanes > maxExecutorBlocks)
+    result = flagcxNotSupported;
+#else
+  result = flagcxNotSupported;
+#endif
+  collectiveResult = flagcxSuccess;
+  agreementResult = agreeUniRunnerInvocationState(
+      comm,
+      mixUniRunnerInvocationSignature(uint64_t{0xcbf29ce484222325},
+                                      maxExecutorBlocks),
+      result, &collectiveResult);
+  if (agreementResult != flagcxSuccess || collectiveResult != flagcxSuccess) {
+    runnerState->ipcRingResourcesDirty = true;
+    return agreementResult != flagcxSuccess ? agreementResult
+                                            : collectiveResult;
+  }
+#ifdef COMPILE_KERNEL_HOST
+  uint64_t *controlDevice =
+      static_cast<uint64_t *>(runnerState->ipcRingControlDevice);
+  result = flagcxLaunchStaticRingDagKernel(
+      runnerState->ipcRingLanesDevice, plan.numRingLanes,
+      runnerState->ipcRingTriggersDevice, plan.numRingStepNodes,
+      runnerState->ipcInputMem, runnerState->ipcOutputMem,
+      runnerState->ipcRingScratchMem, runnerState->ipcRingProgressMem,
+      runnerState->ipcReadyMem, runnerState->ipcRingSimpleBufferBytes,
+      runnerState->ipcRingDatatype, runnerState->ipcRingRedOp,
+      runnerState->avgDivisor, controlDevice + flagcxFifoIdxConsumed,
+      controlDevice + flagcxFifoIdxTerminate, &control,
+      static_cast<size_t>(runnerState->uniRunnerNThreads), maxExecutorBlocks,
+      runnerState->redStream);
+  if (result != flagcxSuccess) {
+    runnerState->ipcRingResourcesDirty = true;
+    return recoverFailedStaticCollectiveLaunch(
+        runnerState, &control, runnerState->redStream, result);
+  }
+#endif
+  result = waitForStaticStreamCompletion(runnerState, &control);
+  if (result == flagcxSuccess &&
+      __atomic_load_n(runnerState->ipcRingControlHost +
+                          flagcxFifoIdxTerminate,
+                      __ATOMIC_ACQUIRE) != 0)
+    result = flagcxRemoteError;
+  if (result != flagcxSuccess)
+    runnerState->ipcRingResourcesDirty = true;
+  return result;
+}
+
 static flagcxResult_t runStaticHostRedIpc(
     flagcxComm_t comm, flagcxResult_t localPreparationResult) {
   flagcxHeteroComm_t hcomm = comm->heteroComm;
@@ -5474,6 +6376,7 @@ static flagcxResult_t runDynamicDagFallback(flagcxHeteroComm_t hcomm) {
   // Feeding IPC nodes through the legacy producer/dequeue path would alias its
   // ready slot zero with the abort word, so fallback is intentionally RED-only.
   if (runnerState->dagPlan.numIpcNodes != 0 ||
+      runnerState->dagPlan.numRingStepNodes != 0 ||
       runnerState->ipcFifo == NULL ||
       runnerState->ipcFifo->buffer != NULL ||
       runnerState->ipcFifoDevicePtr != NULL) {
@@ -5513,7 +6416,9 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
   const bool ipcIntent =
-      runnerState->ipcOwner == comm && runnerState->ipcReadySlots != 0;
+      runnerState->ipcOwner == comm &&
+      (runnerState->dagPlan.numIpcNodes != 0 ||
+       runnerState->dagPlan.numRingStepNodes != 0);
   flagcxResult_t localPreparationResult = flagcxSuccess;
   if (runnerState->numDagNodes < 0 ||
       (runnerState->numDagNodes == 0) != (runnerState->dagNodes == NULL)) {
@@ -5526,7 +6431,9 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
         (numDagNodes != 0 && runnerState->dagPlan.topoOrder == NULL) ||
         plan.numHostNodes > numDagNodes ||
         plan.numRedNodes > numDagNodes - plan.numHostNodes ||
-        plan.numIpcNodes != numDagNodes - plan.numHostNodes - plan.numRedNodes ||
+        plan.numIpcNodes > numDagNodes - plan.numHostNodes - plan.numRedNodes ||
+        plan.numRingStepNodes != numDagNodes - plan.numHostNodes -
+                                     plan.numRedNodes - plan.numIpcNodes ||
         (plan.numRedNodes != 0 &&
          (runnerState->uniRunnerNRedBlocks == 0 ||
           runnerState->uniRunnerNThreads == 0 ||
@@ -5534,7 +6441,12 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
               flagcxTriggerMask(flagcxReduceTriggerBitsNThreads))) ||
         (plan.numIpcNodes != 0 &&
          (runnerState->uniRunnerNIpcBlocks == 0 ||
-          runnerState->ipcReadySlots != plan.numIpcNodes))) {
+          runnerState->ipcReadySlots != plan.numIpcNodes)) ||
+        (plan.numRingStepNodes != 0 &&
+         (plan.numRingLanes == 0 || plan.ringLaneOffsets == NULL ||
+          runnerState->uniRunnerNThreads < 3 * WARP_SIZE ||
+          runnerState->uniRunnerNThreads % WARP_SIZE != 0 ||
+          runnerState->uniRunnerNThreads > FLAGCX_SIMPLE_MAX_NTHREADS))) {
       localPreparationResult = flagcxInternalError;
     }
   }
@@ -5545,7 +6457,9 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
     // IPC initialization already agreed this intent across ranks. Preserve the
     // static preparation collective even when one rank fails validation or
     // stream-flag setup, so no peer enters the preflight all-gather alone.
-    return runStaticHostRedIpc(comm, localPreparationResult);
+    return runnerState->dagPlan.numRingStepNodes != 0
+               ? runStaticRingDag(comm, localPreparationResult)
+               : runStaticHostRedIpc(comm, localPreparationResult);
   }
   if (localPreparationResult != flagcxSuccess) {
     return localPreparationResult;
@@ -5559,6 +6473,7 @@ cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState) {
   FLAGCXCHECK(destroyStreamFlagQueue(runnerState));
   if (runnerState == NULL)
     return flagcxSuccess;
+  FLAGCXCHECK(releaseUniRunnerIpcRingInvocation(runnerState));
 
   flagcxComm_t comm = runnerState->ipcOwner;
   FLAGCXCHECK(destroyUniRunnerIpcDataViews(runnerState));
@@ -5579,6 +6494,40 @@ cleanupUniRunnerPersistentState(flagcxUniRunnerState *runnerState) {
   runnerState->ipcReadyBuffer = NULL;
   runnerState->ipcReadyCapacity = 0;
   runnerState->ipcReadySlots = 0;
+  if (runnerState->ipcRingScratchMem != NULL) {
+    if (comm == NULL)
+      return flagcxInternalError;
+    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->ipcRingScratchMem));
+  }
+  if (runnerState->ipcRingProgressMem != NULL) {
+    if (comm == NULL)
+      return flagcxInternalError;
+    FLAGCXCHECK(flagcxDevMemDestroy(comm, runnerState->ipcRingProgressMem));
+  }
+  runnerState->ipcRingScratchMem = NULL;
+  runnerState->ipcRingProgressMem = NULL;
+  if ((runnerState->ipcRingScratchBuffer != NULL ||
+       runnerState->ipcRingProgressBuffer != NULL) &&
+      comm == NULL) {
+    return flagcxInternalError;
+  }
+  if (runnerState->ipcRingScratchBuffer != NULL) {
+    flagcxCommDeferFree(comm, runnerState->ipcRingScratchBuffer,
+                       flagcxMemDevice);
+  }
+  if (runnerState->ipcRingProgressBuffer != NULL) {
+    flagcxCommDeferFree(comm, runnerState->ipcRingProgressBuffer,
+                       flagcxMemDevice);
+  }
+  runnerState->ipcRingScratchBuffer = NULL;
+  runnerState->ipcRingProgressBuffer = NULL;
+  runnerState->ipcRingScratchBytes = 0;
+  runnerState->ipcRingProgressBytes = 0;
+  runnerState->ipcRingChannels = 0;
+  runnerState->ipcRingSimpleBufferBytes = 0;
+  runnerState->ipcRingDatatype = flagcxInt8;
+  runnerState->ipcRingRedOp = flagcxSum;
+  runnerState->ipcRingResourcesDirty = false;
   runnerState->ipcOwner = NULL;
   if (runnerState->ipcParentFlagsDevice != NULL) {
     FLAGCXCHECK(deviceAdaptor->deviceFree(runnerState->ipcParentFlagsDevice,
