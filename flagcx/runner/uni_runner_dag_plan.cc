@@ -19,7 +19,8 @@ enum uniRunnerDagPlanPhase {
   uniRunnerDagPlanPhaseHost = 0,
   uniRunnerDagPlanPhaseRed = 1,
   uniRunnerDagPlanPhaseIpc = 2,
-  uniRunnerDagPlanNumPhases = 3
+  uniRunnerDagPlanPhaseIpcRing = 3,
+  uniRunnerDagPlanNumPhases = 4
 };
 
 static bool getUniRunnerDagPlanPhase(uniRunnerDagNodeType nodeType,
@@ -34,6 +35,9 @@ static bool getUniRunnerDagPlanPhase(uniRunnerDagNodeType nodeType,
       return true;
     case uniRunnerDagNodeTypeIpc:
       *phase = uniRunnerDagPlanPhaseIpc;
+      return true;
+    case uniRunnerDagNodeTypeIpcRingChannel:
+      *phase = uniRunnerDagPlanPhaseIpcRing;
       return true;
     default:
       return false;
@@ -95,9 +99,10 @@ static uint64_t makeDagEdge(int parentIdx, int childIdx) {
 template <typename NodeAccessor>
 flagcxResult_t compileUniRunnerDagOrder(
     size_t numNodes, const NodeAccessor &nodeAt, std::vector<int> *topoOrder,
-    size_t *numHostNodes, size_t *numRedNodes, size_t *numIpcNodes) {
+    size_t *numHostNodes, size_t *numRedNodes, size_t *numIpcNodes,
+    size_t *numIpcRingChannelNodes) {
   if (topoOrder == NULL || numHostNodes == NULL || numRedNodes == NULL ||
-      numIpcNodes == NULL ||
+      numIpcNodes == NULL || numIpcRingChannelNodes == NULL ||
       numNodes > static_cast<size_t>(std::numeric_limits<int>::max())) {
     return flagcxInvalidArgument;
   }
@@ -105,6 +110,7 @@ flagcxResult_t compileUniRunnerDagOrder(
   *numHostNodes = 0;
   *numRedNodes = 0;
   *numIpcNodes = 0;
+  *numIpcRingChannelNodes = 0;
   if (numNodes == 0) {
     return flagcxSuccess;
   }
@@ -112,8 +118,8 @@ flagcxResult_t compileUniRunnerDagOrder(
   try {
     std::vector<int> indegree(numNodes, 0);
     std::vector<int> nextReady(numNodes, -1);
-    std::array<int, uniRunnerDagPlanNumPhases> readyHead = {{-1, -1, -1}};
-    std::array<int, uniRunnerDagPlanNumPhases> readyTail = {{-1, -1, -1}};
+    std::array<int, uniRunnerDagPlanNumPhases> readyHead = {{-1, -1, -1, -1}};
+    std::array<int, uniRunnerDagPlanNumPhases> readyTail = {{-1, -1, -1, -1}};
     std::unordered_set<uint64_t> parentEdges;
     size_t numEdges = 0;
 
@@ -135,6 +141,10 @@ flagcxResult_t compileUniRunnerDagOrder(
       }
       const size_t numParents = node.numParents();
       const size_t numChildren = node.numChildren();
+      if (node.nodeType == uniRunnerDagNodeTypeIpcRingChannel &&
+          (numParents != 0 || numChildren != 0)) {
+        return flagcxInvalidArgument;
+      }
       if (numParents > static_cast<size_t>(std::numeric_limits<int>::max()) ||
           numChildren > static_cast<size_t>(std::numeric_limits<int>::max()) ||
           numParents > std::numeric_limits<size_t>::max() - numEdges) {
@@ -203,8 +213,10 @@ flagcxResult_t compileUniRunnerDagOrder(
             ++*numHostNodes;
           } else if (phase == uniRunnerDagPlanPhaseRed) {
             ++*numRedNodes;
-          } else {
+          } else if (phase == uniRunnerDagPlanPhaseIpc) {
             ++*numIpcNodes;
+          } else {
+            ++*numIpcRingChannelNodes;
           }
 
           const auto &node = nodeAt(static_cast<size_t>(nodeIdx));
@@ -232,7 +244,8 @@ flagcxResult_t compileUniRunnerDagOrder(
       }
     }
 
-    return *numHostNodes + *numRedNodes + *numIpcNodes == numNodes
+    return *numHostNodes + *numRedNodes + *numIpcNodes +
+                   *numIpcRingChannelNodes == numNodes
                ? flagcxSuccess
                : flagcxInternalError;
   } catch (...) {
@@ -240,6 +253,7 @@ flagcxResult_t compileUniRunnerDagOrder(
     *numHostNodes = 0;
     *numRedNodes = 0;
     *numIpcNodes = 0;
+    *numIpcRingChannelNodes = 0;
     return flagcxSystemError;
   }
 }
@@ -290,14 +304,19 @@ validateUniRunnerDagTemplatePayload(const uniRunnerDagTemplate &dagTemplate) {
     return flagcxInvalidArgument;
   }
   size_t numIpcNodes = 0;
+  size_t numIpcRingNodes = 0;
   for (const uniRunnerDagNodeDesc &node : dagTemplate.nodes) {
     if (node.nodeType == uniRunnerDagNodeTypeIpc) {
       ++numIpcNodes;
+    } else if (node.nodeType == uniRunnerDagNodeTypeIpcRingChannel) {
+      ++numIpcRingNodes;
     }
   }
   std::vector<uint8_t> ipcReadySlots;
+  std::vector<uint8_t> ringChannels;
   try {
     ipcReadySlots.assign(numIpcNodes, uint8_t{0});
+    ringChannels.assign(numIpcRingNodes, uint8_t{0});
   } catch (...) {
     return flagcxSystemError;
   }
@@ -353,9 +372,30 @@ validateUniRunnerDagTemplatePayload(const uniRunnerDagTemplate &dagTemplate) {
         }
         ipcReadySlots[node.ipc.readySlot] = 1;
         break;
+      case uniRunnerDagNodeTypeIpcRingChannel: {
+        const uniRunnerDagIpcRingChannelDesc &ring = node.ipcRingChannel;
+        if (!node.parents.empty() || !node.children.empty() ||
+            ring.nRanks != static_cast<uint32_t>(dagTemplate.key.nranks) ||
+            ring.ringIndex >= ring.nRanks || ring.prevRank < 0 ||
+            ring.prevRank >= dagTemplate.key.nranks || ring.nextRank < 0 ||
+            ring.nextRank >= dagTemplate.key.nranks || ring.prevLocalRank < 0 ||
+            ring.prevLocalRank >= dagTemplate.key.nranks ||
+            ring.nextLocalRank < 0 ||
+            ring.nextLocalRank >= dagTemplate.key.nranks ||
+            ring.nThreads == 0 || ring.nThreads % 32 != 0 ||
+            ring.workIndex != 0 || ring.channelId >= numIpcRingNodes ||
+            ringChannels[ring.channelId] != 0) {
+          return flagcxInvalidArgument;
+        }
+        ringChannels[ring.channelId] = 1;
+        break;
+      }
       default:
         return flagcxInternalError;
     }
+  }
+  for (uint8_t present : ringChannels) {
+    if (present == 0) return flagcxInvalidArgument;
   }
   // Unique slots in [0, numIpcNodes) imply an exact dense assignment.
   return flagcxSuccess;
@@ -443,11 +483,40 @@ flagcxResult_t compileUniRunnerDagExecutionPlan(
     return flagcxInvalidArgument;
   }
 
+  size_t ringNodeCount = 0;
+  for (size_t nodeIdx = 0; nodeIdx < numNodes; ++nodeIdx)
+    ringNodeCount +=
+        nodes[nodeIdx].nodeType == uniRunnerDagNodeTypeIpcRingChannel;
+  std::vector<uint8_t> ringChannels;
+  try {
+    ringChannels.assign(ringNodeCount, uint8_t{0});
+  } catch (...) {
+    return flagcxSystemError;
+  }
+
   for (size_t nodeIdx = 0; nodeIdx < numNodes; ++nodeIdx) {
     if (nodes[nodeIdx].numParents < 0 || nodes[nodeIdx].numChildren < 0 ||
         (nodes[nodeIdx].numParents > 0 && nodes[nodeIdx].parents == NULL) ||
         (nodes[nodeIdx].numChildren > 0 && nodes[nodeIdx].children == NULL)) {
       return flagcxInternalError;
+    }
+    if (nodes[nodeIdx].nodeType == uniRunnerDagNodeTypeIpcRingChannel) {
+      const uniRunnerIpcRingChannelNodeData &ring =
+          nodes[nodeIdx].nodeData.ipcRingChannel;
+      if (nodes[nodeIdx].numParents != 0 ||
+          nodes[nodeIdx].numChildren != 0 || ring.channelId >= ringNodeCount ||
+          ringChannels[ring.channelId] != 0 || ring.nRanks == 0 ||
+          ring.ringIndex >= ring.nRanks || ring.prevRank < 0 ||
+          ring.prevRank >= static_cast<int32_t>(ring.nRanks) ||
+          ring.nextRank < 0 ||
+          ring.nextRank >= static_cast<int32_t>(ring.nRanks) ||
+          ring.prevLocalRank < 0 ||
+          ring.prevLocalRank >= static_cast<int32_t>(ring.nRanks) ||
+          ring.nextLocalRank < 0 ||
+          ring.nextLocalRank >= static_cast<int32_t>(ring.nRanks) ||
+          ring.nThreads == 0 || ring.nThreads % 32 != 0 ||
+          ring.workIndex != 0) return flagcxInvalidArgument;
+      ringChannels[ring.channelId] = 1;
     }
   }
 
@@ -455,9 +524,10 @@ flagcxResult_t compileUniRunnerDagExecutionPlan(
   size_t numHostNodes = 0;
   size_t numRedNodes = 0;
   size_t numIpcNodes = 0;
+  size_t numIpcRingChannelNodes = 0;
   FLAGCXCHECK(compileUniRunnerDagOrder(
       numNodes, RuntimeNodeAccessor(nodes), &order, &numHostNodes,
-      &numRedNodes, &numIpcNodes));
+      &numRedNodes, &numIpcNodes, &numIpcRingChannelNodes));
 
   int *topoOrder = NULL;
   FLAGCXCHECK(flagcxCalloc(&topoOrder, numNodes));
@@ -467,6 +537,7 @@ flagcxResult_t compileUniRunnerDagExecutionPlan(
   plan->numHostNodes = numHostNodes;
   plan->numRedNodes = numRedNodes;
   plan->numIpcNodes = numIpcNodes;
+  plan->numIpcRingChannelNodes = numIpcRingChannelNodes;
   plan->ownsTopoOrder = true;
   return flagcxSuccess;
 }
@@ -488,7 +559,7 @@ flagcxResult_t compileUniRunnerDagTemplate(
     FLAGCXCHECK(compileUniRunnerDagOrder(
         numNodes, TemplateNodeAccessor(dagTemplate.nodes),
         &compiled.topoOrder, &compiled.numHostNodes, &compiled.numRedNodes,
-        &compiled.numIpcNodes));
+        &compiled.numIpcNodes, &compiled.numIpcRingChannelNodes));
     compiled.dagTemplate = dagTemplate;
     compiled.dagTemplate.hashValue =
         getUniRunnerDagPatternHash(compiled.dagTemplate.key);
@@ -516,13 +587,27 @@ flagcxResult_t resolveUniRunnerStaticExecutorSchedule(
       ((plan->numNodes == 0) != (plan->topoOrder == NULL)) ||
       plan->numHostNodes > plan->numNodes ||
       plan->numRedNodes > plan->numNodes - plan->numHostNodes ||
-      plan->numIpcNodes !=
-          plan->numNodes - plan->numHostNodes - plan->numRedNodes) {
+      plan->numIpcNodes >
+          plan->numNodes - plan->numHostNodes - plan->numRedNodes ||
+      plan->numIpcRingChannelNodes != plan->numNodes - plan->numHostNodes -
+                                                plan->numRedNodes -
+                                                plan->numIpcNodes) {
     return flagcxInvalidArgument;
   }
 
   schedule->numRedTasks = plan->numRedNodes;
   schedule->numIpcTasks = plan->numIpcNodes;
+  schedule->numIpcRingTasks = plan->numIpcRingChannelNodes;
+  schedule->numIpcRingBlocks = plan->numIpcRingChannelNodes;
+  if (plan->numIpcRingChannelNodes != 0) {
+    if (plan->numHostNodes != 0 || plan->numRedNodes != 0 ||
+        plan->numIpcNodes != 0 ||
+        plan->numIpcRingChannelNodes > maxExecutorBlocks) {
+      *schedule = {};
+      return flagcxInvalidArgument;
+    }
+    return flagcxSuccess;
+  }
   if ((plan->numIpcNodes == 0 && maxIpcParallelism != 0) ||
       (plan->numIpcNodes != 0 && maxIpcParallelism == 0)) {
     *schedule = {};

@@ -19,6 +19,7 @@
 
 #include "device_utils.h"
 #include "flagcx.h"
+#include <stddef.h>
 
 struct flagcxHeteroComm;
 
@@ -305,6 +306,68 @@ struct alignas(16) flagcxIpcTrigger {
   uint32_t state;
   uint64_t nextChunk; // atomically claimed by IPC executor blocks
 };
+
+// Minimal NCCL Ring+Simple work ABI used by UniRunner's unregistered IPC
+// connection-FIFO path. Derived from NCCL (Apache-2.0), commit
+// 7b83616df3ae082a1f32bb74c27458bfe8153a13.
+struct alignas(16) flagcxUniRunnerRingWork {
+  uint32_t channelLo;
+  uint32_t channelHi;
+  uint32_t nWarps;
+  uint32_t directMode;
+  uint64_t countLo;
+  uint64_t countMid;
+  uint64_t countHi;
+  uint32_t chunkGrainsLo;
+  uint32_t chunkGrainsMid;
+  uint32_t chunkGrainsHi;
+  uint32_t reserved;
+  uint32_t datatype;
+  uint32_t redOp;
+  uint64_t avgDivisor;
+};
+
+struct alignas(16) flagcxIpcRingTrigger {
+  uint32_t channelId;
+  uint32_t ringIndex;
+  int32_t prevRank;
+  int32_t nextRank;
+  int32_t prevLocalRank;
+  int32_t nextLocalRank;
+  uint32_t nRanks;
+  uint32_t nThreads;
+  uint32_t workIndex;
+  uint32_t reserved;
+  uint64_t flagOut;
+};
+
+struct alignas(128) flagcxUniRunnerCounterLine {
+  uint64_t value;
+  uint64_t padding[15];
+};
+
+struct alignas(128) flagcxUniRunnerRingChannelProgress {
+  flagcxUniRunnerCounterLine head;
+  flagcxUniRunnerCounterLine tail;
+  uint64_t sendStep;
+  uint64_t recvStep;
+  uint64_t padding[14];
+};
+
+static_assert(sizeof(flagcxUniRunnerRingWork) == 80,
+              "UniRunner Ring work ABI changed");
+static_assert(alignof(flagcxUniRunnerRingWork) == 16,
+              "UniRunner Ring work alignment changed");
+static_assert(sizeof(flagcxIpcRingTrigger) == 48,
+              "UniRunner Ring trigger ABI changed");
+static_assert(alignof(flagcxIpcRingTrigger) == 16,
+              "UniRunner Ring trigger alignment changed");
+static_assert(offsetof(flagcxUniRunnerRingChannelProgress, tail) >= 128,
+              "Ring head and tail must use separate cache lines");
+static_assert(sizeof(flagcxUniRunnerRingChannelProgress) == 384,
+              "UniRunner Ring progress ABI changed");
+static_assert(alignof(flagcxUniRunnerRingChannelProgress) == 128,
+              "UniRunner Ring progress alignment changed");
 typedef flagcxReduceTrigger *flagcxReduceTrigger_t;
 
 #endif // FLAGCX_KERNEL_CORE_H_

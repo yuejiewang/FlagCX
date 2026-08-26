@@ -237,6 +237,27 @@ flagcxResult_t flagcxFifo::flagcxIpcFifoInit(size_t numTriggers) {
   return flagcxSuccess;
 }
 
+flagcxResult_t flagcxFifo::flagcxIpcRingFifoInit(size_t numTriggers) {
+  TRACE(FLAGCX_INIT, "flagcxIpcRingFifoInit called");
+  if (buffer != NULL || numTriggers == 0) return flagcxInvalidArgument;
+  size_t bytes = 0;
+  FLAGCXCHECK(flagcxCheckedFifoAllocationSize(
+      numTriggers, sizeof(flagcxIpcRingTrigger), &bytes));
+  uint64_t *newBuffer = NULL;
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+      reinterpret_cast<void **>(&newBuffer), bytes, flagcxMemHost, NULL));
+  if (newBuffer == NULL) return flagcxSystemError;
+  buffer = newBuffer;
+  buffer[flagcxFifoIdxCapacity] = numTriggers;
+  buffer[flagcxFifoIdxConsumed] = 0;
+  buffer[flagcxFifoIdxProduced] = 0;
+  buffer[flagcxFifoIdxTerminate] = 0;
+  memset(buffer + flagcxFifoIdxData, 0,
+         numTriggers * sizeof(flagcxIpcRingTrigger));
+  __sync_synchronize();
+  return flagcxSuccess;
+}
+
 flagcxResult_t flagcxFifo::flagcxRedFifoDestroy() {
   INFO(FLAGCX_KERNEL, "flagcxRedFifoDestroy called");
   if (buffer != NULL) {

@@ -43,6 +43,7 @@ public:
   flagcxResult_t flagcxRedFifoInit(size_t numTriggers);
   flagcxResult_t flagcxIpcFifoInit();
   flagcxResult_t flagcxIpcFifoInit(size_t numTriggers);
+  flagcxResult_t flagcxIpcRingFifoInit(size_t numTriggers);
   flagcxResult_t flagcxFifoDestroy();
   flagcxResult_t flagcxRedFifoDestroy();
   flagcxResult_t flagcxIpcFifoDestroy();
@@ -95,6 +96,12 @@ FLAGCX_GLOBAL_DECORATOR void flagcxStaticCollectiveKernel(
     flagcxStaticIpcControl ipcControl, uint64_t avgDivisor);
 FLAGCX_GLOBAL_DECORATOR void flagcxStaticIpcRecoveryKernel(
     flagcxDevMem readyMem, flagcxStaticIpcControl ipcControl);
+FLAGCX_GLOBAL_DECORATOR void flagcxStaticIpcRingKernel(
+    flagcxIpcRingTrigger *triggers, uint64_t numTriggers,
+    flagcxUniRunnerRingWork work, flagcxDevMem inputMem,
+    flagcxDevMem outputMem, flagcxDevMem scratchMem,
+    flagcxDevMem progressMem, flagcxDevMem readyMem, uint64_t *blocksDone,
+    const uint64_t *abortFlag, flagcxStaticIpcControl ipcControl);
 #endif // COMPILE_KERNEL
 
 flagcxResult_t flagcxLaunchCollectiveKernel(
@@ -120,6 +127,15 @@ flagcxResult_t flagcxLaunchStaticCollectiveKernel(
     const flagcxStaticIpcControl *ipcControl, flagcxStream_t stream);
 flagcxResult_t flagcxLaunchStaticIpcRecoveryKernel(
     flagcxDevMem_t readyMem, const flagcxStaticIpcControl *ipcControl,
+    flagcxStream_t stream);
+flagcxResult_t flagcxGetStaticIpcRingKernelMaxExecutorBlocks(
+    size_t nthreads, size_t *maxExecutorBlocks);
+flagcxResult_t flagcxLaunchStaticIpcRingKernel(
+    void *triggerDeviceBuffer, size_t numTriggers,
+    const flagcxUniRunnerRingWork *work, flagcxDevMem_t inputMem,
+    flagcxDevMem_t outputMem, flagcxDevMem_t scratchMem,
+    flagcxDevMem_t progressMem, flagcxDevMem_t readyMem, size_t nthreads,
+    size_t maxExecutorBlocks, const flagcxStaticIpcControl *ipcControl,
     flagcxStream_t stream);
 
 // ==========================================================================

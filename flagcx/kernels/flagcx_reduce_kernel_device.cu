@@ -634,6 +634,499 @@ FLAGCX_GLOBAL_DECORATOR void flagcxStaticReduceKernel(
       static_cast<uint64_t>(FLAGCX_GRID_DIM_X), shm);
 }
 
+FLAGCX_DEVICE_INLINE_DECORATOR bool isStaticIpcAbortRequested(
+    const uint64_t *abortFlag, const flagcxDevMem &readyMem,
+    const flagcxStaticIpcControl &control);
+FLAGCX_DEVICE_INLINE_DECORATOR void publishStaticIpcRemoteAbort(
+    const flagcxDevMem &readyMem, const flagcxStaticIpcControl &control);
+FLAGCX_DEVICE_INLINE_DECORATOR void finishStaticCollectiveExecution(
+    const flagcxDevMem &readyMem, uint64_t *blocksDone,
+    uint64_t numExecutorBlocks, const uint64_t *abortFlag,
+    const flagcxStaticIpcControl &control, uint64_t *shm);
+
+template <typename T>
+FLAGCX_DEVICE_INLINE_DECORATOR void flagcxUniRunnerCollCbdPart(
+    const flagcxUniRunnerRingWork &work, uint32_t channel, uint64_t *offset,
+    uint64_t *count, uint64_t *chunkCount) {
+  const uint64_t nchannels =
+      static_cast<uint64_t>(work.channelHi - work.channelLo) + 1;
+  const uint64_t total = work.countMid;
+  const uint64_t grainElems = 512 / sizeof(T);
+  const uint64_t share = total / nchannels + (total % nchannels != 0);
+  const uint64_t grainUnits =
+      share / grainElems + (share % grainElems != 0);
+  const uint64_t perChannel =
+      grainUnits > ~uint64_t(0) / grainElems ? total
+                                             : grainUnits * grainElems;
+  const uint64_t ordinal = channel - work.channelLo;
+  *offset = ordinal != 0 && perChannel > ~uint64_t(0) / ordinal
+                ? total
+                : ordinal * perChannel;
+  *count = *offset < total ?
+      (total - *offset < perChannel ? total - *offset : perChannel) : 0;
+  *chunkCount =
+      static_cast<uint64_t>(work.chunkGrainsMid) * 512 / sizeof(T);
+}
+
+template <typename T, flagcxRedOp_t Op>
+FLAGCX_DEVICE_INLINE_DECORATOR T ipcRingReduce(T a, T b, bool post,
+                                               uint64_t divisor) {
+  if constexpr (Op == flagcxAvg) {
+    return post ? uniRunnerReduceTraits<T>::avg(a, b, divisor)
+                : uniRunnerReduceTraits<T>::sum(a, b);
+  } else {
+    (void)post;
+    return uniRunnerApplyReduce<T, Op>(a, b, divisor);
+  }
+}
+
+template <typename T> struct alignas(16) flagcxIpcRingPack {
+  T lane[16 / sizeof(T)];
+};
+
+template <typename T>
+FLAGCX_DEVICE_INLINE_DECORATOR void copyOneDestination(
+    T *dst, const T *src, size_t count, uint32_t tid, uint32_t nworkers) {
+  constexpr size_t lanes = 16 / sizeof(T);
+  size_t packedElems = 0;
+  if (((reinterpret_cast<uintptr_t>(dst) |
+        reinterpret_cast<uintptr_t>(src)) & 15) == 0) {
+    const size_t packs = count / lanes;
+    auto *d = reinterpret_cast<flagcxIpcRingPack<T> *>(dst);
+    const auto *s = reinterpret_cast<const flagcxIpcRingPack<T> *>(src);
+    for (size_t i = tid; i < packs; i += nworkers) d[i] = s[i];
+    packedElems = packs * lanes;
+  }
+  for (size_t i = packedElems + tid; i < count; i += nworkers) dst[i] = src[i];
+}
+
+template <typename T>
+FLAGCX_DEVICE_INLINE_DECORATOR void copyTwoDestinations(
+    T *dst0, T *dst1, const T *src, size_t count, uint32_t tid,
+    uint32_t nworkers) {
+  constexpr size_t lanes = 16 / sizeof(T);
+  size_t packedElems = 0;
+  if (((reinterpret_cast<uintptr_t>(dst0) |
+        reinterpret_cast<uintptr_t>(dst1) |
+        reinterpret_cast<uintptr_t>(src)) & 15) == 0) {
+    const size_t packs = count / lanes;
+    auto *d0 = reinterpret_cast<flagcxIpcRingPack<T> *>(dst0);
+    auto *d1 = reinterpret_cast<flagcxIpcRingPack<T> *>(dst1);
+    const auto *s = reinterpret_cast<const flagcxIpcRingPack<T> *>(src);
+    for (size_t i = tid; i < packs; i += nworkers) {
+      const flagcxIpcRingPack<T> value = s[i];
+      d0[i] = value;
+      d1[i] = value;
+    }
+    packedElems = packs * lanes;
+  }
+  for (size_t i = packedElems + tid; i < count; i += nworkers) {
+    const T value = src[i];
+    dst0[i] = value;
+    dst1[i] = value;
+  }
+}
+
+template <typename T, flagcxRedOp_t Op>
+FLAGCX_DEVICE_INLINE_DECORATOR void reduceCopyOneDestination(
+    T *dst, const T *src0, const T *src1, size_t count, bool post,
+    uint64_t divisor, uint32_t tid, uint32_t nworkers) {
+  constexpr size_t lanes = 16 / sizeof(T);
+  size_t packedElems = 0;
+  if (((reinterpret_cast<uintptr_t>(dst) |
+        reinterpret_cast<uintptr_t>(src0) |
+        reinterpret_cast<uintptr_t>(src1)) & 15) == 0) {
+    const size_t packs = count / lanes;
+    auto *d = reinterpret_cast<flagcxIpcRingPack<T> *>(dst);
+    const auto *a = reinterpret_cast<const flagcxIpcRingPack<T> *>(src0);
+    const auto *b = reinterpret_cast<const flagcxIpcRingPack<T> *>(src1);
+    for (size_t i = tid; i < packs; i += nworkers) {
+      const flagcxIpcRingPack<T> av = a[i];
+      const flagcxIpcRingPack<T> bv = b[i];
+      flagcxIpcRingPack<T> value;
+#pragma unroll
+      for (size_t j = 0; j < lanes; ++j)
+        value.lane[j] =
+            ipcRingReduce<T, Op>(av.lane[j], bv.lane[j], post, divisor);
+      d[i] = value;
+    }
+    packedElems = packs * lanes;
+  }
+  for (size_t i = packedElems + tid; i < count; i += nworkers)
+    dst[i] = ipcRingReduce<T, Op>(src0[i], src1[i], post, divisor);
+}
+
+template <typename T, flagcxRedOp_t Op>
+FLAGCX_DEVICE_INLINE_DECORATOR void reduceCopyTwoDestinations(
+    T *dst0, T *dst1, const T *src0, const T *src1, size_t count, bool post,
+    uint64_t divisor, uint32_t tid, uint32_t nworkers) {
+  constexpr size_t lanes = 16 / sizeof(T);
+  size_t packedElems = 0;
+  if (((reinterpret_cast<uintptr_t>(dst0) |
+        reinterpret_cast<uintptr_t>(dst1) |
+        reinterpret_cast<uintptr_t>(src0) |
+        reinterpret_cast<uintptr_t>(src1)) & 15) == 0) {
+    const size_t packs = count / lanes;
+    auto *d0 = reinterpret_cast<flagcxIpcRingPack<T> *>(dst0);
+    auto *d1 = reinterpret_cast<flagcxIpcRingPack<T> *>(dst1);
+    const auto *a = reinterpret_cast<const flagcxIpcRingPack<T> *>(src0);
+    const auto *b = reinterpret_cast<const flagcxIpcRingPack<T> *>(src1);
+    for (size_t i = tid; i < packs; i += nworkers) {
+      const flagcxIpcRingPack<T> av = a[i];
+      const flagcxIpcRingPack<T> bv = b[i];
+      flagcxIpcRingPack<T> value;
+#pragma unroll
+      for (size_t j = 0; j < lanes; ++j)
+        value.lane[j] =
+            ipcRingReduce<T, Op>(av.lane[j], bv.lane[j], post, divisor);
+      d0[i] = value;
+      d1[i] = value;
+    }
+    packedElems = packs * lanes;
+  }
+  for (size_t i = packedElems + tid; i < count; i += nworkers) {
+    const T value = ipcRingReduce<T, Op>(src0[i], src1[i], post, divisor);
+    dst0[i] = value;
+    dst1[i] = value;
+  }
+}
+
+template <typename T, flagcxRedOp_t Op> class UniRunnerRingSimplePrims {
+public:
+  FLAGCX_DEVICE_INLINE_DECORATOR UniRunnerRingSimplePrims(
+      const flagcxIpcRingTrigger &trigger, const flagcxDevMem &scratchMem,
+      const flagcxDevMem &progressMem, const flagcxDevMem &readyMem,
+      const uint64_t *abortFlag, size_t simpleBufferBytes,
+      uint64_t avgDivisor, const flagcxStaticIpcControl &control,
+      uint64_t *shared)
+      : trigger(trigger), scratchMem(scratchMem), progressMem(progressMem),
+        readyMem(readyMem), abortFlag(abortFlag),
+        simpleBufferBytes(simpleBufferBytes), avgDivisor(avgDivisor),
+        control(control),
+        shared(shared) {}
+
+  FLAGCX_DEVICE_INLINE_DECORATOR bool send(const T *src, size_t n) {
+    return execute(nullptr, src, nullptr, false, false, true, n);
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR bool recvReduceSend(const T *recv,
+                                                      const T *input,
+                                                      size_t n) {
+    return execute(recv, input, nullptr, true, false, true, n);
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR bool recvReduceCopySend(
+      const T *recv, const T *input, T *output, size_t n) {
+    return execute(recv, input, output, true, true, true, n);
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR bool recvCopySend(const T *recv, T *output,
+                                                   size_t n) {
+    return execute(recv, nullptr, output, false, true, true, n);
+  }
+  FLAGCX_DEVICE_INLINE_DECORATOR bool recv(const T *recv, T *output,
+                                           size_t n) {
+    return execute(recv, nullptr, output, false, true, false, n);
+  }
+
+private:
+  FLAGCX_DEVICE_INLINE_DECORATOR bool execute(
+      const T *recvHint, const T *input, T *output, bool reduce,
+      bool copyOutput, bool hasSend, size_t n) {
+    (void)recvHint;
+    const uint32_t tid = FLAGCX_THREAD_IDX_X;
+    flagcxUniRunnerRingChannelProgress *local =
+        static_cast<flagcxUniRunnerRingChannelProgress *>(
+            flagcxGetLocalPointer(progressMem, trigger.channelId *
+                sizeof(flagcxUniRunnerRingChannelProgress)));
+    flagcxUniRunnerRingChannelProgress *next =
+        static_cast<flagcxUniRunnerRingChannelProgress *>(
+            flagcxGetIntraPointer(progressMem, trigger.channelId *
+                sizeof(flagcxUniRunnerRingChannelProgress),
+                trigger.nextLocalRank));
+    const bool hasRecv = recvHint != nullptr;
+    if (tid == 0) {
+      shared[0] = local->sendStep;
+      shared[1] = local->recvStep;
+      shared[2] = 0;
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+    if (hasRecv && tid == 0) {
+      int backoff = 0;
+      while (DeviceAPI::Atomic::load(&local->tail.value,
+                                      flagcxDeviceMemoryOrderAcquire) <
+             shared[1] + 1) {
+        if (isStaticIpcAbortRequested(abortFlag, readyMem,
+                                     control)) {
+          shared[2] = 1;
+          break;
+        }
+        DeviceAPI::Intrin::spinBackoff(backoff++);
+      }
+    }
+    if (hasSend && tid == 1) {
+      int backoff = 0;
+      while (DeviceAPI::Atomic::load(&next->head.value,
+                                      flagcxDeviceMemoryOrderAcquire) +
+                 FLAGCX_STEPS < shared[0] + 1) {
+        if (isStaticIpcAbortRequested(abortFlag, readyMem,
+                                     control)) {
+          shared[2] = 1;
+          break;
+        }
+        DeviceAPI::Intrin::spinBackoff(backoff++);
+      }
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+    if (shared[2] != 0) return false;
+
+    const size_t stepBytes = simpleBufferBytes / FLAGCX_STEPS;
+    const size_t recvOffset = trigger.channelId * simpleBufferBytes +
+        (shared[1] % FLAGCX_STEPS) * stepBytes;
+    const size_t sendOffset = trigger.channelId * simpleBufferBytes +
+        (shared[0] % FLAGCX_STEPS) * stepBytes;
+    const T *recvSrc = hasRecv ? static_cast<const T *>(
+        flagcxGetLocalPointer(scratchMem, recvOffset)) : nullptr;
+    T *sendDst = hasSend ? static_cast<T *>(flagcxGetIntraPointer(
+        scratchMem, sendOffset, trigger.nextLocalRank)) : nullptr;
+    const uint32_t nworkers = hasSend && FLAGCX_BLOCK_DIM_X >= 64
+        ? FLAGCX_BLOCK_DIM_X - 32 : FLAGCX_BLOCK_DIM_X;
+    if (tid < nworkers) {
+      if (reduce && copyOutput && hasSend)
+        reduceCopyTwoDestinations<T, Op>(output, sendDst, recvSrc, input, n,
+                                         true, avgDivisor, tid, nworkers);
+      else if (reduce && hasSend)
+        reduceCopyOneDestination<T, Op>(sendDst, recvSrc, input, n, false,
+                                        avgDivisor, tid, nworkers);
+      else if (copyOutput && hasSend)
+        copyTwoDestinations(output, sendDst, recvSrc, n, tid, nworkers);
+      else if (copyOutput)
+        copyOneDestination(output, recvSrc, n, tid, nworkers);
+      else if (hasSend)
+        copyOneDestination(sendDst, hasRecv ? recvSrc : input, n, tid,
+                           nworkers);
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+    const uint32_t postSendThread = hasSend && FLAGCX_BLOCK_DIM_X >= 64
+        ? FLAGCX_BLOCK_DIM_X - 32 : 3;
+    if (hasSend && tid == postSendThread) {
+      DeviceAPI::Intrin::threadfenceSystem();
+      if (!isStaticIpcAbortRequested(abortFlag, readyMem,
+                                    control)) {
+        DeviceAPI::Atomic::store(&next->tail.value, shared[0] + 1,
+                                 flagcxDeviceMemoryOrderRelease);
+        local->sendStep = shared[0] + 1;
+      } else {
+        shared[2] = 1;
+      }
+    }
+    if (hasRecv && tid == 2) {
+      if (!isStaticIpcAbortRequested(abortFlag, readyMem,
+                                    control)) {
+        DeviceAPI::Atomic::store(&local->head.value, shared[1] + 1,
+                                 flagcxDeviceMemoryOrderRelease);
+        local->recvStep = shared[1] + 1;
+      } else {
+        shared[2] = 1;
+      }
+    }
+    FLAGCX_DEVICE_SYNC_THREADS();
+    return shared[2] == 0;
+  }
+
+  const flagcxIpcRingTrigger &trigger;
+  const flagcxDevMem &scratchMem;
+  const flagcxDevMem &progressMem;
+  const flagcxDevMem &readyMem;
+  const uint64_t *abortFlag;
+  size_t simpleBufferBytes;
+  uint64_t avgDivisor;
+  const flagcxStaticIpcControl &control;
+  uint64_t *shared;
+};
+
+template <typename T, flagcxRedOp_t Op>
+FLAGCX_DEVICE_INLINE_DECORATOR void ipcRingChunkInfo(
+    uint64_t gridOffset, uint64_t elemOffset, uint64_t rem,
+    uint64_t chunkCount, uint64_t chunk, uint64_t *offset, size_t *nelem) {
+  if ((chunk != 0 && chunkCount > ~uint64_t(0) / chunk) ||
+      gridOffset > ~uint64_t(0) - elemOffset) {
+    *offset = gridOffset;
+    *nelem = 0;
+    return;
+  }
+  const uint64_t base = gridOffset + elemOffset;
+  const uint64_t chunkOffset = chunk * chunkCount;
+  if (chunkOffset > ~uint64_t(0) - base) {
+    *offset = base;
+    *nelem = 0;
+    return;
+  }
+  *offset = base + chunkOffset;
+  *nelem = chunkOffset < rem
+               ? static_cast<size_t>(rem - chunkOffset < chunkCount
+                                         ? rem - chunkOffset
+                                         : chunkCount)
+               : 0;
+}
+
+template <typename T, flagcxRedOp_t Op>
+FLAGCX_DEVICE_INLINE_DECORATOR bool runStaticIpcRingTyped(
+    const flagcxIpcRingTrigger &trigger, const flagcxUniRunnerRingWork &work,
+    const flagcxDevMem &inputMem, const flagcxDevMem &outputMem,
+    const flagcxDevMem &scratchMem, const flagcxDevMem &progressMem,
+    const flagcxDevMem &readyMem, const uint64_t *abortFlag,
+    const flagcxStaticIpcControl &control, uint64_t *shared) {
+  // Ring stage/chunk order follows NCCL all_reduce.h runRing (Apache-2.0),
+  // commit 7b83616df3ae082a1f32bb74c27458bfe8153a13.
+  uint64_t gridOffset = 0, channelCount = 0, chunkCount = 0;
+  flagcxUniRunnerCollCbdPart<T>(work, trigger.channelId, &gridOffset,
+                                &channelCount, &chunkCount);
+  if (chunkCount == 0 || chunkCount * sizeof(T) >
+          static_cast<uint64_t>(work.chunkGrainsMid) * 512) return false;
+  const T *input = static_cast<const T *>(flagcxGetLocalPointer(inputMem, 0));
+  T *output = static_cast<T *>(flagcxGetLocalPointer(outputMem, 0));
+  const uint64_t nranks = trigger.nRanks;
+  UniRunnerRingSimplePrims<T, Op> prims(
+      trigger, scratchMem, progressMem, readyMem, abortFlag,
+      static_cast<size_t>(work.chunkGrainsMid) * 512 * FLAGCX_STEPS,
+      work.avgDivisor, control, shared);
+  const bool emptyChannel = channelCount == 0;
+  for (uint64_t elemOffset = 0; emptyChannel || elemOffset < channelCount;) {
+    const uint64_t rem = channelCount - elemOffset;
+    uint64_t currentChunk = chunkCount;
+    if (rem != 0 && rem < nranks * currentChunk) {
+      const uint64_t align = 16 / sizeof(T);
+      currentChunk = ((rem + nranks - 1) / nranks + align - 1) / align * align;
+    }
+    uint64_t chunk = (trigger.ringIndex + nranks - 1) % nranks;
+    uint64_t offset = 0;
+    size_t nelem = 0;
+    ipcRingChunkInfo<T, Op>(gridOffset, elemOffset, rem, currentChunk, chunk,
+                            &offset, &nelem);
+    if (!prims.send(nelem == 0 ? input : input + offset, nelem)) return false;
+    for (uint64_t j = 2; j < nranks; ++j) {
+      chunk = (trigger.ringIndex + nranks - j) % nranks;
+      ipcRingChunkInfo<T, Op>(gridOffset, elemOffset, rem, currentChunk, chunk,
+                              &offset, &nelem);
+      const T *chunkInput = nelem == 0 ? input : input + offset;
+      if (!prims.recvReduceSend(chunkInput, chunkInput, nelem))
+        return false;
+    }
+    chunk = trigger.ringIndex;
+    ipcRingChunkInfo<T, Op>(gridOffset, elemOffset, rem, currentChunk, chunk,
+                            &offset, &nelem);
+    if (!prims.recvReduceCopySend(nelem == 0 ? input : input + offset,
+                                  nelem == 0 ? input : input + offset,
+                                  nelem == 0 ? output : output + offset,
+                                  nelem)) return false;
+    for (uint64_t j = 1; j < nranks - 1; ++j) {
+      chunk = (trigger.ringIndex + nranks - j) % nranks;
+      ipcRingChunkInfo<T, Op>(gridOffset, elemOffset, rem, currentChunk, chunk,
+                              &offset, &nelem);
+      if (!prims.recvCopySend(nelem == 0 ? input : input + offset,
+                              nelem == 0 ? output : output + offset, nelem))
+        return false;
+    }
+    chunk = (trigger.ringIndex + 1) % nranks;
+    ipcRingChunkInfo<T, Op>(gridOffset, elemOffset, rem, currentChunk, chunk,
+                            &offset, &nelem);
+    if (!prims.recv(nelem == 0 ? input : input + offset,
+                    nelem == 0 ? output : output + offset, nelem)) return false;
+    if (emptyChannel) break;
+    elemOffset += nranks * currentChunk;
+  }
+  return true;
+}
+
+template <typename T>
+FLAGCX_DEVICE_INLINE_DECORATOR bool dispatchStaticIpcRingOp(
+    const flagcxIpcRingTrigger &trigger, const flagcxUniRunnerRingWork &work,
+    const flagcxDevMem &inputMem, const flagcxDevMem &outputMem,
+    const flagcxDevMem &scratchMem, const flagcxDevMem &progressMem,
+    const flagcxDevMem &readyMem, const uint64_t *abortFlag,
+    const flagcxStaticIpcControl &control, uint64_t *shared) {
+  switch (static_cast<flagcxRedOp_t>(work.redOp)) {
+    case flagcxSum: return runStaticIpcRingTyped<T, flagcxSum>(
+        trigger, work, inputMem, outputMem, scratchMem, progressMem, readyMem,
+        abortFlag, control, shared);
+    case flagcxProd: return runStaticIpcRingTyped<T, flagcxProd>(
+        trigger, work, inputMem, outputMem, scratchMem, progressMem, readyMem,
+        abortFlag, control, shared);
+    case flagcxMax: return runStaticIpcRingTyped<T, flagcxMax>(
+        trigger, work, inputMem, outputMem, scratchMem, progressMem, readyMem,
+        abortFlag, control, shared);
+    case flagcxMin: return runStaticIpcRingTyped<T, flagcxMin>(
+        trigger, work, inputMem, outputMem, scratchMem, progressMem, readyMem,
+        abortFlag, control, shared);
+    case flagcxAvg: return runStaticIpcRingTyped<T, flagcxAvg>(
+        trigger, work, inputMem, outputMem, scratchMem, progressMem, readyMem,
+        abortFlag, control, shared);
+    default: return false;
+  }
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR bool dispatchStaticIpcRing(
+    const flagcxIpcRingTrigger &trigger, const flagcxUniRunnerRingWork &work,
+    const flagcxDevMem &inputMem, const flagcxDevMem &outputMem,
+    const flagcxDevMem &scratchMem, const flagcxDevMem &progressMem,
+    const flagcxDevMem &readyMem, const uint64_t *abortFlag,
+    const flagcxStaticIpcControl &control, uint64_t *shared) {
+#define FLAGCX_IPC_RING_TYPE_CASE(dtype, type)                                  \
+  case dtype:                                                                  \
+    return dispatchStaticIpcRingOp<type>(                                       \
+        trigger, work, inputMem, outputMem, scratchMem, progressMem, readyMem, \
+        abortFlag, control, shared)
+  switch (static_cast<flagcxDataType_t>(work.datatype)) {
+    FLAGCX_IPC_RING_TYPE_CASE(flagcxInt8, int8_t);
+    FLAGCX_IPC_RING_TYPE_CASE(flagcxUint8, uint8_t);
+    FLAGCX_IPC_RING_TYPE_CASE(flagcxInt32, int32_t);
+    FLAGCX_IPC_RING_TYPE_CASE(flagcxUint32, uint32_t);
+    FLAGCX_IPC_RING_TYPE_CASE(flagcxInt64, int64_t);
+    FLAGCX_IPC_RING_TYPE_CASE(flagcxUint64, uint64_t);
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+    FLAGCX_IPC_RING_TYPE_CASE(flagcxFloat16, __half);
+#endif
+    FLAGCX_IPC_RING_TYPE_CASE(flagcxFloat32, float);
+    FLAGCX_IPC_RING_TYPE_CASE(flagcxFloat64, double);
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+    FLAGCX_IPC_RING_TYPE_CASE(flagcxBfloat16, __nv_bfloat16);
+#endif
+    default: return false;
+  }
+#undef FLAGCX_IPC_RING_TYPE_CASE
+}
+
+FLAGCX_GLOBAL_DECORATOR void flagcxStaticIpcRingKernel(
+    flagcxIpcRingTrigger *triggers, uint64_t numTriggers,
+    flagcxUniRunnerRingWork work, flagcxDevMem inputMem,
+    flagcxDevMem outputMem, flagcxDevMem scratchMem,
+    flagcxDevMem progressMem, flagcxDevMem readyMem, uint64_t *blocksDone,
+    const uint64_t *abortFlag, flagcxStaticIpcControl ipcControl) {
+  FLAGCX_SHARED uint64_t shared[16];
+  const uint64_t ordinal = static_cast<uint64_t>(FLAGCX_BLOCK_IDX_X);
+  bool completed = false;
+  if (ordinal < numTriggers) {
+    const flagcxIpcRingTrigger trigger = triggers[ordinal];
+    if (trigger.channelId == ordinal + work.channelLo &&
+        trigger.nThreads == static_cast<uint32_t>(FLAGCX_BLOCK_DIM_X)) {
+      completed = dispatchStaticIpcRing(
+          trigger, work, inputMem, outputMem, scratchMem, progressMem,
+          readyMem, abortFlag, ipcControl, shared);
+      if (completed && trigger.flagOut != 0 && FLAGCX_THREAD_IDX_X == 0) {
+        DeviceAPI::Atomic::store(
+            reinterpret_cast<uint64_t *>(trigger.flagOut),
+            static_cast<uint64_t>(flagcxStreamFlagDone),
+            flagcxDeviceMemoryOrderRelease);
+      }
+    }
+  }
+  if (!completed && FLAGCX_THREAD_IDX_X == 0) {
+    requestStaticAbort(abortFlag);
+    publishStaticIpcRemoteAbort(readyMem, ipcControl);
+  }
+  FLAGCX_DEVICE_SYNC_THREADS();
+  finishStaticCollectiveExecution(readyMem, blocksDone, numTriggers,
+                                  abortFlag, ipcControl, shared);
+}
+
 struct alignas(16) flagcxIpcVector128 {
   uint64_t x;
   uint64_t y;
@@ -1385,6 +1878,13 @@ flagcxResult_t flagcxGetStaticCollectiveKernelMaxExecutorBlocks(
       "RED+IPC", nthreads, maxExecutorBlocks);
 }
 
+flagcxResult_t flagcxGetStaticIpcRingKernelMaxExecutorBlocks(
+    size_t nthreads, size_t *maxExecutorBlocks) {
+  return getStaticKernelMaxExecutorBlocks(
+      reinterpret_cast<const void *>(flagcxStaticIpcRingKernel),
+      "IPC Ring+Simple", nthreads, maxExecutorBlocks);
+}
+
 flagcxResult_t flagcxLaunchStaticReduceKernel(
     void *redFifoDeviceBuffer, size_t numTriggers, size_t nthreads,
     size_t nRedBlocks, size_t maxExecutorBlocks, uint64_t avgDivisor,
@@ -1519,6 +2019,57 @@ flagcxResult_t flagcxLaunchStaticCollectiveKernel(
   cudaError_t launchResult = cudaLaunchCooperativeKernel(
       reinterpret_cast<const void *>(flagcxStaticCollectiveKernel),
       dim3(static_cast<unsigned int>(nblocks)),
+      dim3(static_cast<unsigned int>(nthreads)), args, 0,
+      *(FLAGCX_DEVICE_STREAM_PTR)stream);
+  return launchResult == cudaSuccess ? flagcxSuccess
+                                     : flagcxUnhandledDeviceError;
+#else
+  return flagcxNotSupported;
+#endif
+}
+
+flagcxResult_t flagcxLaunchStaticIpcRingKernel(
+    void *triggerDeviceBuffer, size_t numTriggers,
+    const flagcxUniRunnerRingWork *work, flagcxDevMem_t inputMem,
+    flagcxDevMem_t outputMem, flagcxDevMem_t scratchMem,
+    flagcxDevMem_t progressMem, flagcxDevMem_t readyMem, size_t nthreads,
+    size_t maxExecutorBlocks, const flagcxStaticIpcControl *ipcControl,
+    flagcxStream_t stream) {
+  const size_t maxInt = static_cast<size_t>(std::numeric_limits<int>::max());
+  if (triggerDeviceBuffer == nullptr || numTriggers == 0 || work == nullptr ||
+      inputMem == nullptr || outputMem == nullptr || scratchMem == nullptr ||
+      progressMem == nullptr || readyMem == nullptr || ipcControl == nullptr ||
+      stream == nullptr || nthreads == 0 || nthreads % 32 != 0 ||
+      nthreads > maxInt || numTriggers > maxInt || maxExecutorBlocks == 0 ||
+      numTriggers > maxExecutorBlocks || work->channelHi < work->channelLo ||
+      static_cast<uint64_t>(work->channelHi) - work->channelLo + 1 !=
+          numTriggers || work->nWarps * 32 != nthreads ||
+      work->directMode != 0 || work->avgDivisor == 0 ||
+      work->chunkGrainsMid == 0 || !flagcxIpcControlEpochValid(ipcControl->epoch) ||
+      ipcControl->localRanks == 0 ||
+      ipcControl->localRank >= ipcControl->localRanks ||
+      ipcControl->abortSlot != 0 || ipcControl->doneBase != 1 ||
+      ipcControl->readyDataOffset !=
+          uint64_t(1) + static_cast<uint64_t>(ipcControl->localRanks)) {
+    return flagcxInvalidArgument;
+  }
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_DU_ADAPTOR)
+  uint64_t *words = static_cast<uint64_t *>(triggerDeviceBuffer);
+  flagcxIpcRingTrigger *triggers = reinterpret_cast<flagcxIpcRingTrigger *>(
+      words + flagcxFifoIdxData);
+  uint64_t *blocksDone = words + flagcxFifoIdxConsumed;
+  uint64_t *abortFlag = words + flagcxFifoIdxTerminate;
+  flagcxDevMem input(*inputMem), output(*outputMem), scratch(*scratchMem),
+      progress(*progressMem), ready(*readyMem);
+  flagcxUniRunnerRingWork workValue = *work;
+  flagcxStaticIpcControl control = *ipcControl;
+  uint64_t numTriggers64 = static_cast<uint64_t>(numTriggers);
+  void *args[] = {&triggers, &numTriggers64, &workValue, &input, &output,
+                  &scratch, &progress, &ready, &blocksDone, &abortFlag,
+                  &control};
+  cudaError_t launchResult = cudaLaunchCooperativeKernel(
+      reinterpret_cast<const void *>(flagcxStaticIpcRingKernel),
+      dim3(static_cast<unsigned int>(numTriggers)),
       dim3(static_cast<unsigned int>(nthreads)), args, 0,
       *(FLAGCX_DEVICE_STREAM_PTR)stream);
   return launchResult == cudaSuccess ? flagcxSuccess

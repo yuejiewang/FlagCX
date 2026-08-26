@@ -21,7 +21,8 @@ typedef enum {
   uniRunnerDagNodeTypeP2p = 0,
   uniRunnerDagNodeTypeRed = 1,
   uniRunnerDagNodeTypeCpy = 2,
-  uniRunnerDagNodeTypeIpc = 3
+  uniRunnerDagNodeTypeIpc = 3,
+  uniRunnerDagNodeTypeIpcRingChannel = 4
 } uniRunnerDagNodeType;
 
 // Static DAG template algorithm identifiers used by the uniRunner cache.
@@ -34,7 +35,8 @@ typedef enum {
   uniRunnerDagAlgoSlicedAR = 5,
   uniRunnerDagAlgoRingRS = 6,
   uniRunnerDagAlgoTreeRed = 7,
-  uniRunnerDagAlgoIpcAR = 8
+  uniRunnerDagAlgoIpcAR = 8,
+  uniRunnerDagAlgoIpcRingAR = 9
 } uniRunnerDagAlgoType;
 
 // Normalized algorithm parameters that affect DAG construction. Runtime-only
@@ -50,6 +52,11 @@ struct uniRunnerDagAlgorithmConfig {
   uint64_t numRedSlices = 0;
   uint64_t groupSize = 0;
   uint64_t topologyHash = 0;
+  uint64_t numChannels = 0;
+  uint64_t simpleBufferBytes = 0;
+  uint64_t nThreads = 0;
+  uint64_t protocol = 0;
+  uint64_t directMode = 0;
   uniRunnerDagBufferMode bufferMode = uniRunnerDagBufferModeOutOfPlace;
 };
 
@@ -115,6 +122,19 @@ struct uniRunnerIpcNodeData {
   int triggerIdx;
 };
 
+struct uniRunnerIpcRingChannelNodeData {
+  uint32_t channelId;
+  uint32_t ringIndex;
+  int32_t prevRank;
+  int32_t nextRank;
+  int32_t prevLocalRank;
+  int32_t nextLocalRank;
+  uint32_t nRanks;
+  uint32_t nThreads;
+  uint32_t workIndex;
+  int triggerIdx;
+};
+
 // Unified DAG node with common DAG structure fields
 struct uniRunnerDagNode {
   uniRunnerDagNodeType nodeType; // Discriminator for union
@@ -134,6 +154,7 @@ struct uniRunnerDagNode {
     struct uniRunnerRedNodeData red;
     struct uniRunnerCpyNodeData cpy;
     struct uniRunnerIpcNodeData ipc;
+    struct uniRunnerIpcRingChannelNodeData ipcRingChannel;
   } nodeData;
 };
 
@@ -146,6 +167,7 @@ struct uniRunnerDagExecutionPlan {
   size_t numHostNodes = 0;
   size_t numRedNodes = 0;
   size_t numIpcNodes = 0;
+  size_t numIpcRingChannelNodes = 0;
   // Cached plans borrow immutable storage owned by the process cache.
   bool ownsTopoOrder = false;
   // Set only after static topology and node payload validation succeeds.
@@ -155,13 +177,16 @@ struct uniRunnerDagExecutionPlan {
 
 // Per-invocation executor counts derived from the DAG and the runtime
 // residency budget. RED trigger i is owned by block i % numRedBlocks. IPC
-// triggers remain flat and in topological order; all IPC blocks advance them
-// in lockstep, with chunk c owned by block c % numIpcBlocks.
+// triggers remain flat and in topological order; all legacy IPC blocks advance
+// them in lockstep, with chunk c owned by block c % numIpcBlocks. Dedicated
+// IPC Ring tasks instead have the strict one-task/one-block mapping.
 struct uniRunnerStaticExecutorSchedule {
   size_t numRedTasks = 0;
   size_t numIpcTasks = 0;
   size_t numRedBlocks = 0;
   size_t numIpcBlocks = 0;
+  size_t numIpcRingTasks = 0;
+  size_t numIpcRingBlocks = 0;
 };
 
 // Runtime bounds needed to materialize immutable IPC triggers. All fields are
@@ -180,6 +205,8 @@ typedef struct {
   flagcxFifo_t fifo;
   flagcxFifo_t ipcFifo;
   void *ipcFifoDevicePtr;
+  flagcxFifo_t ipcRingFifo;
+  void *ipcRingFifoDevicePtr;
   flagcxStream_t commStream;
   flagcxStream_t redStream;
   flagcxStream_t cpyStream;
@@ -234,6 +261,17 @@ typedef struct {
   uint64_t ipcEpoch;
   uint64_t *ipcParentFlagsDevice;
   size_t ipcParentFlagsCount;
+
+  void *ipcRingScratchBuffer;
+  flagcxDevMem_t ipcRingScratchMem;
+  size_t ipcRingScratchBytes;
+  void *ipcRingProgressBuffer;
+  flagcxDevMem_t ipcRingProgressMem;
+  size_t ipcRingProgressBytes;
+  size_t ipcRingChannels;
+  size_t ipcRingSimpleBufferBytes;
+  bool ipcRingResourcesDirty;
+  flagcxUniRunnerRingWork ipcRingWork;
 } flagcxUniRunnerState;
 
 flagcxResult_t initUniRunnerStateDummy(flagcxUniRunnerState *runnerState);
@@ -264,6 +302,12 @@ flagcxResult_t initUniRunnerStateIpcAR(flagcxUniRunnerState *runnerState,
                                        size_t count,
                                        flagcxDataType_t datatype,
                                        flagcxRedOp_t op, flagcxComm_t comm);
+flagcxResult_t initUniRunnerStateIpcRingAR(flagcxUniRunnerState *runnerState,
+                                           const void *sendbuff,
+                                           void *recvbuff, size_t count,
+                                           flagcxDataType_t datatype,
+                                           flagcxRedOp_t op,
+                                           flagcxComm_t comm);
 flagcxResult_t initUniRunnerStateRingRS(flagcxUniRunnerState *runnerState,
                                         const void *sendbuff, void *recvbuff,
                                         void *scratchbuff, size_t count,

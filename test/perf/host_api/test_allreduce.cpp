@@ -1,5 +1,28 @@
 #include "perf_common.h"
 
+namespace {
+
+constexpr const char *kUseIpcRingAllReduceEnv =
+    "FLAGCX_PERF_USE_IPC_RING_AR";
+
+static bool envEnabled(const char *name) {
+  const char *value = getenv(name);
+  return value != nullptr && atoi(value) == 1;
+}
+
+static void configureIpcRingAllReduceForPerf() {
+  if (!envEnabled(kUseIpcRingAllReduceEnv)) return;
+
+  // Keep the benchmark on the public host API while forcing its AllReduce
+  // dispatch through UniRunner. UNIRUNNER_USE_IPCAR now selects IpcRingAR;
+  // setting both variables before perfSetup ensures communicator creation and
+  // the first cached parameter lookup observe the requested path.
+  setenv("FLAGCX_USE_HETERO_COMM", "1", 1);
+  setenv("FLAGCX_UNIRUNNER_USE_IPCAR", "1", 1);
+}
+
+} // namespace
+
 static void collFn(PerfContext &ctx, size_t count) {
   flagcxAllReduce(ctx.sendbuff, ctx.recvbuff, count, ctx.datatype, ctx.redOp,
                   ctx.comm, ctx.stream);
@@ -41,6 +64,7 @@ static void postIterFn(PerfContext &ctx, size_t, size_t count) {
 }
 
 int main(int argc, char *argv[]) {
+  configureIpcRingAllReduceForPerf();
   PerfContext ctx;
   perfSetup(ctx, argc, argv);
   perfEnableTypedReduction(ctx);
