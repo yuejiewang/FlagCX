@@ -1314,9 +1314,7 @@ FLAGCX_DEVICE_INLINE_DECORATOR bool executeRingStep(
   const uint64_t nelem = trigger.countElements;
   const uint64_t sliceSize = max(
       ((nelem + 16 * kRingSimpleSlicesPerChunk - 1) /
-           (16 * kRingSimpleSlicesPerChunk) +
-       15) /
-          16 * 16,
+       (16 * kRingSimpleSlicesPerChunk)) * 16,
       stepSizeElements * kRingSimpleSliceSteps / 32);
 
   for (uint32_t slice = 0; slice < kRingSimpleSlicesPerChunk; ++slice) {

@@ -4301,13 +4301,17 @@ flagcxResult_t initUniRunnerStateIpcRingAR(
       result = flagcxSystemError;
     }
   }
+  const size_t resourceChannels =
+      comm->nranks > 1
+          ? static_cast<size_t>(comm->heteroComm->collChannels)
+          : 0;
   if (result == flagcxSuccess && runnerState->ipcRingScratchMem != NULL &&
-      (runnerState->ipcRingChannels != numChannels ||
+      (runnerState->ipcRingChannels != resourceChannels ||
        runnerState->ipcRingSimpleBufferBytes != simpleBufferBytes)) {
     result = flagcxInvalidUsage;
   }
   if (runnerState->ipcRingScratchMem == NULL) {
-    runnerState->ipcRingChannels = numChannels;
+    runnerState->ipcRingChannels = resourceChannels;
     runnerState->ipcRingSimpleBufferBytes = simpleBufferBytes;
   }
   runnerState->ipcRingDatatype = datatype;
@@ -6153,7 +6157,7 @@ static flagcxResult_t runStaticRingDag(
       runnerState, comm, size_t{1} + static_cast<size_t>(comm->localRanks));
   if (result == flagcxSuccess)
     result = ensureUniRunnerIpcRingResources(
-        runnerState, comm, plan.numRingLanes,
+        runnerState, comm, runnerState->ipcRingChannels,
         runnerState->ipcRingSimpleBufferBytes);
   if (result == flagcxSuccess)
     result = resetDirtyUniRunnerIpcRingResources(runnerState, comm);
