@@ -188,6 +188,11 @@ constexpr char kUniRunnerDagCachePathEnv[] = "FLAGCX_UNIRUNNER_DAG_CACHE_PATH";
 constexpr uint64_t kUniRunnerDagAlgorithmHashSchemaVersion = 2;
 constexpr uint64_t kUniRunnerDagFnvOffsetBasis = 14695981039346656037ull;
 constexpr uint64_t kUniRunnerDagFnvPrime = 1099511628211ull;
+// Hetero communicators currently leave NCCL's collective tuning fields zero;
+// use a complete Ring+Simple configuration until those fields are populated.
+constexpr size_t kUniRunnerIpcRingDefaultChannels = 32;
+constexpr size_t kUniRunnerIpcRingDefaultSimpleBytes = 4 * 1024 * 1024;
+constexpr size_t kUniRunnerIpcRingDefaultThreads = 512;
 
 struct uniRunnerDagRuntimeBindings {
   const void *inputBase = NULL;
@@ -705,8 +710,12 @@ static flagcxResult_t getUniRunnerIpcRingTopologyHash(
   }
   if (comm->localRanks != comm->nranks) return flagcxNotSupported;
   flagcxHeteroComm_t hcomm = comm->heteroComm;
-  if (numChannels == 0 || numChannels > static_cast<size_t>(hcomm->collChannels) ||
-      hcomm->localRankToRank == NULL) {
+  const bool useConfiguredChannels = hcomm->collChannels > 0;
+  if (numChannels == 0 || hcomm->localRankToRank == NULL ||
+      (useConfiguredChannels &&
+       numChannels > static_cast<size_t>(hcomm->collChannels)) ||
+      (!useConfiguredChannels &&
+       numChannels > kUniRunnerIpcRingDefaultChannels)) {
     return flagcxInvalidArgument;
   }
   uint64_t hash = kUniRunnerDagFnvOffsetBasis;
@@ -720,6 +729,10 @@ static flagcxResult_t getUniRunnerIpcRingTopologyHash(
   }
   hash = hashAlgorithmUint64(hash, static_cast<uint64_t>(numChannels));
   for (size_t c = 0; c < numChannels; ++c) {
+    if (!useConfiguredChannels) {
+      hash = hashAlgorithmUint64(hash, static_cast<uint64_t>(c));
+      continue;
+    }
     const flagcxRing &ring = hcomm->channels[c].ring;
     if (ring.index < 0 || ring.index >= comm->nranks || ring.prev < 0 ||
         ring.prev >= comm->nranks || ring.next < 0 ||
@@ -3760,22 +3773,41 @@ static flagcxResult_t buildUniRunnerStateIpcRingAR(
   runnerState->numDagNodes = static_cast<int>(numChannels);
   FLAGCXCHECK(flagcxCalloc(&runnerState->dagNodes, runnerState->numDagNodes));
   flagcxHeteroComm_t hcomm = comm->heteroComm;
+  const bool useConfiguredChannels = hcomm->collChannels > 0;
   for (size_t c = 0; c < numChannels; ++c) {
-    const flagcxRing &ring = hcomm->channels[c].ring;
-    const int prevLocal = getUniRunnerLocalRank(hcomm, ring.prev);
-    const int nextLocal = getUniRunnerLocalRank(hcomm, ring.next);
-    if (ring.index < 0 || ring.index >= comm->nranks || ring.prev < 0 ||
-        ring.prev >= comm->nranks || ring.next < 0 ||
-        ring.next >= comm->nranks || ring.userRanks == NULL || prevLocal < 0 ||
-        nextLocal < 0) return flagcxInvalidArgument;
+    int ringIndex = -1;
+    int prevRank = -1;
+    int nextRank = -1;
+    int prevLocal = -1;
+    int nextLocal = -1;
+    if (useConfiguredChannels) {
+      const flagcxRing &ring = hcomm->channels[c].ring;
+      ringIndex = ring.index;
+      prevRank = ring.prev;
+      nextRank = ring.next;
+      prevLocal = getUniRunnerLocalRank(hcomm, prevRank);
+      nextLocal = getUniRunnerLocalRank(hcomm, nextRank);
+      if (ring.userRanks == NULL) return flagcxInvalidArgument;
+    } else {
+      ringIndex = getUniRunnerLocalRank(hcomm, comm->rank);
+      if (ringIndex >= 0) {
+        prevLocal = (ringIndex + comm->nranks - 1) % comm->nranks;
+        nextLocal = (ringIndex + 1) % comm->nranks;
+        prevRank = hcomm->localRankToRank[prevLocal];
+        nextRank = hcomm->localRankToRank[nextLocal];
+      }
+    }
+    if (ringIndex < 0 || ringIndex >= comm->nranks || prevRank < 0 ||
+        prevRank >= comm->nranks || nextRank < 0 || nextRank >= comm->nranks ||
+        prevLocal < 0 || nextLocal < 0) return flagcxInvalidArgument;
     uniRunnerDagNode &node = runnerState->dagNodes[c];
     node.nodeIdx = static_cast<int>(c);
     node.nodeType = uniRunnerDagNodeTypeIpcRingChannel;
     uniRunnerIpcRingChannelNodeData &data = node.nodeData.ipcRingChannel;
     data.channelId = static_cast<uint32_t>(c);
-    data.ringIndex = static_cast<uint32_t>(ring.index);
-    data.prevRank = ring.prev;
-    data.nextRank = ring.next;
+    data.ringIndex = static_cast<uint32_t>(ringIndex);
+    data.prevRank = prevRank;
+    data.nextRank = nextRank;
     data.prevLocalRank = prevLocal;
     data.nextLocalRank = nextLocal;
     data.nRanks = static_cast<uint32_t>(comm->nranks);
@@ -3821,12 +3853,19 @@ flagcxResult_t initUniRunnerStateIpcRingAR(
   const int configuredSimpleBytes = hcomm->buffSizes[FLAGCX_PROTO_SIMPLE];
   const int configuredThreads =
       hcomm->maxThreads[FLAGCX_ALGO_RING][FLAGCX_PROTO_SIMPLE];
+  const bool useConfiguredChannels = configuredChannels > 0 &&
+      configuredSimpleBytes > 0 && configuredThreads > 0;
+  const bool useDefaultChannel = configuredChannels == 0 &&
+      configuredSimpleBytes == 0 && configuredThreads == 0;
   const size_t numChannels = comm->nranks == 1 ? 0 :
-      configuredChannels > 0 ? static_cast<size_t>(configuredChannels) : 0;
+      useConfiguredChannels ? static_cast<size_t>(configuredChannels) :
+      useDefaultChannel ? kUniRunnerIpcRingDefaultChannels : 0;
   const size_t simpleBufferBytes = comm->nranks == 1 ? 0 :
-      configuredSimpleBytes > 0 ? static_cast<size_t>(configuredSimpleBytes) : 0;
+      useConfiguredChannels ? static_cast<size_t>(configuredSimpleBytes) :
+      useDefaultChannel ? kUniRunnerIpcRingDefaultSimpleBytes : 0;
   size_t nthreads = comm->nranks == 1 ? WARP_SIZE :
-      configuredThreads > 0 ? static_cast<size_t>(configuredThreads) : 0;
+      useConfiguredChannels ? static_cast<size_t>(configuredThreads) :
+      useDefaultChannel ? kUniRunnerIpcRingDefaultThreads : 0;
   nthreads = std::min(nthreads, static_cast<size_t>(FLAGCX_SIMPLE_MAX_NTHREADS));
   nthreads -= nthreads % WARP_SIZE;
   uint64_t topologyHash = 0;
