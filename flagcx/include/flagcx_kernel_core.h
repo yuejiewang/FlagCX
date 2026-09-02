@@ -171,6 +171,13 @@ constexpr unsigned int flagcxReduceWorkerBitsWorkerId = 32;
 constexpr unsigned int flagcxReduceWorkerOffWorkerCount = 32;
 constexpr unsigned int flagcxReduceWorkerBitsWorkerCount = 32;
 
+constexpr unsigned int flagcxGemmTriggerOffWorkerId = 0;
+constexpr unsigned int flagcxGemmTriggerBitsWorkerId = 32;
+constexpr unsigned int flagcxGemmTriggerOffWorkerCount = 32;
+constexpr unsigned int flagcxGemmTriggerBitsWorkerCount = 31;
+constexpr unsigned int flagcxGemmTriggerOffAccumulate = 63;
+constexpr unsigned int flagcxGemmTriggerBitsAccumulate = 1;
+
 // Kernel launch configuration constants.
 // Also defined in device_api/flagcx_device.h (with same include guard).
 #ifndef FLAGCX_DEVICE_CTA_COUNT
@@ -244,6 +251,10 @@ struct alignas(16) flagcxReduceTrigger {
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmLdb();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmLdc();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmAccumulate();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmWorkerId();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmWorkerCount();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmCompletionCounter();
+  FLAGCX_DEVICE_INLINE_DECORATOR void completeGemmWorker();
   FLAGCX_DEVICE_INLINE_DECORATOR void setComplete();
 #endif
   FLAGCX_HOST_DECORATOR void setValue(uint64_t fst, uint64_t snd, uint64_t out,
@@ -260,7 +271,8 @@ struct alignas(16) flagcxReduceTrigger {
   FLAGCX_HOST_DECORATOR void setGemmValue(
       uint64_t a, uint64_t b, uint64_t c, uint32_t m, uint32_t n, uint32_t k,
       uint32_t lda, uint32_t ldb, uint32_t ldc, size_t nthreads,
-      flagcxDataType_t datatype, int accumulate,
+      flagcxDataType_t datatype, int accumulate, uint32_t workerId,
+      uint32_t workerCount, uint64_t completionCounter,
       flagcxReduceTriggerState state, uint64_t flagIn, uint64_t flagOut);
   FLAGCX_HOST_DECORATOR uint64_t pollState();
   FLAGCX_HOST_DECORATOR void setState(int state);

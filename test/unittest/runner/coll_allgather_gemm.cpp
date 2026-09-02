@@ -7,11 +7,10 @@
 
 TEST_F(FlagCXCollTest, AllGatherGemm) {
   setenv("FLAGCX_UNIRUNNER_GEMM_KSLICES", "3", 0);
-  setenv("FLAGCX_UNIRUNNER_NTHREADS", "32", 0);
 
-  const size_t mPerRank = 3;
-  const size_t k = 5;
-  const size_t n = 4;
+  const size_t mPerRank = 130;
+  const size_t k = 19;
+  const size_t n = 130;
   const size_t inputElements = mPerRank * k;
   const size_t weightElements = k * n;
   const size_t outputElements = nranks * mPerRank * n;

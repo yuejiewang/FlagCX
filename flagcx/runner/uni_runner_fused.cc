@@ -3,6 +3,7 @@
 #include "comm.h"
 #include "global_comm.h"
 #include "proxy.h"
+#include "uni_runner_gemm.h"
 
 #include <algorithm>
 #include <climits>
@@ -12,6 +13,8 @@
 FLAGCX_PARAM(UniRunnerFusedAgGemmAlgo, "UNIRUNNER_FUSED_AG_GEMM_ALGO", 0);
 FLAGCX_PARAM(UniRunnerFusedGemmRsAlgo, "UNIRUNNER_FUSED_GEMM_RS_ALGO", 0);
 FLAGCX_PARAM(UniRunnerGemmKSlices, "UNIRUNNER_GEMM_KSLICES", 1);
+FLAGCX_PARAM(UniRunnerGemmWorkersPerStep,
+             "UNIRUNNER_GEMM_WORKERS_PER_STEP", 0);
 
 namespace {
 
@@ -29,6 +32,35 @@ static bool checkedAdd(size_t a, size_t b, size_t *result) {
   }
   *result = a + b;
   return true;
+}
+
+static bool checkedAlignUp(size_t value, size_t *result) {
+  size_t remainder = value % kUniRunnerGemmCounterStrideBytes;
+  size_t padding = remainder == 0
+                       ? 0
+                       : kUniRunnerGemmCounterStrideBytes - remainder;
+  return checkedAdd(value, padding, result);
+}
+
+static flagcxResult_t resolveUniRunnerGemmWorkerCount(
+    uint32_t m, uint32_t n, uint64_t configuredBlocks,
+    int64_t requestedWorkers, uint32_t *workerCount) {
+  if (m == 0 || n == 0 || configuredBlocks == 0 ||
+      configuredBlocks > INT_MAX || requestedWorkers < 0) {
+    return flagcxInvalidArgument;
+  }
+  uint64_t totalTiles = uniRunnerGemmTotalTiles(m, n);
+  uint64_t limit = configuredBlocks;
+  if (requestedWorkers > 0 &&
+      static_cast<uint64_t>(requestedWorkers) < limit) {
+    limit = static_cast<uint64_t>(requestedWorkers);
+  }
+  uint64_t resolved = totalTiles < limit ? totalTiles : limit;
+  if (resolved < 1 || resolved > INT_MAX) {
+    return flagcxInvalidArgument;
+  }
+  *workerCount = static_cast<uint32_t>(resolved);
+  return flagcxSuccess;
 }
 
 static bool rangesOverlap(const void *first, size_t firstBytes,
@@ -104,8 +136,10 @@ static void enqueueInitialNodes(flagcxUniRunnerState *runnerState) {
       if (node->nodeType == uniRunnerDagNodeTypeP2p ||
           node->nodeType == uniRunnerDagNodeTypeCpy) {
         flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue, node);
-      } else {
+      } else if (node->nodeType == uniRunnerDagNodeTypeRed) {
         flagcxIntruQueueEnqueue(&runnerState->redReadyQueue, node);
+      } else if (node->nodeType == uniRunnerDagNodeTypeGemm) {
+        flagcxIntruQueueEnqueue(&runnerState->gemmReadyQueue, node);
       }
     } else {
       runnerState->numPendingNodes++;
@@ -117,7 +151,8 @@ static void setGemmNode(uniRunnerDagNode *node, int nodeIdx, const void *a,
                         const void *b, void *c, uint32_t m, uint32_t n,
                         uint32_t k, uint32_t lda, uint32_t ldb, uint32_t ldc,
                         size_t nthreads, int accumulate, int numParents,
-                        int numChildren) {
+                        int numChildren, uint32_t workerCount,
+                        uint32_t *completionCounter) {
   node->nodeIdx = nodeIdx;
   node->nodeType = uniRunnerDagNodeTypeGemm;
   node->numParents = numParents;
@@ -131,9 +166,13 @@ static void setGemmNode(uniRunnerDagNode *node, int nodeIdx, const void *a,
   node->nodeData.gemm.lda = lda;
   node->nodeData.gemm.ldb = ldb;
   node->nodeData.gemm.ldc = ldc;
-  node->nodeData.gemm.nthreads = nthreads;
+  (void)nthreads;
+  node->nodeData.gemm.nthreads = kUniRunnerGemmThreads;
   node->nodeData.gemm.datatype = flagcxFloat32;
   node->nodeData.gemm.accumulate = accumulate;
+  node->nodeData.gemm.workerCount = workerCount;
+  node->nodeData.gemm.nextWorkerToSubmit = 0;
+  node->nodeData.gemm.completionCounter = completionCounter;
   node->nodeData.gemm.triggerIdx = -1;
 }
 
@@ -157,7 +196,8 @@ static flagcxResult_t setP2pNode(uniRunnerDagNode *node, int nodeIdx,
 static flagcxResult_t buildAllGatherGemmDag(
     flagcxUniRunnerState *runnerState, const void *input, const void *weight,
     void *output, float *scratch, size_t mPerRank, size_t n, size_t k,
-    size_t slices, flagcxComm_t comm) {
+    size_t slices, uint32_t gemmWorkerCount, char *counterBase,
+    flagcxComm_t comm) {
   const int rank = comm->rank;
   const int nranks = comm->nranks;
   size_t gemmNodes = 0;
@@ -191,6 +231,9 @@ static flagcxResult_t buildAllGatherGemmDag(
     for (size_t s = 0; s < slices; ++s) {
       int nodeIdx = p2pCount + q * static_cast<int>(slices) + s;
       size_t kOffset = kSliceOffset(k, slices, s);
+      size_t stepOrdinal = static_cast<size_t>(q) * slices + s;
+      uint32_t *completionCounter = reinterpret_cast<uint32_t *>(
+          counterBase + stepOrdinal * kUniRunnerGemmCounterStrideBytes);
       const float *aBase = q == rank ? inputFloat : scratch + q * rankElements;
       setGemmNode(&runnerState->dagNodes[nodeIdx], nodeIdx, aBase + kOffset,
                   weightFloat + kOffset * n,
@@ -200,7 +243,8 @@ static flagcxResult_t buildAllGatherGemmDag(
                   static_cast<uint32_t>(k), static_cast<uint32_t>(n),
                   static_cast<uint32_t>(n), runnerState->uniRunnerNThreads,
                   s != 0, s == 0 ? (q == rank ? 0 : 1) : 1,
-                  s + 1 < slices ? 1 : 0);
+                  s + 1 < slices ? 1 : 0, gemmWorkerCount,
+                  completionCounter);
     }
   }
 
@@ -243,7 +287,8 @@ static flagcxResult_t buildAllGatherGemmDag(
 static flagcxResult_t buildGemmReduceScatterDag(
     flagcxUniRunnerState *runnerState, const void *input, const void *weight,
     void *output, float *gemmOutput, float *rsScratch, size_t m, size_t n,
-    size_t kPerRank, size_t slices, flagcxComm_t comm) {
+    size_t kPerRank, size_t slices, uint32_t gemmWorkerCount,
+    char *counterBase, flagcxComm_t comm) {
   const int rank = comm->rank;
   const int nranks = comm->nranks;
   const size_t rowsPerRank = m / nranks;
@@ -270,6 +315,9 @@ static flagcxResult_t buildGemmReduceScatterDag(
     for (size_t s = 0; s < slices; ++s) {
       int nodeIdx = q * static_cast<int>(slices) + s;
       size_t kOffset = kSliceOffset(kPerRank, slices, s);
+      size_t stepOrdinal = static_cast<size_t>(q) * slices + s;
+      uint32_t *completionCounter = reinterpret_cast<uint32_t *>(
+          counterBase + stepOrdinal * kUniRunnerGemmCounterStrideBytes);
       float *c = nranks == 1 ? outputFloat : gemmOutput + rowStart * n;
       setGemmNode(
           &runnerState->dagNodes[nodeIdx], nodeIdx,
@@ -280,7 +328,8 @@ static flagcxResult_t buildGemmReduceScatterDag(
           static_cast<uint32_t>(kPerRank), static_cast<uint32_t>(n),
           static_cast<uint32_t>(n), runnerState->uniRunnerNThreads, s != 0,
           s == 0 ? 0 : 1,
-          s + 1 < slices ? 1 : (nranks > 1 ? 1 : 0));
+          s + 1 < slices ? 1 : (nranks > 1 ? 1 : 0), gemmWorkerCount,
+          completionCounter);
     }
   }
 
@@ -422,8 +471,16 @@ flagcxResult_t flagcxAllGatherGemm(
   FLAGCXCHECK(getEffectiveSlices(k, &slices));
   size_t inputElements = 0, weightElements = 0, outputRows = 0;
   size_t outputElements = 0, inputBytes = 0, weightBytes = 0, outputBytes = 0;
-  size_t workspaceElements = 0, workspaceBytes = 0;
+  size_t agScratchElements = 0, agScratchBytes = 0;
+  size_t counterBytes = 0, counterOffset = 0, totalWorkspaceBytes = 0;
   size_t gemmNodes = 0, numNodes = 0, dagBytes = 0;
+  if (comm->nranks > 1 &&
+      (!checkedMul(static_cast<size_t>(comm->nranks), mPerRank,
+                   &agScratchElements) ||
+       !checkedMul(agScratchElements, k, &agScratchElements) ||
+       !checkedMul(agScratchElements, sizeof(float), &agScratchBytes))) {
+    return flagcxInvalidArgument;
+  }
   if (!checkedMul(mPerRank, k, &inputElements) ||
       !checkedMul(k, n, &weightElements) ||
       !checkedMul(static_cast<size_t>(comm->nranks), mPerRank, &outputRows) ||
@@ -432,10 +489,11 @@ flagcxResult_t flagcxAllGatherGemm(
       !checkedMul(weightElements, sizeof(float), &weightBytes) ||
       !checkedMul(outputElements, sizeof(float), &outputBytes) ||
       inputElements > UINT32_MAX ||
-      !checkedMul(static_cast<size_t>(comm->nranks), inputElements,
-                  &workspaceElements) ||
-      !checkedMul(workspaceElements, sizeof(float), &workspaceBytes) ||
       !checkedMul(static_cast<size_t>(comm->nranks), slices, &gemmNodes) ||
+      !checkedMul(gemmNodes, kUniRunnerGemmCounterStrideBytes,
+                  &counterBytes) ||
+      !checkedAlignUp(agScratchBytes, &counterOffset) ||
+      !checkedAdd(counterOffset, counterBytes, &totalWorkspaceBytes) ||
       !checkedAdd(gemmNodes, comm->nranks > 1 ? comm->nranks - 1 : 0,
                   &numNodes) ||
       numNodes > static_cast<size_t>(INT_MAX) ||
@@ -445,14 +503,21 @@ flagcxResult_t flagcxAllGatherGemm(
   FLAGCXCHECK(validateBufferRanges(input, inputBytes, weight, weightBytes,
                                    output, outputBytes));
 
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(stream));
   void *workspace = NULL;
-  if (comm->nranks > 1) {
-    res = deviceAdaptor->deviceMalloc(&workspace, workspaceBytes,
-                                      flagcxMemDevice, NULL);
-    if (res != flagcxSuccess) {
-      return res;
-    }
+  res = deviceAdaptor->deviceMalloc(&workspace, totalWorkspaceBytes,
+                                    flagcxMemDevice, NULL);
+  if (res != flagcxSuccess) {
+    return res;
+  }
+  char *counterBase = static_cast<char *>(workspace) + counterOffset;
+  res = deviceAdaptor->deviceMemset(counterBase, 0, counterBytes,
+                                    flagcxMemDevice, stream);
+  if (res != flagcxSuccess) {
+    return finishInvocation(res, false, comm, workspace);
+  }
+  res = deviceAdaptor->streamSynchronize(stream);
+  if (res != flagcxSuccess) {
+    return finishInvocation(res, false, comm, workspace);
   }
 
   bool initialized = false;
@@ -461,15 +526,23 @@ flagcxResult_t flagcxAllGatherGemm(
     initialized = true;
     flagcxUniRunnerState *runnerState =
         &comm->heteroComm->proxyState->uniRunnerState;
-    if (runnerState->uniRunnerNThreads < 1 ||
-        runnerState->uniRunnerNThreads > 1024 ||
-        runnerState->uniRunnerNThreads > UINT16_MAX ||
-        runnerState->uniRunnerNBlocks < 1) {
+    runnerState->uniRunnerNThreads = kUniRunnerGemmThreads;
+    uint32_t gemmWorkerCount = 0;
+    int64_t requestedWorkers = flagcxParamUniRunnerGemmWorkersPerStep();
+    if (runnerState->uniRunnerNThreads != kUniRunnerGemmThreads ||
+        runnerState->uniRunnerNBlocks < 1 ||
+        runnerState->uniRunnerNBlocks > INT_MAX) {
       res = flagcxInvalidArgument;
     } else {
-      res = buildAllGatherGemmDag(
-          runnerState, input, weight, output, static_cast<float *>(workspace),
-          mPerRank, n, k, slices, comm);
+      res = resolveUniRunnerGemmWorkerCount(
+          static_cast<uint32_t>(mPerRank), static_cast<uint32_t>(n),
+          runnerState->uniRunnerNBlocks, requestedWorkers, &gemmWorkerCount);
+      float *scratch = comm->nranks > 1 ? static_cast<float *>(workspace) : NULL;
+      if (res == flagcxSuccess) {
+        res = buildAllGatherGemmDag(
+            runnerState, input, weight, output, scratch, mPerRank, n, k,
+            slices, gemmWorkerCount, counterBase, comm);
+      }
       if (res == flagcxSuccess) {
         res = runUniRunner(comm);
       }
@@ -502,7 +575,9 @@ flagcxResult_t flagcxGemmReduceScatter(
   size_t rowsPerRank = m / comm->nranks;
   size_t inputElements = 0, weightElements = 0, outputElements = 0;
   size_t fullOutputElements = 0, inputBytes = 0, weightBytes = 0;
-  size_t outputBytes = 0, workspaceElements = 0, workspaceBytes = 0;
+  size_t outputBytes = 0, dataWorkspaceElements = 0;
+  size_t dataWorkspaceBytes = 0, counterBytes = 0, counterOffset = 0;
+  size_t totalWorkspaceBytes = 0;
   size_t gemmNodes = 0, ringNodes = 0, numNodes = 0, dagBytes = 0;
   if (rowsPerRank > UINT32_MAX ||
       !checkedMul(m, kPerRank, &inputElements) ||
@@ -512,26 +587,43 @@ flagcxResult_t flagcxGemmReduceScatter(
       !checkedMul(inputElements, sizeof(float), &inputBytes) ||
       !checkedMul(weightElements, sizeof(float), &weightBytes) ||
       !checkedMul(outputElements, sizeof(float), &outputBytes) ||
-      !checkedMul(fullOutputElements, 2, &workspaceElements) ||
-      !checkedMul(workspaceElements, sizeof(float), &workspaceBytes) ||
       !checkedMul(static_cast<size_t>(comm->nranks), slices, &gemmNodes) ||
+      !checkedMul(gemmNodes, kUniRunnerGemmCounterStrideBytes,
+                  &counterBytes) ||
       !checkedMul(comm->nranks > 1 ? comm->nranks - 1 : 0, 2, &ringNodes) ||
       !checkedAdd(gemmNodes, ringNodes, &numNodes) ||
       numNodes > static_cast<size_t>(INT_MAX) ||
       !checkedMul(numNodes, sizeof(uniRunnerDagNode), &dagBytes)) {
     return flagcxInvalidArgument;
   }
+  if (comm->nranks > 1 &&
+      (!checkedMul(fullOutputElements, 2, &dataWorkspaceElements) ||
+       !checkedMul(dataWorkspaceElements, sizeof(float),
+                   &dataWorkspaceBytes))) {
+    return flagcxInvalidArgument;
+  }
+  if (!checkedAlignUp(dataWorkspaceBytes, &counterOffset) ||
+      !checkedAdd(counterOffset, counterBytes, &totalWorkspaceBytes)) {
+    return flagcxInvalidArgument;
+  }
   FLAGCXCHECK(validateBufferRanges(input, inputBytes, weight, weightBytes,
                                    output, outputBytes));
 
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(stream));
   void *workspace = NULL;
-  if (comm->nranks > 1) {
-    res = deviceAdaptor->deviceMalloc(&workspace, workspaceBytes,
-                                      flagcxMemDevice, NULL);
-    if (res != flagcxSuccess) {
-      return res;
-    }
+  res = deviceAdaptor->deviceMalloc(&workspace, totalWorkspaceBytes,
+                                    flagcxMemDevice, NULL);
+  if (res != flagcxSuccess) {
+    return res;
+  }
+  char *counterBase = static_cast<char *>(workspace) + counterOffset;
+  res = deviceAdaptor->deviceMemset(counterBase, 0, counterBytes,
+                                    flagcxMemDevice, stream);
+  if (res != flagcxSuccess) {
+    return finishInvocation(res, false, comm, workspace);
+  }
+  res = deviceAdaptor->streamSynchronize(stream);
+  if (res != flagcxSuccess) {
+    return finishInvocation(res, false, comm, workspace);
   }
 
   bool initialized = false;
@@ -540,18 +632,27 @@ flagcxResult_t flagcxGemmReduceScatter(
     initialized = true;
     flagcxUniRunnerState *runnerState =
         &comm->heteroComm->proxyState->uniRunnerState;
-    if (runnerState->uniRunnerNThreads < 1 ||
-        runnerState->uniRunnerNThreads > 1024 ||
-        runnerState->uniRunnerNThreads > UINT16_MAX ||
-        runnerState->uniRunnerNBlocks < 1) {
+    runnerState->uniRunnerNThreads = kUniRunnerGemmThreads;
+    uint32_t gemmWorkerCount = 0;
+    int64_t requestedWorkers = flagcxParamUniRunnerGemmWorkersPerStep();
+    if (runnerState->uniRunnerNThreads != kUniRunnerGemmThreads ||
+        runnerState->uniRunnerNBlocks < 1 ||
+        runnerState->uniRunnerNBlocks > INT_MAX) {
       res = flagcxInvalidArgument;
     } else {
-      float *gemmOutput = static_cast<float *>(workspace);
-      float *rsScratch =
-          comm->nranks > 1 ? gemmOutput + fullOutputElements : NULL;
-      res = buildGemmReduceScatterDag(
-          runnerState, input, weight, output, gemmOutput, rsScratch, m, n,
-          kPerRank, slices, comm);
+      res = resolveUniRunnerGemmWorkerCount(
+          static_cast<uint32_t>(rowsPerRank), static_cast<uint32_t>(n),
+          runnerState->uniRunnerNBlocks, requestedWorkers, &gemmWorkerCount);
+      float *gemmOutput =
+          comm->nranks > 1 ? static_cast<float *>(workspace) : NULL;
+      float *rsScratch = comm->nranks > 1
+                             ? gemmOutput + fullOutputElements
+                             : NULL;
+      if (res == flagcxSuccess) {
+        res = buildGemmReduceScatterDag(
+            runnerState, input, weight, output, gemmOutput, rsScratch, m, n,
+            kPerRank, slices, gemmWorkerCount, counterBase, comm);
+      }
       if (res == flagcxSuccess) {
         res = runUniRunner(comm);
       }

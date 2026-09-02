@@ -94,6 +94,9 @@ struct uniRunnerGemmNodeData {
   size_t nthreads;
   flagcxDataType_t datatype;
   int accumulate;
+  uint32_t workerCount;
+  uint32_t nextWorkerToSubmit;
+  uint32_t *completionCounter;
   int triggerIdx;
 };
 
@@ -142,6 +145,8 @@ typedef struct {
       p2pReadyQueue;
   flagcxIntruQueue<struct uniRunnerDagNode, &uniRunnerDagNode::next>
       redReadyQueue;
+  flagcxIntruQueue<struct uniRunnerDagNode, &uniRunnerDagNode::next>
+      gemmReadyQueue;
 
   uint64_t uniRunnerNSlices;
   uint64_t uniRunnerNThreads;

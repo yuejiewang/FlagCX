@@ -9,6 +9,7 @@
 #include "socket.h"
 #include "transport.h"
 #include "uni_runner_helper.h"
+#include "uni_runner_gemm.h"
 #define ENABLE_TIMER 0
 #include "timer.h"
 
@@ -2095,6 +2096,7 @@ static flagcxResult_t buildUniRunnerStateTreeRed(
 static void resetDagSchedulerRuntimeState(flagcxUniRunnerState *runnerState) {
   flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
   flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->gemmReadyQueue);
   runnerState->numPendingNodes = 0;
 }
 
@@ -2617,10 +2619,12 @@ static flagcxResult_t enqueueReadyQueue(flagcxUniRunnerState *runnerState,
     flagcxIntruQueueEnqueue(&runnerState->p2pReadyQueue,
                             &runnerState->dagNodes[nodeIdx]);
   } else if (runnerState->dagNodes[nodeIdx].nodeType ==
-                 uniRunnerDagNodeTypeRed ||
-             runnerState->dagNodes[nodeIdx].nodeType ==
-                 uniRunnerDagNodeTypeGemm) {
+             uniRunnerDagNodeTypeRed) {
     flagcxIntruQueueEnqueue(&runnerState->redReadyQueue,
+                            &runnerState->dagNodes[nodeIdx]);
+  } else if (runnerState->dagNodes[nodeIdx].nodeType ==
+             uniRunnerDagNodeTypeGemm) {
+    flagcxIntruQueueEnqueue(&runnerState->gemmReadyQueue,
                             &runnerState->dagNodes[nodeIdx]);
   } else {
     return flagcxNotSupported;
@@ -2650,7 +2654,6 @@ static flagcxResult_t notifyChildrenScheduled(flagcxUniRunnerState *runnerState,
 // dependencies are enforced via stream flags.
 static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
                                         flagcxHeteroComm_t comm) {
-  // process p2pReadyQueue
   while (!flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue)) {
     uniRunnerDagNode *current =
         flagcxIntruQueueHead(&runnerState->p2pReadyQueue);
@@ -2658,19 +2661,14 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
     FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
   }
 
-  // process redReadyQueue
   while (!flagcxIntruQueueEmpty(&runnerState->redReadyQueue)) {
-    struct uniRunnerDagNode *current =
+    uniRunnerDagNode *current =
         flagcxIntruQueueHead(&runnerState->redReadyQueue);
-    uniRunnerRedNodeData *red = current->nodeType == uniRunnerDagNodeTypeRed
-                                   ? &current->nodeData.red
-                                   : NULL;
-    if (current->numParents > 1 ||
-        (red != NULL &&
-         (red->workerCount < 1 ||
-          red->nextWorkerToSubmit > red->workerCount ||
-          (red->workerCount > 1 && red->completionCounter == NULL))) ||
-        (red == NULL && current->nodeType != uniRunnerDagNodeTypeGemm)) {
+    uniRunnerRedNodeData *red = &current->nodeData.red;
+    if (current->nodeType != uniRunnerDagNodeTypeRed ||
+        current->numParents > 1 || red->workerCount < 1 ||
+        red->nextWorkerToSubmit > red->workerCount ||
+        (red->workerCount > 1 && red->completionCounter == NULL)) {
       return flagcxInvalidArgument;
     }
     uint64_t flagIn =
@@ -2678,7 +2676,7 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
             ? 0
             : (uintptr_t)getDagNodeFlag(runnerState, current->parents[0]);
     uint64_t flagOut = (uintptr_t)getDagNodeFlag(runnerState, current->nodeIdx);
-    if (red != NULL && red->workerCount == 1) {
+    if (red->workerCount == 1) {
       int idx = -1;
       FLAGCXCHECK(enqueue(
           (void *)runnerState->fifo->buffer, (uintptr_t)red->input1,
@@ -2690,7 +2688,7 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
       }
       red->triggerIdx = idx;
       red->nextWorkerToSubmit = 1;
-    } else if (red != NULL) {
+    } else {
       while (red->nextWorkerToSubmit < red->workerCount) {
         uint32_t workerId = red->nextWorkerToSubmit;
         int idx = -1;
@@ -2709,25 +2707,46 @@ static flagcxResult_t processReadyQueue(flagcxUniRunnerState *runnerState,
         }
         red->nextWorkerToSubmit++;
       }
-    } else {
+    }
+    flagcxIntruQueueDequeue(&runnerState->redReadyQueue);
+    FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
+  }
+
+  while (!flagcxIntruQueueEmpty(&runnerState->gemmReadyQueue)) {
+    uniRunnerDagNode *current =
+        flagcxIntruQueueHead(&runnerState->gemmReadyQueue);
+    uniRunnerGemmNodeData *gemm = &current->nodeData.gemm;
+    if (current->nodeType != uniRunnerDagNodeTypeGemm ||
+        current->numParents > 1 || gemm->workerCount < 1 ||
+        gemm->nextWorkerToSubmit > gemm->workerCount ||
+        gemm->completionCounter == NULL || gemm->datatype != flagcxFloat32 ||
+        gemm->nthreads != kUniRunnerGemmThreads) {
+      return flagcxInvalidArgument;
+    }
+    uint64_t flagIn =
+        current->numParents == 0
+            ? 0
+            : (uintptr_t)getDagNodeFlag(runnerState, current->parents[0]);
+    uint64_t flagOut = (uintptr_t)getDagNodeFlag(runnerState, current->nodeIdx);
+    while (gemm->nextWorkerToSubmit < gemm->workerCount) {
+      uint32_t workerId = gemm->nextWorkerToSubmit;
       int idx = -1;
       FLAGCXCHECK(enqueueGemm(
-          (void *)runnerState->fifo->buffer,
-          (uintptr_t)current->nodeData.gemm.a,
-          (uintptr_t)current->nodeData.gemm.b,
-          (uintptr_t)current->nodeData.gemm.c, current->nodeData.gemm.m,
-          current->nodeData.gemm.n, current->nodeData.gemm.k,
-          current->nodeData.gemm.lda, current->nodeData.gemm.ldb,
-          current->nodeData.gemm.ldc, current->nodeData.gemm.nthreads,
-          current->nodeData.gemm.datatype, current->nodeData.gemm.accumulate,
-          flagIn, flagOut, &idx));
+          (void *)runnerState->fifo->buffer, (uintptr_t)gemm->a,
+          (uintptr_t)gemm->b, (uintptr_t)gemm->c, gemm->m, gemm->n, gemm->k,
+          gemm->lda, gemm->ldb, gemm->ldc, gemm->nthreads, gemm->datatype,
+          gemm->accumulate, workerId, gemm->workerCount,
+          (uintptr_t)gemm->completionCounter, flagIn, flagOut, &idx));
       if (idx == -1) {
         sched_yield();
         return flagcxSuccess;
       }
-      current->nodeData.gemm.triggerIdx = idx;
+      if (gemm->triggerIdx == -1) {
+        gemm->triggerIdx = idx;
+      }
+      gemm->nextWorkerToSubmit++;
     }
-    flagcxIntruQueueDequeue(&runnerState->redReadyQueue);
+    flagcxIntruQueueDequeue(&runnerState->gemmReadyQueue);
     FLAGCXCHECK(notifyChildrenScheduled(runnerState, current));
   }
 
@@ -2762,6 +2781,7 @@ flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream) {
   // Initialize queues
   flagcxIntruQueueConstruct(&runnerState->p2pReadyQueue);
   flagcxIntruQueueConstruct(&runnerState->redReadyQueue);
+  flagcxIntruQueueConstruct(&runnerState->gemmReadyQueue);
   runnerState->numPendingNodes = 0;
 
   // Create dedicated reduce and copy streams
@@ -2824,6 +2844,7 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   while (true) {
     if (flagcxIntruQueueEmpty(&runnerState->p2pReadyQueue) &&
         flagcxIntruQueueEmpty(&runnerState->redReadyQueue) &&
+        flagcxIntruQueueEmpty(&runnerState->gemmReadyQueue) &&
         runnerState->numPendingNodes == 0) {
       TRACE(
           FLAGCX_UNIRUNNER,

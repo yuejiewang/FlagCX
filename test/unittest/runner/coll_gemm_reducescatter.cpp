@@ -6,12 +6,11 @@
 
 TEST_F(FlagCXCollTest, GemmReduceScatter) {
   setenv("FLAGCX_UNIRUNNER_GEMM_KSLICES", "3", 0);
-  setenv("FLAGCX_UNIRUNNER_NTHREADS", "32", 0);
 
-  const size_t m = 3 * nranks;
-  const size_t kPerRank = 5;
-  const size_t n = 4;
-  const size_t rowsPerRank = m / nranks;
+  const size_t rowsPerRank = 130;
+  const size_t m = rowsPerRank * nranks;
+  const size_t kPerRank = 19;
+  const size_t n = 130;
   const size_t inputElements = m * kPerRank;
   const size_t weightElements = kPerRank * n;
   const size_t fullOutputElements = m * n;

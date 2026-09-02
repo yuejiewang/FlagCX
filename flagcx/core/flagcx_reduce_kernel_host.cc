@@ -32,7 +32,8 @@ FLAGCX_HOST_DECORATOR void flagcxReduceTrigger::setValue(
 FLAGCX_HOST_DECORATOR void flagcxReduceTrigger::setGemmValue(
     uint64_t a, uint64_t b, uint64_t c, uint32_t m, uint32_t n, uint32_t k,
     uint32_t lda, uint32_t ldb, uint32_t ldc, size_t nthreads,
-    flagcxDataType_t datatype, int accumulate,
+    flagcxDataType_t datatype, int accumulate, uint32_t workerId,
+    uint32_t workerCount, uint64_t completionCounter,
     flagcxReduceTriggerState state, uint64_t flagIn, uint64_t flagOut) {
   uint64_t tmp[12] = {};
   tmp[0] = a;
@@ -55,7 +56,17 @@ FLAGCX_HOST_DECORATOR void flagcxReduceTrigger::setGemmValue(
   tmp[6] = static_cast<uint64_t>(m) << 32 | n;
   tmp[7] = static_cast<uint64_t>(k) << 32 | lda;
   tmp[8] = static_cast<uint64_t>(ldb) << 32 | ldc;
-  tmp[9] = accumulate != 0 ? 1 : 0;
+  tmp[9] =
+      (static_cast<uint64_t>(workerId) &
+       flagcxTriggerMask(flagcxGemmTriggerBitsWorkerId))
+          << flagcxGemmTriggerOffWorkerId |
+      (static_cast<uint64_t>(workerCount) &
+       flagcxTriggerMask(flagcxGemmTriggerBitsWorkerCount))
+          << flagcxGemmTriggerOffWorkerCount |
+      (static_cast<uint64_t>(accumulate != 0) &
+       flagcxTriggerMask(flagcxGemmTriggerBitsAccumulate))
+          << flagcxGemmTriggerOffAccumulate;
+  tmp[10] = completionCounter;
   memcpy(this->value, tmp, sizeof(tmp));
 }
 
@@ -178,6 +189,7 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueueGemm(
     void *fifoBuffer, uint64_t a, uint64_t b, uint64_t c, uint32_t m,
     uint32_t n, uint32_t k, uint32_t lda, uint32_t ldb, uint32_t ldc,
     size_t nthreads, flagcxDataType_t datatype, int accumulate,
+    uint32_t workerId, uint32_t workerCount, uint64_t completionCounter,
     uint64_t flagIn, uint64_t flagOut, int *ret) {
   uint64_t *buffer = (uint64_t *)fifoBuffer;
   int capacity = buffer[flagcxFifoIdxCapacity];
@@ -196,13 +208,13 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueueGemm(
     return flagcxSuccess;
   }
   trigger->setGemmValue(a, b, c, m, n, k, lda, ldb, ldc, nthreads, datatype,
-                        accumulate, flagcxReduceTriggerEnqueued, flagIn,
-                        flagOut);
+                        accumulate, workerId, workerCount, completionCounter,
+                        flagcxReduceTriggerEnqueued, flagIn, flagOut);
   __atomic_fetch_add(buffer + flagcxFifoIdxProduced, 1ul, __ATOMIC_RELEASE);
   *ret = idx;
   TRACE(FLAGCX_KERNEL,
-        "enqueue gemm: m=%u, n=%u, k=%u, nthreads=%lu, idx=%d", m, n, k,
-        nthreads, idx);
+        "enqueue gemm worker: m=%u, n=%u, k=%u, worker=%u/%u, idx=%d", m, n,
+        k, workerId, workerCount, idx);
   return flagcxSuccess;
 }
 
