@@ -158,6 +158,11 @@ constexpr unsigned int flagcxReduceTriggerOffState =
 constexpr unsigned int flagcxReduceTriggerBitsState = 2;
 constexpr unsigned int flagcxReduceTriggerBitsFifoReserved = 1;
 
+constexpr unsigned int flagcxReduceWorkerOffWorkerId = 0;
+constexpr unsigned int flagcxReduceWorkerBitsWorkerId = 32;
+constexpr unsigned int flagcxReduceWorkerOffWorkerCount = 32;
+constexpr unsigned int flagcxReduceWorkerBitsWorkerCount = 32;
+
 // Kernel launch configuration constants.
 // Also defined in device_api/flagcx_device.h (with same include guard).
 #ifndef FLAGCX_DEVICE_CTA_COUNT
@@ -204,7 +209,7 @@ struct flagcxDeviceTrigger {
 typedef flagcxDeviceTrigger *flagcxDeviceTrigger_t;
 
 struct alignas(16) flagcxReduceTrigger {
-  uint64_t value[6];
+  uint64_t value[12];
 
 #ifdef COMPILE_KERNEL
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getInput1();
@@ -217,6 +222,12 @@ struct alignas(16) flagcxReduceTrigger {
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getState();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getFlagIn();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getFlagOut();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getReduceWorkerId();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getReduceWorkerCount();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getReduceCompletionCounter();
+  FLAGCX_DEVICE_INLINE_DECORATOR void publishOutputDone();
+  FLAGCX_DEVICE_INLINE_DECORATOR void recycle();
+  FLAGCX_DEVICE_INLINE_DECORATOR void completeReduceWorker();
   FLAGCX_DEVICE_INLINE_DECORATOR void setComplete();
 #endif
   FLAGCX_HOST_DECORATOR void setValue(uint64_t fst, uint64_t snd, uint64_t out,
@@ -225,9 +236,16 @@ struct alignas(16) flagcxReduceTrigger {
                                       flagcxRedOp_t redOp,
                                       flagcxReduceTriggerState state,
                                       uint64_t flagIn, uint64_t flagOut);
+  FLAGCX_HOST_DECORATOR void setReduceWorkerValue(
+      uint64_t fst, uint64_t snd, uint64_t out, size_t count,
+      size_t nthreads, flagcxDataType_t datatype, flagcxRedOp_t redOp,
+      uint32_t workerId, uint32_t workerCount, uint64_t completionCounter,
+      flagcxReduceTriggerState state, uint64_t flagIn, uint64_t flagOut);
   FLAGCX_HOST_DECORATOR uint64_t pollState();
   FLAGCX_HOST_DECORATOR void setState(int state);
 };
 typedef flagcxReduceTrigger *flagcxReduceTrigger_t;
+static_assert(sizeof(flagcxReduceTrigger) == 96,
+              "compute trigger layout must remain 96 bytes");
 
 #endif // FLAGCX_KERNEL_CORE_H_

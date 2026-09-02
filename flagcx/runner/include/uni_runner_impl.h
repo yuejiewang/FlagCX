@@ -74,6 +74,9 @@ struct uniRunnerRedNodeData {
   flagcxRedOp_t redOp;
 
   // Trigger and state tracking
+  uint32_t workerCount;
+  uint32_t nextWorkerToSubmit;
+  uint32_t *completionCounter;
   int triggerIdx; // Trigger index in FIFO
 };
 
@@ -127,6 +130,11 @@ typedef struct {
   uint64_t uniRunnerNBlocks;
   uint64_t uniRunnerNRedSlices;
   uint64_t uniRunnerRedSliceSize;
+  bool redSliceWorkersEnabled;
+
+  // Reusable, cache-line-separated completion counters for logical RED nodes.
+  void *redCompletionCountersPool;
+  size_t redCompletionCountersCapacity;
 
   // Stream completion flags backed by a reusable contiguous device pool. The
   // host-side queue stores per-node addresses within that pool.

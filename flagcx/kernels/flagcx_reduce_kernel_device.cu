@@ -12,6 +12,8 @@
 #define REDOP_IDX 11
 #define FLAG_IN_IDX 12
 #define FLAG_OUT_IDX 13
+#define WORKER_INFO_IDX 18
+#define COMPLETION_COUNTER_IDX 19
 
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxStreamFlagState
 loadStreamFlagState(uint64_t flagAddr) {
@@ -27,6 +29,17 @@ isStreamFlagStatePending(flagcxStreamFlagState state) {
 FLAGCX_DEVICE_INLINE_DECORATOR bool
 isStreamFlagStateDone(flagcxStreamFlagState state) {
   return state == flagcxStreamFlagDone;
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void markStreamFlagPending(uint64_t flagAddr) {
+  if (flagAddr == 0) {
+    return;
+  }
+  uint64_t expected = flagcxStreamFlagIdle;
+  DeviceAPI::Atomic::compareExchange(
+      reinterpret_cast<uint64_t *>(flagAddr), expected,
+      static_cast<uint64_t>(flagcxStreamFlagPend),
+      flagcxDeviceMemoryOrderAcqRel);
 }
 
 FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getInput1() {
@@ -59,6 +72,11 @@ FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getState() {
          flagcxTriggerMask(flagcxReduceTriggerBitsState);
 }
 FLAGCX_DEVICE_INLINE_DECORATOR void flagcxReduceTrigger::setComplete() {
+  publishOutputDone();
+  recycle();
+}
+FLAGCX_DEVICE_INLINE_DECORATOR void
+flagcxReduceTrigger::publishOutputDone() {
   uint64_t flagOut = getFlagOut();
   if (flagOut != 0) {
     flagcxStreamFlagState flagState = loadStreamFlagState(flagOut);
@@ -68,9 +86,8 @@ FLAGCX_DEVICE_INLINE_DECORATOR void flagcxReduceTrigger::setComplete() {
                                flagcxDeviceMemoryOrderRelease);
     }
   }
-  // Recycle the FIFO slot only after the output flag is visible as DONE, so a
-  // host-side re-enqueue cannot overwrite flagOut before dependent streams
-  // observe completion.
+}
+FLAGCX_DEVICE_INLINE_DECORATOR void flagcxReduceTrigger::recycle() {
   uint64_t currVal =
       DeviceAPI::Atomic::load(value + 3, flagcxDeviceMemoryOrderAcquire);
   currVal &= ~(flagcxTriggerMask(flagcxReduceTriggerBitsState)
@@ -85,6 +102,34 @@ FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getFlagIn() {
 }
 FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getFlagOut() {
   return value[5];
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t
+flagcxReduceTrigger::getReduceWorkerId() {
+  return value[6] >> flagcxReduceWorkerOffWorkerId &
+         flagcxTriggerMask(flagcxReduceWorkerBitsWorkerId);
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t
+flagcxReduceTrigger::getReduceWorkerCount() {
+  return value[6] >> flagcxReduceWorkerOffWorkerCount &
+         flagcxTriggerMask(flagcxReduceWorkerBitsWorkerCount);
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t
+flagcxReduceTrigger::getReduceCompletionCounter() {
+  return value[7];
+}
+FLAGCX_DEVICE_INLINE_DECORATOR void
+flagcxReduceTrigger::completeReduceWorker() {
+  uint64_t workerCount = getReduceWorkerCount();
+  uint32_t *counter =
+      reinterpret_cast<uint32_t *>(getReduceCompletionCounter());
+  uint32_t oldCompleted =
+      DeviceAPI::Atomic::fetchAdd<uint32_t, flagcxDeviceScopeDevice>(
+          counter, 1u, flagcxDeviceMemoryOrderAcqRel);
+  if (static_cast<uint64_t>(oldCompleted) + 1 == workerCount) {
+    FLAGCX_DEVICE_THREAD_FENCE();
+    publishOutputDone();
+  }
+  recycle();
 }
 
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(uint64_t *buffer,
@@ -111,21 +156,39 @@ FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(uint64_t *buffer,
   return flagcxSuccess;
 }
 
-FLAGCX_DEVICE_INLINE_DECORATOR void
-flagcxReduceKernel(uint64_t fst, uint64_t snd, uint64_t out, uint64_t count,
-                   uint64_t nthreads, uint64_t datatype, uint64_t redOp) {
+FLAGCX_DEVICE_INLINE_DECORATOR void computeReduceWorkerRange(
+    uint64_t fullCount, uint64_t workerId, uint64_t workerCount,
+    uint64_t *elementOffset, uint64_t *elementCount) {
+  if (workerCount == 0) {
+    *elementOffset = 0;
+    *elementCount = fullCount;
+    return;
+  }
+  uint64_t base = fullCount / workerCount;
+  uint64_t remainder = fullCount % workerCount;
+  *elementCount = base + (workerId < remainder ? 1 : 0);
+  *elementOffset =
+      workerId * base + (workerId < remainder ? workerId : remainder);
+}
+
+FLAGCX_DEVICE_INLINE_DECORATOR void flagcxReduceKernel(
+    uint64_t fst, uint64_t snd, uint64_t out, uint64_t elementOffset,
+    uint64_t elementCount, uint64_t nthreads, uint64_t datatype,
+    uint64_t redOp) {
   // to be implemented by vendors
   int tid = threadIdx.x;
   float *fstPtr = (float *)fst;
   float *sndPtr = (float *)snd;
   float *outPtr = (float *)out;
-  for (int i = tid; i < count; i += nthreads) {
-    outPtr[i] = fstPtr[i] + sndPtr[i];
+  for (uint64_t localIndex = tid; localIndex < elementCount;
+       localIndex += nthreads) {
+    uint64_t globalIndex = elementOffset + localIndex;
+    outPtr[globalIndex] = fstPtr[globalIndex] + sndPtr[globalIndex];
   }
 }
 
 FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
-  FLAGCX_SHARED uint64_t shm[16];
+  FLAGCX_SHARED uint64_t shm[20];
   uint64_t *vBuf = (uint64_t *)fifoBuffer;
   int emptyIter = 0; // backoff counter
   int cap = -1;
@@ -183,6 +246,10 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
         shm[REDOP_IDX] = t->getRedop();
         shm[FLAG_IN_IDX] = t->getFlagIn();
         shm[FLAG_OUT_IDX] = t->getFlagOut();
+        shm[WORKER_INFO_IDX] =
+            t->getReduceWorkerCount() << flagcxReduceWorkerOffWorkerCount |
+            t->getReduceWorkerId();
+        shm[COMPLETION_COUNTER_IDX] = t->getReduceCompletionCounter();
       }
     }
     FLAGCX_DEVICE_SYNC_THREADS();
@@ -196,17 +263,8 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
       continue;
     }
 
-    // RED nodes are submitted from the host before they are executable, so the
-    // kernel marks the output flag as pending once it has claimed the FIFO
-    // slot.
-    if (tid == 0 && shm[FLAG_OUT_IDX] != 0) {
-      uint64_t flagOut = shm[FLAG_OUT_IDX];
-      flagcxStreamFlagState flagState = loadStreamFlagState(flagOut);
-      if (flagState == flagcxStreamFlagIdle) {
-        DeviceAPI::Atomic::store(reinterpret_cast<uint64_t *>(flagOut),
-                                 (uint64_t)flagcxStreamFlagPend,
-                                 flagcxDeviceMemoryOrderRelease);
-      }
+    if (tid == 0) {
+      markStreamFlagPending(shm[FLAG_OUT_IDX]);
     }
     FLAGCX_DEVICE_SYNC_THREADS();
 
@@ -234,7 +292,15 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
     uint64_t nthreads = shm[NTHREADS_IDX];
     uint64_t datatype = shm[DATATYPE_IDX];
     uint64_t redop = shm[REDOP_IDX];
-    flagcxReduceKernel(fst, snd, out, count, nthreads, datatype, redop);
+    uint64_t workerInfo = shm[WORKER_INFO_IDX];
+    uint64_t workerId = workerInfo & 0xffffffffull;
+    uint64_t workerCount = workerInfo >> flagcxReduceWorkerOffWorkerCount;
+    uint64_t elementOffset = 0;
+    uint64_t elementCount = 0;
+    computeReduceWorkerRange(count, workerId, workerCount, &elementOffset,
+                             &elementCount);
+    flagcxReduceKernel(fst, snd, out, elementOffset, elementCount, nthreads,
+                       datatype, redop);
     FLAGCX_DEVICE_SYNC_THREADS();
     FLAGCX_DEVICE_THREAD_FENCE();
 
@@ -242,7 +308,11 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
     if (tid == 0) {
       flagcxReduceTrigger *t =
           (flagcxReduceTrigger *)(vBuf + flagcxFifoIdxData) + slot;
-      t->setComplete();
+      if (workerCount == 0) {
+        t->setComplete();
+      } else {
+        t->completeReduceWorker();
+      }
     }
   }
 }

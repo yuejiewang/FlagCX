@@ -48,6 +48,11 @@ FLAGCX_HOST_DECORATOR flagcxResult_t enqueue(void *fifoBuffer, uint64_t addr1,
                                              flagcxRedOp_t redop,
                                              uint64_t flagIn,
                                              uint64_t flagOut, int *idx);
+FLAGCX_HOST_DECORATOR flagcxResult_t enqueueReduceWorker(
+    void *fifoBuffer, uint64_t addr1, uint64_t addr2, uint64_t addr3,
+    size_t count, size_t nthreads, flagcxDataType_t datatype,
+    flagcxRedOp_t redop, uint32_t workerId, uint32_t workerCount,
+    uint64_t completionCounter, uint64_t flagIn, uint64_t flagOut, int *idx);
 #ifdef COMPILE_KERNEL
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(volatile uint64_t *buffer,
                                                       int *idx);

@@ -14,7 +14,7 @@
 
 using Json = nlohmann::json;
 
-inline constexpr int kUniRunnerDagCacheFormatVersion = 1;
+inline constexpr int kUniRunnerDagCacheFormatVersion = 2;
 
 enum uniRunnerDagBufferType {
   uniRunnerDagBufferTypeNone = 0,
