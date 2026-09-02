@@ -1,6 +1,7 @@
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 #include "device_api/comm_traits.h"
+#include "flagcx_basic_gemm_device.cuh"
 
 #define SLOT_IDX 4
 #define FST_IDX 5
@@ -12,6 +13,10 @@
 #define REDOP_IDX 11
 #define FLAG_IN_IDX 12
 #define FLAG_OUT_IDX 13
+#define COMPUTE_TYPE_IDX 14
+#define GEMM_MN_IDX 15
+#define GEMM_K_LDA_IDX 16
+#define GEMM_LDB_LDC_IDX 17
 #define WORKER_INFO_IDX 18
 #define COMPLETION_COUNTER_IDX 19
 
@@ -70,6 +75,11 @@ FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getRedop() {
 FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getState() {
   return value[3] >> flagcxReduceTriggerOffState &
          flagcxTriggerMask(flagcxReduceTriggerBitsState);
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t
+flagcxReduceTrigger::getComputeType() {
+  return value[3] >> flagcxReduceTriggerOffComputeType &
+         flagcxTriggerMask(flagcxReduceTriggerBitsComputeType);
 }
 FLAGCX_DEVICE_INLINE_DECORATOR void flagcxReduceTrigger::setComplete() {
   publishOutputDone();
@@ -130,6 +140,28 @@ flagcxReduceTrigger::completeReduceWorker() {
     publishOutputDone();
   }
   recycle();
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getGemmM() {
+  return value[6] >> 32;
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getGemmN() {
+  return value[6] & 0xffffffffull;
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getGemmK() {
+  return value[7] >> 32;
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getGemmLda() {
+  return value[7] & 0xffffffffull;
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getGemmLdb() {
+  return value[8] >> 32;
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t flagcxReduceTrigger::getGemmLdc() {
+  return value[8] & 0xffffffffull;
+}
+FLAGCX_DEVICE_INLINE_DECORATOR uint64_t
+flagcxReduceTrigger::getGemmAccumulate() {
+  return value[9] & 1ull;
 }
 
 FLAGCX_DEVICE_INLINE_DECORATOR flagcxResult_t dequeue(uint64_t *buffer,
@@ -246,10 +278,18 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
         shm[REDOP_IDX] = t->getRedop();
         shm[FLAG_IN_IDX] = t->getFlagIn();
         shm[FLAG_OUT_IDX] = t->getFlagOut();
-        shm[WORKER_INFO_IDX] =
-            t->getReduceWorkerCount() << flagcxReduceWorkerOffWorkerCount |
-            t->getReduceWorkerId();
-        shm[COMPLETION_COUNTER_IDX] = t->getReduceCompletionCounter();
+        shm[COMPUTE_TYPE_IDX] = t->getComputeType();
+        if (shm[COMPUTE_TYPE_IDX] == flagcxComputeTriggerReduce) {
+          shm[WORKER_INFO_IDX] =
+              t->getReduceWorkerCount() << flagcxReduceWorkerOffWorkerCount |
+              t->getReduceWorkerId();
+          shm[COMPLETION_COUNTER_IDX] = t->getReduceCompletionCounter();
+        } else if (shm[COMPUTE_TYPE_IDX] == flagcxComputeTriggerGemm) {
+          shm[GEMM_MN_IDX] = t->getGemmM() << 32 | t->getGemmN();
+          shm[GEMM_K_LDA_IDX] = t->getGemmK() << 32 | t->getGemmLda();
+          shm[GEMM_LDB_LDC_IDX] = t->getGemmLdb() << 32 | t->getGemmLdc();
+          shm[WORKER_INFO_IDX] = t->getGemmAccumulate();
+        }
       }
     }
     FLAGCX_DEVICE_SYNC_THREADS();
@@ -283,7 +323,7 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
       DeviceAPI::Intrin::spinBackoff(emptyIter);
     }
 
-    // (4) perform reduce task
+    // (4) perform compute task
     emptyIter = 0;
     uint64_t fst = shm[FST_IDX];
     uint64_t snd = shm[SND_IDX];
@@ -292,15 +332,27 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
     uint64_t nthreads = shm[NTHREADS_IDX];
     uint64_t datatype = shm[DATATYPE_IDX];
     uint64_t redop = shm[REDOP_IDX];
-    uint64_t workerInfo = shm[WORKER_INFO_IDX];
-    uint64_t workerId = workerInfo & 0xffffffffull;
-    uint64_t workerCount = workerInfo >> flagcxReduceWorkerOffWorkerCount;
-    uint64_t elementOffset = 0;
-    uint64_t elementCount = 0;
-    computeReduceWorkerRange(count, workerId, workerCount, &elementOffset,
-                             &elementCount);
-    flagcxReduceKernel(fst, snd, out, elementOffset, elementCount, nthreads,
-                       datatype, redop);
+    uint64_t computeType = shm[COMPUTE_TYPE_IDX];
+    uint64_t reduceWorkerCount = 0;
+    if (computeType == flagcxComputeTriggerReduce) {
+      uint64_t workerInfo = shm[WORKER_INFO_IDX];
+      uint64_t workerId = workerInfo & 0xffffffffull;
+      reduceWorkerCount = workerInfo >> flagcxReduceWorkerOffWorkerCount;
+      uint64_t elementOffset = 0;
+      uint64_t elementCount = 0;
+      computeReduceWorkerRange(count, workerId, reduceWorkerCount,
+                               &elementOffset, &elementCount);
+      flagcxReduceKernel(fst, snd, out, elementOffset, elementCount, nthreads,
+                         datatype, redop);
+    } else if (computeType == flagcxComputeTriggerGemm) {
+      uint64_t mn = shm[GEMM_MN_IDX];
+      uint64_t kLda = shm[GEMM_K_LDA_IDX];
+      uint64_t ldbLdc = shm[GEMM_LDB_LDC_IDX];
+      flagcxBasicGemmDevice(fst, snd, out, mn >> 32, mn & 0xffffffffull,
+                           kLda >> 32, kLda & 0xffffffffull, ldbLdc >> 32,
+                           ldbLdc & 0xffffffffull, nthreads,
+                           shm[WORKER_INFO_IDX] & 1ull);
+    }
     FLAGCX_DEVICE_SYNC_THREADS();
     FLAGCX_DEVICE_THREAD_FENCE();
 
@@ -308,10 +360,16 @@ FLAGCX_GLOBAL_DECORATOR void flagcxCollectiveKernel(void *fifoBuffer) {
     if (tid == 0) {
       flagcxReduceTrigger *t =
           (flagcxReduceTrigger *)(vBuf + flagcxFifoIdxData) + slot;
-      if (workerCount == 0) {
+      if (computeType == flagcxComputeTriggerReduce) {
+        if (reduceWorkerCount == 0) {
+          t->setComplete();
+        } else {
+          t->completeReduceWorker();
+        }
+      } else if (computeType == flagcxComputeTriggerGemm) {
         t->setComplete();
       } else {
-        t->completeReduceWorker();
+        t->recycle();
       }
     }
   }

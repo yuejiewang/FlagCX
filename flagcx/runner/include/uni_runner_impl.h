@@ -20,7 +20,8 @@
 typedef enum {
   uniRunnerDagNodeTypeP2p = 0,
   uniRunnerDagNodeTypeRed = 1,
-  uniRunnerDagNodeTypeCpy = 2
+  uniRunnerDagNodeTypeCpy = 2,
+  uniRunnerDagNodeTypeGemm = 3
 } uniRunnerDagNodeType;
 
 // Static DAG template algorithm identifiers used by the uniRunner cache.
@@ -80,6 +81,22 @@ struct uniRunnerRedNodeData {
   int triggerIdx; // Trigger index in FIFO
 };
 
+struct uniRunnerGemmNodeData {
+  const void *a;
+  const void *b;
+  void *c;
+  uint32_t m;
+  uint32_t n;
+  uint32_t k;
+  uint32_t lda;
+  uint32_t ldb;
+  uint32_t ldc;
+  size_t nthreads;
+  flagcxDataType_t datatype;
+  int accumulate;
+  int triggerIdx;
+};
+
 // Copy node data (operation-specific fields only)
 struct uniRunnerCpyNodeData {
   void *src;
@@ -106,6 +123,7 @@ struct uniRunnerDagNode {
     struct uniRunnerP2pNodeData p2p;
     struct uniRunnerRedNodeData red;
     struct uniRunnerCpyNodeData cpy;
+    struct uniRunnerGemmNodeData gemm;
   } nodeData;
 };
 
@@ -179,6 +197,10 @@ flagcxResult_t initUniRunnerStateTreeRed(flagcxUniRunnerState *runnerState,
                                          flagcxRedOp_t op, int root,
                                          flagcxComm_t comm);
 size_t getUniRunnerDagPatternHash(const uniRunnerDagCacheKey &key);
+flagcxResult_t allocDagNodeDeps(uniRunnerDagNode *node);
+flagcxResult_t setDagNodeParent(uniRunnerDagNode *node, int parentSlot,
+                               int parentIdx);
+flagcxResult_t validateDagNodes(flagcxUniRunnerState *runnerState);
 flagcxResult_t initUniRunner(flagcxComm_t comm, flagcxStream_t stream);
 flagcxResult_t cleanupUniRunner(flagcxComm_t comm);
 flagcxResult_t

@@ -58,6 +58,11 @@ typedef enum {
 } flagcxReduceTriggerState;
 
 typedef enum {
+  flagcxComputeTriggerReduce = 0,
+  flagcxComputeTriggerGemm = 1
+} flagcxComputeTriggerType;
+
+typedef enum {
   flagcxStreamFlagIdle = 0,
   flagcxStreamFlagPend = 1,
   flagcxStreamFlagDone = 2
@@ -156,6 +161,9 @@ constexpr unsigned int flagcxReduceTriggerOffState =
     flagcxReduceTriggerOffRedop + flagcxReduceTriggerBitsRedop;
 /* op state: 0 for available, 1 for enqueued, 2 for in-progress, 3 for done */
 constexpr unsigned int flagcxReduceTriggerBitsState = 2;
+constexpr unsigned int flagcxReduceTriggerOffComputeType =
+    flagcxReduceTriggerOffState + flagcxReduceTriggerBitsState;
+constexpr unsigned int flagcxReduceTriggerBitsComputeType = 2;
 constexpr unsigned int flagcxReduceTriggerBitsFifoReserved = 1;
 
 constexpr unsigned int flagcxReduceWorkerOffWorkerId = 0;
@@ -220,6 +228,7 @@ struct alignas(16) flagcxReduceTrigger {
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getDatatype();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getRedop();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getState();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getComputeType();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getFlagIn();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getFlagOut();
   FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getReduceWorkerId();
@@ -228,6 +237,13 @@ struct alignas(16) flagcxReduceTrigger {
   FLAGCX_DEVICE_INLINE_DECORATOR void publishOutputDone();
   FLAGCX_DEVICE_INLINE_DECORATOR void recycle();
   FLAGCX_DEVICE_INLINE_DECORATOR void completeReduceWorker();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmM();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmN();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmK();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmLda();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmLdb();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmLdc();
+  FLAGCX_DEVICE_INLINE_DECORATOR uint64_t getGemmAccumulate();
   FLAGCX_DEVICE_INLINE_DECORATOR void setComplete();
 #endif
   FLAGCX_HOST_DECORATOR void setValue(uint64_t fst, uint64_t snd, uint64_t out,
@@ -240,6 +256,11 @@ struct alignas(16) flagcxReduceTrigger {
       uint64_t fst, uint64_t snd, uint64_t out, size_t count,
       size_t nthreads, flagcxDataType_t datatype, flagcxRedOp_t redOp,
       uint32_t workerId, uint32_t workerCount, uint64_t completionCounter,
+      flagcxReduceTriggerState state, uint64_t flagIn, uint64_t flagOut);
+  FLAGCX_HOST_DECORATOR void setGemmValue(
+      uint64_t a, uint64_t b, uint64_t c, uint32_t m, uint32_t n, uint32_t k,
+      uint32_t lda, uint32_t ldb, uint32_t ldc, size_t nthreads,
+      flagcxDataType_t datatype, int accumulate,
       flagcxReduceTriggerState state, uint64_t flagIn, uint64_t flagOut);
   FLAGCX_HOST_DECORATOR uint64_t pollState();
   FLAGCX_HOST_DECORATOR void setState(int state);
