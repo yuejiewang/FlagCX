@@ -39,6 +39,13 @@ flagcxResult_t flagcxTopoGetNetDev(struct flagcxHeteroComm *comm, int rank,
                                    struct flagcxTopoGraph *graph, int channelId,
                                    int peerRank, int64_t *id, int *dev,
                                    int *proxyRank);
+// Select a local NIC corresponding to the receiver's device and an optional
+// sender-side relay. The receiver advertises its actual NIC for route checks.
+// logicalRanksPerNode is used only by single-host PXN CI simulations.
+flagcxResult_t flagcxTopoSelectNetRoute(
+    struct flagcxTopoServer *local, struct flagcxTopoServer *remote,
+    struct flagcxInterServerTopo *interServer, int sourceRank, int peerRank,
+    int remoteNetDev, int *netDev, int *relayRank, int logicalRanksPerNode = 0);
 flagcxResult_t flagcxTopoCheckP2p(struct flagcxTopoServer *topoServer,
                                   int64_t id1, int64_t id2, int *p2p, int *read,
                                   int *intermediateRank);
@@ -55,6 +62,11 @@ flagcxResult_t flagcxTopoCheckNet(struct flagcxTopoServer *topoServer,
 int flagcxPxnDisable(struct flagcxHeteroComm *comm);
 flagcxResult_t flagcxTopoGetPxnRanks(struct flagcxHeteroComm *comm,
                                      int **intermediateRanks, int *nranks);
+// Return the GPU closest to a NIC when it can relay from the source GPU.
+flagcxResult_t flagcxTopoSelectPxnRelay(struct flagcxTopoServer *topoServer,
+                                        int apuIndex, int netIndex,
+                                        int *relayRank,
+                                        int logicalRanksPerNode = 0);
 
 // Find CPU affinity
 flagcxResult_t flagcxTopoGetCpuAffinity(struct flagcxTopoServer *topoServer,

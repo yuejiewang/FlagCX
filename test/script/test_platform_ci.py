@@ -283,6 +283,14 @@ class PlatformCiRegressionTest(unittest.TestCase):
             '{"platform":"metax","display_name":"MetaX Tests"},'
             '{"platform":"ppu","display_name":"T-Head PPU Tests"}]}',
         )
+        unit_workflow = (
+            REPO_ROOT / ".github/workflows/unit-test.yml"
+        ).read_text()
+        self.assertIn(
+            "FLAGCX_CI_PLATFORM: ${{ github.event.inputs.platform || 'all' }}",
+            unit_workflow,
+        )
+        self.assertNotIn("pull_request.number == 648", unit_workflow)
 
         expected_suites = {
             "cuda": [
@@ -351,6 +359,7 @@ class PlatformCiRegressionTest(unittest.TestCase):
             trigger = workflow[: workflow.index("\njobs:")]
             self.assertIn("pull_request:", trigger)
             self.assertIn("push:", trigger)
+            self.assertNotIn("pull_request.number != 648", workflow)
 
     def test_reference_platform_coverage_is_explicit(self):
         perf_workflow = (REPO_ROOT / ".github/workflows/test.yml").read_text()
@@ -1046,6 +1055,10 @@ class PlatformCiRegressionTest(unittest.TestCase):
         ppu_forced_net = ppu_forced_net[:ppu_forced_net.index("return")]
         self.assertIn("FLAGCX_CI_EXPECT_NET_ADAPTOR=BAREX", ppu_forced_net)
         self.assertIn("FLAGCX_CI_EXPECT_COLL_MULTICHANNEL=1", ppu_forced_net)
+        self.assertIn('FLAGCX_CI_MPI_LABEL="runner PPU PXN eight-rank"', ppu_forced_net)
+        self.assertIn("FLAGCX_PXN_DISABLE=0", ppu_forced_net)
+        self.assertIn("FLAGCX_CI_PXN_RANKS_PER_NODE=4", ppu_forced_net)
+        self.assertIn("FLAGCX_CI_EXPECT_PXN=1", ppu_forced_net)
 
     def test_p2p_ci_runs_write_only_engine_coverage(self):
         unit_runner = (
@@ -1161,12 +1174,26 @@ class PlatformCiRegressionTest(unittest.TestCase):
         self.assertIn("FLAGCX_IB_RETRY_CNT=1", runner_case)
         self.assertIn('"${runner_net_platform_env[@]}"', runner_case)
         self.assertEqual(
-            runner_case.count("./build/bin/runner_mpi_tests"), 4
+            runner_case.count("./build/bin/runner_mpi_tests"), 5
         )
         self.assertIn("FLAGCX_CI_EXPECT_RUNNER_MODE=HOMO", runner_case)
         self.assertEqual(
-            runner_case.count("FLAGCX_CI_EXPECT_RUNNER_MODE=HYBRID"), 3
+            runner_case.count("FLAGCX_CI_EXPECT_RUNNER_MODE=HYBRID"), 4
         )
+        self.assertIn('"${FLAGCX_CI_ENABLE_PXN:-1}" == "1"', runner_case)
+        self.assertIn('FLAGCX_CI_EXPECT_PXN=1', runner_case)
+        self.assertIn('FLAGCX_PXN_DISABLE=1', runner_case)
+        self.assertIn('FLAGCX_PXN_DISABLE=0', runner_case)
+        self.assertIn('FLAGCX_CI_PXN_RANKS_PER_NODE=4', runner_case)
+        pxn_case = runner_case[
+            runner_case.index('if [[ "${FLAGCX_CI_ENABLE_PXN:-1}" == "1" ]]') :
+        ]
+        self.assertIn('pxn_launcher+=(CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7)', pxn_case)
+        self.assertIn('-x CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7', pxn_case)
+        self.assertIn('"$MPI_RUNNER" -np 8', pxn_case)
+        self.assertIn('FLAGCX_CI_MPI_LABEL="runner $platform_name PXN eight-rank"', pxn_case)
+        self.assertNotIn('FLAGCX_CI_ENABLE_PXN_INTERSERVER', runner_case)
+        self.assertIn('FLAGCX_CI_EXPECT_PEER_TRANSPORT=NET', runner_case)
         self.assertIn("FLAGCX_CI_EXPECT_PEER_TRANSPORT=P2P", runner_case)
         self.assertIn("FLAGCX_CI_EXPECT_PEER_TRANSPORT=NET", runner_case)
         self.assertNotIn("--gtest_filter=FlagCXCollTest.Scatter", runner_case)

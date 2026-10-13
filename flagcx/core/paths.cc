@@ -12,6 +12,281 @@
 
 // Pre-compute GPU->NIC, GPU->GPU and NIC->GPU paths
 
+// Remain disabled until topology discovery and cross-process proxy submission
+// are connected. An explicit opt-in must never silently rewrite NET paths.
+FLAGCX_PARAM(PxnDisable, "PXN_DISABLE", 1);
+
+int flagcxPxnDisable(struct flagcxHeteroComm *comm) {
+  (void)comm;
+  return flagcxParamPxnDisable();
+}
+
+static bool flagcxTopoApuCanUseNet(const flagcxTopoNode *apu,
+                                   const flagcxTopoNode *net) {
+  return apu->apu.gdrSupport && net->net.gdrSupport;
+}
+
+flagcxResult_t flagcxTopoSelectPxnRelay(struct flagcxTopoServer *topoServer,
+                                        int apuIndex, int netIndex,
+                                        int *relayRank,
+                                        int logicalRanksPerNode) {
+  if (topoServer == NULL || relayRank == NULL || apuIndex < 0 || netIndex < 0 ||
+      apuIndex >= topoServer->nodes[APU].count ||
+      netIndex >= topoServer->nodes[NET].count || logicalRanksPerNode < 0)
+    return flagcxInvalidArgument;
+
+  const flagcxTopoNode *source = topoServer->nodes[APU].nodes + apuIndex;
+  if (source->paths[APU] == NULL || source->paths[NET] == NULL)
+    return flagcxInvalidArgument;
+  *relayRank = source->apu.rank;
+  const flagcxTopoNode *net = topoServer->nodes[NET].nodes + netIndex;
+  // NCCL first finds the GPU local to this NIC. Select that GPU by the NIC
+  // path alone; the source-to-relay path is an eligibility check, not a score.
+  int localGpuIndex = -1;
+  float bestBw = 0;
+  int bestType = PATH_DIS;
+  for (int i = 0; i < topoServer->nodes[APU].count; i++) {
+    const flagcxTopoNode *candidate = topoServer->nodes[APU].nodes + i;
+    if (candidate->paths[NET] == NULL ||
+        FLAGCX_TOPO_ID_SERVER_ID(candidate->id) !=
+            FLAGCX_TOPO_ID_SERVER_ID(source->id))
+      continue;
+    if (logicalRanksPerNode > 0 && candidate->apu.rank / logicalRanksPerNode !=
+                                       source->apu.rank / logicalRanksPerNode)
+      continue;
+    const flagcxTopoPath *netPath = candidate->paths[NET] + netIndex;
+    if (netPath->bw > bestBw ||
+        (netPath->bw == bestBw && netPath->type < bestType)) {
+      localGpuIndex = i;
+      bestBw = netPath->bw;
+      bestType = netPath->type;
+    }
+  }
+  if (localGpuIndex < 0 || localGpuIndex == apuIndex)
+    return flagcxSuccess;
+  const flagcxTopoNode *candidate =
+      topoServer->nodes[APU].nodes + localGpuIndex;
+  const flagcxTopoPath *netPath = candidate->paths[NET] + netIndex;
+  const flagcxTopoPath *peerPath = source->paths[APU] + localGpuIndex;
+  // Match NCCL's default P2P aggregation policy: the NIC-local GPU may
+  // relay even when a direct PCI path has the same bandwidth.
+  if (flagcxTopoApuCanUseNet(candidate, net) && peerPath->type <= PATH_CCI &&
+      peerPath->bw > 0 && netPath->type <= PATH_PXB && netPath->bw > 0)
+    *relayRank = candidate->apu.rank;
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxTopoSelectNetRoute(
+    struct flagcxTopoServer *local, struct flagcxTopoServer *remote,
+    struct flagcxInterServerTopo *interServer, int sourceRank, int peerRank,
+    int remoteNetDev, int *netDev, int *relayRank, int logicalRanksPerNode) {
+  if (local == NULL || remote == NULL || interServer == NULL ||
+      netDev == NULL || relayRank == NULL || logicalRanksPerNode < 0)
+    return flagcxInvalidArgument;
+
+  int sourceIndex = -1;
+  for (int i = 0; i < local->nodes[APU].count; ++i) {
+    if (local->nodes[APU].nodes[i].apu.rank == sourceRank) {
+      sourceIndex = i;
+      break;
+    }
+  }
+  if (sourceIndex < 0)
+    return flagcxInvalidArgument;
+
+  const flagcxTopoNode *peer = NULL;
+  for (int i = 0; i < remote->nodes[APU].count; ++i) {
+    if (remote->nodes[APU].nodes[i].apu.rank == peerRank) {
+      peer = remote->nodes[APU].nodes + i;
+      break;
+    }
+  }
+  if (peer == NULL)
+    return flagcxInvalidArgument;
+
+  // Use the NIC advertised by the receiver. Its topology-preferred NIC may
+  // differ when FLAGCX_TOPO_FILE overrides the device choice.
+  struct flagcxTopoNode *remoteNet = NULL;
+  for (int i = 0; i < remote->nodes[NET].count; ++i) {
+    if (remote->nodes[NET].nodes[i].net.dev == remoteNetDev) {
+      remoteNet = remote->nodes[NET].nodes + i;
+      break;
+    }
+  }
+  if (remoteNet == NULL)
+    return flagcxInvalidArgument;
+
+  const flagcxTopoNode *source = local->nodes[APU].nodes + sourceIndex;
+  if (source->paths[NET] == NULL)
+    return flagcxInvalidArgument;
+
+  // Match the receiver's GPU device number to a GPU on the sending node,
+  // then use that GPU's preferred local NIC, as NCCL does for P2P NET.
+  // CI places two logical nodes on one physical host, so device numbers are
+  // normalized within each logical group only in that explicit test mode.
+  const int peerDev = logicalRanksPerNode > 0
+                          ? peer->apu.dev % logicalRanksPerNode
+                          : peer->apu.dev;
+  int preferredRank = -1;
+  for (int i = 0; i < local->nodes[APU].count; ++i) {
+    const flagcxTopoNode *candidate = local->nodes[APU].nodes + i;
+    if (FLAGCX_TOPO_ID_SERVER_ID(candidate->id) !=
+            FLAGCX_TOPO_ID_SERVER_ID(source->id) ||
+        (logicalRanksPerNode > 0 && candidate->apu.rank / logicalRanksPerNode !=
+                                        sourceRank / logicalRanksPerNode))
+      continue;
+    const int candidateDev = logicalRanksPerNode > 0
+                                 ? candidate->apu.dev % logicalRanksPerNode
+                                 : candidate->apu.dev;
+    if (candidateDev == peerDev) {
+      preferredRank = candidate->apu.rank;
+      break;
+    }
+  }
+
+  int candidateDevs[FLAGCX_TOPO_MAX_NODES] = {};
+  int candidateDevCount = 0;
+  auto addCandidateDev = [&](int dev) {
+    if (dev < 0)
+      return;
+    for (int i = 0; i < candidateDevCount; ++i) {
+      if (candidateDevs[i] == dev)
+        return;
+    }
+    if (candidateDevCount < FLAGCX_TOPO_MAX_NODES)
+      candidateDevs[candidateDevCount++] = dev;
+  };
+  if (preferredRank >= 0) {
+    int preferredDev = -1;
+    if (flagcxTopoGetLocalNet(local, preferredRank, &preferredDev) ==
+        flagcxSuccess)
+      addCandidateDev(preferredDev);
+  }
+  int sourceDev = -1;
+  if (flagcxTopoGetLocalNet(local, sourceRank, &sourceDev) == flagcxSuccess)
+    addCandidateDev(sourceDev);
+  // FlagCX can describe asymmetric NIC reachability. Preserve a deterministic
+  // route fallback after the NCCL-style preferred NIC; never score PXN relays
+  // across all NICs by aggregate bandwidth.
+  for (int n = 0; n < local->nodes[NET].count; ++n)
+    addCandidateDev(local->nodes[NET].nodes[n].net.dev);
+  for (int choice = 0; choice < candidateDevCount; ++choice) {
+    for (int n = 0; n < local->nodes[NET].count; ++n) {
+      const flagcxTopoNode *net = local->nodes[NET].nodes + n;
+      if (net->net.dev != candidateDevs[choice])
+        continue;
+      bool reachable = false;
+      if (local->serverId == remote->serverId && net->id == remoteNet->id) {
+        reachable = net->net.bw > 0 && remoteNet->net.bw > 0;
+      } else {
+        auto localRoutes = interServer->routeMap.find(net->net.guid);
+        if (localRoutes != interServer->routeMap.end()) {
+          auto route = localRoutes->second.find(remoteNet->net.guid);
+          reachable = route != localRoutes->second.end() &&
+                      route->second != NULL && route->second->interBw > 0;
+        }
+        // CI's two logical nodes share a physical network. The forced-NET
+        // baseline and this end-to-end test exercise the actual NIC pair.
+        if (!reachable && logicalRanksPerNode > 0 &&
+            local->serverId == remote->serverId)
+          reachable = net->net.bw > 0 && remoteNet->net.bw > 0;
+      }
+      if (!reachable)
+        continue;
+
+      int candidateRank = sourceRank;
+      FLAGCXCHECK(flagcxTopoSelectPxnRelay(
+          local, sourceIndex, n, &candidateRank, logicalRanksPerNode));
+      int candidateIndex = sourceIndex;
+      for (int i = 0; i < local->nodes[APU].count; ++i) {
+        if (local->nodes[APU].nodes[i].apu.rank == candidateRank) {
+          candidateIndex = i;
+          break;
+        }
+      }
+      const flagcxTopoNode *sender = local->nodes[APU].nodes + candidateIndex;
+      const flagcxTopoPath *netPath = sender->paths[NET] + n;
+      if (!flagcxTopoApuCanUseNet(sender, net) || netPath->type > PATH_PXB ||
+          netPath->bw <= 0)
+        continue;
+      *netDev = net->net.dev;
+      *relayRank = candidateRank;
+      return flagcxSuccess;
+    }
+  }
+  return flagcxNotSupported;
+}
+
+flagcxResult_t flagcxTopoGetNetDev(struct flagcxHeteroComm *comm, int rank,
+                                   struct flagcxTopoGraph *graph, int channelId,
+                                   int peerRank, int64_t *id, int *dev,
+                                   int *proxyRank) {
+  (void)graph;
+  (void)channelId;
+  if (comm == NULL || id == NULL || dev == NULL || proxyRank == NULL)
+    return flagcxInvalidArgument;
+  *dev = comm->netDev;
+  *proxyRank = rank;
+  *id = -1;
+  if (comm->topoServer == NULL)
+    return flagcxSuccess;
+  for (int n = 0; n < comm->topoServer->nodes[NET].count; ++n) {
+    const flagcxTopoNode *net = comm->topoServer->nodes[NET].nodes + n;
+    if (net->net.dev == *dev) {
+      *id = net->id;
+      break;
+    }
+  }
+  // The transport still uses process-local operations and buffers. Exposing
+  // another proxy rank here before remote submission is implemented would
+  // silently corrupt a live send connection.
+  (void)peerRank;
+  return flagcxSuccess;
+}
+
+flagcxResult_t
+flagcxTopoGetIntermediateRank(struct flagcxTopoServer *topoServer, int rank,
+                              int64_t netId, int *intermediateRank) {
+  if (topoServer == NULL || intermediateRank == NULL)
+    return flagcxInvalidArgument;
+  int apuIndex = -1;
+  int netIndex = -1;
+  for (int i = 0; i < topoServer->nodes[APU].count; ++i) {
+    if (topoServer->nodes[APU].nodes[i].apu.rank == rank) {
+      apuIndex = i;
+      break;
+    }
+  }
+  for (int i = 0; i < topoServer->nodes[NET].count; ++i) {
+    if (topoServer->nodes[NET].nodes[i].id == netId) {
+      netIndex = i;
+      break;
+    }
+  }
+  if (apuIndex < 0 || netIndex < 0)
+    return flagcxInvalidArgument;
+  const flagcxTopoNode *source = topoServer->nodes[APU].nodes + apuIndex;
+  if (source->paths[NET] == NULL)
+    return flagcxInvalidArgument;
+  const flagcxTopoPath *path = source->paths[NET] + netIndex;
+  if (path->type != PATH_PXN) {
+    *intermediateRank = rank;
+    return flagcxSuccess;
+  }
+  for (int i = 0; i < path->count; ++i) {
+    if (path->list[i] == NULL || path->list[i]->remNode == NULL)
+      return flagcxInternalError;
+    const flagcxTopoNode *node = path->list[i]->remNode;
+    if (node->type == APU && node != source &&
+        FLAGCX_TOPO_ID_SERVER_ID(node->id) ==
+            FLAGCX_TOPO_ID_SERVER_ID(source->id)) {
+      *intermediateRank = node->apu.rank;
+      return flagcxSuccess;
+    }
+  }
+  return flagcxInternalError;
+}
+
 struct flagcxTopoNodeList {
   struct flagcxTopoNode *list[FLAGCX_TOPO_MAX_NODES];
   int count;
@@ -55,6 +330,10 @@ static flagcxResult_t flagcxTopoSetPaths(struct flagcxTopoNode *baseNode,
     nextNodeList.count = 0;
     for (int n = 0; n < nodeList.count; n++) {
       struct flagcxTopoNode *node = nodeList.list[n];
+      // APU paths may end at a peer APU, but a peer must not become an
+      // implicit transit hop when computing the receiver's local NIC path.
+      if (node->type == APU && node != baseNode)
+        continue;
       struct flagcxTopoPath *path;
       FLAGCXCHECK(
           getPath(topoServer, node, baseNode->type, baseNode->id, &path));
