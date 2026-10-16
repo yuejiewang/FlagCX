@@ -49,10 +49,10 @@ FLAGCX_CI_PROJECT_MAKE_ARGS=(
 FLAGCX_CI_TEST_MAKE_ARGS=("${FLAGCX_CI_COMMON_MAKE_ARGS[@]}")
 FLAGCX_CI_ENABLE_SHARED_P2P_ENGINE=1
 
-FLAGCX_CI_INTRA_NP=8
-FLAGCX_CI_NODE_NP=4
-FLAGCX_CI_RUNNER_NP=8
-export NP=8
+FLAGCX_CI_INTRA_NP=4
+FLAGCX_CI_NODE_NP=2
+FLAGCX_CI_RUNNER_NP=4
+export NP=4
 
 # The Hygon CI host exposes two mutually reachable SHCA pairs. Keep the RDMA
 # integration suites on the verified shca_0 <-> shca_3 fabric until runtime
@@ -61,6 +61,10 @@ export NP=8
 FLAGCX_CI_HYGON_CONNECTED_HCAS=shca_0,shca_3
 FLAGCX_CI_HYGON_TWO_GPU_DEVICES=0,7
 FLAGCX_CI_HYGON_FOUR_GPU_DEVICES=0,1,6,7
+# Put the NIC-distant GPUs at ranks 0 and 2, with their local relay GPUs at
+# ranks 1 and 3. Both PXN sends then use the verified shca_0/shca_3 fabric.
+FLAGCX_CI_PXN_VISIBLE_DEVICES=2,0,6,7
+FLAGCX_CI_PXN_HCAS=shca_0,shca_3
 
 FLAGCX_CI_NODE1_MPI_ARGS=(
   -x CUDA_VISIBLE_DEVICES=0,1
@@ -86,10 +90,6 @@ flagcx_ci_configure_suite() {
     runner|symmem)
       export CUDA_VISIBLE_DEVICES="$FLAGCX_CI_HYGON_FOUR_GPU_DEVICES"
       export FLAGCX_IB_HCA="$FLAGCX_CI_HYGON_CONNECTED_HCAS"
-      if [[ "$suite" == "runner" ]]; then
-        FLAGCX_CI_RUNNER_NP=4
-        export NP=4
-      fi
       ;;
     device_api)
       FLAGCX_CI_PROJECT_MAKE_ARGS+=(COMPILE_KERNEL=1)

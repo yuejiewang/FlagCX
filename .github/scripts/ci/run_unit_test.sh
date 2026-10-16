@@ -686,23 +686,30 @@ run_suite() {
       if [[ "${FLAGCX_CI_ENABLE_PXN:-1}" == "1" ]]; then
         local -a pxn_platform_env=()
         local -a pxn_launcher=(env)
-        if [[ "$platform_name" == "hygon" ]]; then
-          # The baseline uses four visible DCUs. Expose all eight here so
-          # ranks 0-3 and 4-7 form the same two logical groups as other CI
-          # platforms.
-          pxn_launcher+=(CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7)
+        if [[ -n "${FLAGCX_CI_PXN_HCAS:-}" ]]; then
+          # Use the platform's PXN HCA selection for the launcher and ranks.
+          pxn_launcher+=(FLAGCX_IB_HCA="$FLAGCX_CI_PXN_HCAS")
           pxn_platform_env+=(
-            -x CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-            -x FLAGCX_IB_HCA="$FLAGCX_CI_HYGON_CONNECTED_HCAS"
+            -x FLAGCX_IB_HCA="$FLAGCX_CI_PXN_HCAS"
           )
         fi
-        FLAGCX_CI_MPI_LABEL="runner $platform_name PXN eight-rank" \
-          "${pxn_launcher[@]}" "$MPI_RUNNER" -np 8 --allow-run-as-root \
+        if [[ -n "${FLAGCX_CI_PXN_VISIBLE_DEVICES:-}" ]]; then
+          local pxn_visible_devices_var=CUDA_VISIBLE_DEVICES
+          if [[ "$platform_name" == "metax" ]]; then
+            pxn_visible_devices_var=MACA_VISIBLE_DEVICES
+          fi
+          pxn_launcher+=("$pxn_visible_devices_var=$FLAGCX_CI_PXN_VISIBLE_DEVICES")
+          pxn_platform_env+=(
+            -x "$pxn_visible_devices_var=$FLAGCX_CI_PXN_VISIBLE_DEVICES"
+          )
+        fi
+        FLAGCX_CI_MPI_LABEL="runner $platform_name PXN four-rank" \
+          "${pxn_launcher[@]}" "$MPI_RUNNER" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
           -x FLAGCX_MEM_ENABLE=1 \
           -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
           -x FLAGCX_P2P_DISABLE=1 \
           -x FLAGCX_PXN_DISABLE=0 \
-          -x FLAGCX_CI_PXN_RANKS_PER_NODE=4 \
+          -x FLAGCX_CI_PXN_RANKS_PER_NODE="$FLAGCX_CI_NODE_NP" \
           -x FLAGCX_VMM_ENABLE=0 \
           -x FLAGCX_CI_EXPECT_RUNNER_MODE=HYBRID \
           -x FLAGCX_CI_EXPECT_PEER_TRANSPORT=NET \
