@@ -65,7 +65,7 @@ flagcx_ci_require_rdma() {
   esac
 
   case "$suite" in
-    adaptor|p2p|rma|runner|symmem) ;;
+    adaptor|p2p|rma|runner|symmem|device_api|device_api_unified_ir) ;;
     *) return 0 ;;
   esac
 
@@ -143,6 +143,9 @@ run_device_api() {
     -x FLAGCX_IB_QPS_PER_CONNECTION=2
     -x LD_LIBRARY_PATH
   )
+  if declare -p FLAGCX_CI_DEVICE_API_MPI_ARGS >/dev/null 2>&1; then
+    common_env+=("${FLAGCX_CI_DEVICE_API_MPI_ARGS[@]}")
+  fi
   local -a flags=(-b 1M -e 4M -f 2 -R 1)
 
   declare -p FLAGCX_CI_NODE1_MPI_ARGS >/dev/null 2>&1 || {
@@ -183,13 +186,11 @@ run_device_api_unified_ir() {
   local -a common_env=(
     -x FLAGCX_USE_HETERO_COMM=1
     -x FLAGCX_VMM_ENABLE=0
-    -x FLAGCX_IB_GID_INDEX=3
-    -x NCCL_DEBUG=INFO
-    -x NCCL_DEBUG_SUBSYS=INIT
-    -x NCCL_NVLS_ENABLE=0
-    -x NCCL_IB_GID_INDEX=3
     -x LD_LIBRARY_PATH
   )
+  if declare -p FLAGCX_CI_UNIFIED_IR_MPI_ARGS >/dev/null 2>&1; then
+    common_env+=("${FLAGCX_CI_UNIFIED_IR_MPI_ARGS[@]}")
+  fi
   local -a intra_env=(
     "${common_env[@]}"
     -x FLAGCX_DEBUG=INFO
@@ -240,9 +241,8 @@ run_device_api_unified_ir() {
     : -np "$FLAGCX_CI_NODE_NP" "${inter_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
     build/bin/test_device_ir_unified_inter "${inter_flags[@]}"
 
-  # Fault injection: disable only one-sided data/signal IPC.  Barriers retain
-  # their IPC transport so these runs specifically validate IPC-to-Net
-  # fallback for S18-S25.
+  # Force one-sided data/signal operations through Net. Barriers retain their
+  # configured transport; these runs validate the Net fallback for S18-S25.
   FLAGCX_CI_MPI_LABEL="unified IR intra forced fallback" \
     "$MPI_RUNNER" -np "$FLAGCX_CI_INTRA_NP" --allow-run-as-root \
     "${intra_fallback_env[@]}" \
@@ -697,6 +697,8 @@ run_suite() {
           local pxn_visible_devices_var=CUDA_VISIBLE_DEVICES
           if [[ "$platform_name" == "metax" ]]; then
             pxn_visible_devices_var=MACA_VISIBLE_DEVICES
+          elif [[ "$platform_name" == "hygon" ]]; then
+            pxn_visible_devices_var=HIP_VISIBLE_DEVICES
           fi
           pxn_launcher+=("$pxn_visible_devices_var=$FLAGCX_CI_PXN_VISIBLE_DEVICES")
           pxn_platform_env+=(
