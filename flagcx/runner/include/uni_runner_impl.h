@@ -44,7 +44,9 @@ typedef enum {
   uniRunnerDagAlgoIpcAR = 8,
   uniRunnerDagAlgoGroupedAR = 9,
   uniRunnerDagAlgoIpcRingAR = 10,
-  uniRunnerDagAlgoHierarchicalSlicedAR = 11
+  uniRunnerDagAlgoHierarchicalSlicedAR = 11,
+  uniRunnerDagAlgoAllGatherGemm = 12,
+  uniRunnerDagAlgoGemmReduceScatter = 13
 } uniRunnerDagAlgoType;
 
 #ifndef FLAGCX_RING_STEP_KIND_DEFINED
@@ -67,6 +69,10 @@ typedef enum {
 } uniRunnerDagBufferMode;
 
 struct uniRunnerDagAlgorithmConfig {
+  uint64_t matrixM = 0;
+  uint64_t matrixN = 0;
+  uint64_t matrixK = 0;
+  uint64_t numKSlices = 0;
   uint64_t numSlices = 0;
   uint64_t numLocalSlices = 0;
   uint64_t numRedSlices = 0;
